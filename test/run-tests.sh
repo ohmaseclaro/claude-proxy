@@ -9,7 +9,10 @@ export CLAUDE_PROXY_CONFIG_DIR="$TMP/config"
 export CLAUDE_PROXY_SECURITY_BIN="$ROOT/test/fake-security"
 export FAKE_KEYCHAIN_DIR="$TMP/keychain"
 mkdir -p "$TMP/bin"
-cp "$ROOT/test/fake-claude" "$TMP/bin/claude"
+sed -e "s/RESET5/$(( $(date +%s) + 4 * 3600 + 3480 ))/g" \
+    -e "s/RESET7/$(( $(date +%s) + 6 * 86400 + 23 * 3600 ))/g" \
+    "$ROOT/test/fake-claude" > "$TMP/bin/claude"
+chmod +x "$TMP/bin/claude"
 # Deliberately NOT $PATH: the real `claude` must be unreachable from the suite.
 PATH="$TMP/bin:/usr/bin:/bin"; export PATH
 REGISTRY="$CLAUDE_PROXY_CONFIG_DIR/accounts.json"
@@ -21,6 +24,8 @@ ok()  { pass=$((pass + 1)); printf '  ok    %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf '  FAIL  %s\n        %s\n' "$1" "$2"; }
 
 run() { out=$("$ROOT/claude-proxy" "$@" 2>&1); st=$?; }
+# stdout only: what a script consuming --json actually sees.
+run_out() { out=$("$ROOT/claude-proxy" "$@" 2>/dev/null); st=$?; }
 run_in() { _in=$1; shift; out=$(printf '%s\n' "$_in" | "$ROOT/claude-proxy" "$@" 2>&1); st=$?; }
 
 has()    { case $2 in *"$1"*) ok "$3" ;; *) bad "$3" "missing '$1' in: $out" ;; esac; }
@@ -158,7 +163,9 @@ PORT=$(cat "$TMP/port" 2>/dev/null)
 export CLAUDE_PROXY_USAGE_URL="http://127.0.0.1:$PORT/api/oauth/usage"
 
 for pair in 'full tok-full' 'minimal tok-minimal' 'garbage tok-garbage' 'empty tok-empty' \
-            'dead tok-dead' 'limited tok-limited' 'slow tok-slow' 'gone tok-gone' 'far tok-far'; do
+            'dead tok-dead' 'limited tok-limited' 'slow tok-slow' 'gone tok-gone' 'far tok-far' \
+            'scoped tok-scope-ok' 'noevent tok-scope-noevent' 'badline tok-scope-bad' \
+            'probefail tok-scope-fail' 'probehang tok-scope-hang' 'forbidden tok-forbidden'; do
   run_in "${pair#* }" config add "${pair%% *}" >/dev/null 2>&1
 done
 rm -f "$FAKE_KEYCHAIN_DIR/${USER}.claude-proxy-gone"
@@ -185,12 +192,12 @@ status 0 'list over every account exits 0 despite failures'
 has 'Sonnet 12%' "$out" 'a healthy row survives its failing neighbours'
 has 'unreadable usage response' "$out" 'invalid JSON is reported in the row'
 has 'carried no windows' "$out" 'a response with no windows is reported'
-has 'usage scope' "$out" '401 explains the token may lack the usage scope'
+has '401 — token rejected: expired or revoked' "$out" '401 is reported as a dead token'
 has '429' "$out" '429 is reported as rate limiting'
 has 'no Keychain item' "$out" 'an account without a keychain item is reported'
 has 'MISSING' "$out" 'keychain column still says MISSING'
 rows=$(printf '%s\n' "$out" | grep -c .)
-[ "$rows" = 10 ] && ok 'every account gets a row' || bad 'every account gets a row' "$rows lines"
+[ "$rows" = 16 ] && ok 'every account gets a row' || bad 'every account gets a row' "$rows lines"
 hasnt 'tok-' "$out" 'list never prints a token'
 
 run list --account=far
@@ -231,6 +238,69 @@ has 'no model request' "$out" 'list --help says the probe costs nothing'
 # it, so a healthy row proves we send it.
 run list --account=full
 has '4%' "$out" 'the claude-code User-Agent and beta header are sent'
+
+# --- probe fallback ---------------------------------------------------------
+run list --account=scoped
+status 0 'a 403-scope account still gets a row'
+has 'needs --probe' "$out" 'a setup-token account says it needs --probe'
+has 'user:profile' "$out" 'the row names the missing scope'
+hasnt '4%' "$out" 'no quota is invented for it'
+
+run list --account=forbidden
+has '403 — forbidden' "$out" 'a 403 that is not about scope reads differently'
+hasnt 'needs --probe' "$out" 'and does not claim a probe would help'
+
+err=$("$ROOT/claude-proxy" list --probe --account=scoped 2>&1 >/dev/null)
+case $err in *'one small request'*) ok 'the probe announces its cost' ;;
+  *) bad 'the probe announces its cost' "stderr was: $err" ;; esac
+
+run list --probe --account=scoped
+status 0 'list --probe succeeds'
+has 'probe' "$out" 'the row is marked as coming from the probe'
+has '4%' "$out" 'the 0..1 fraction is normalised to a percentage'
+has '10%' "$out" 'the seven-day fraction too'
+matches 'in 4h 5[0-9]m' 'epoch resetsAt renders like the endpoint ISO one'
+has 'status allowed' "$out" 'the event status is carried into the row'
+has 'overage rejected (out_of_credits)' "$out" 'so is the overage reason'
+hasnt 'tok-' "$out" 'the probe never prints a token'
+
+run list --probe --account=noevent
+has 'no rate_limit_event' "$out" 'a response without the event is reported'
+run list --probe --account=badline
+has 'probe' "$out" 'a malformed event does not crash the row'
+run list --probe --account=probefail
+has 'probe failed (exit 1)' "$out" 'a non-zero probe exit is reported'
+has '401 Invalid bearer token' "$out" "the probe's own error text is shown"
+run list --probe --account=probehang --timeout 1
+has 'probe: timed out after 1s' "$out" 'a hanging probe hits the timeout'
+
+run list --probe --timeout 2
+status 0 'a mixed table with probes exits 0'
+has 'endpoint' "$out" 'rows read for free are marked endpoint'
+has 'probe' "$out" 'probed rows are marked probe'
+has 'Fable 5 31%' "$out" 'the free rows are unaffected by probing'
+hasnt 'tok-' "$out" 'a mixed table never prints a token'
+mixed=$(printf '%s\n' "$out" | grep -v '^claude-proxy:' | grep -c .)
+[ "$mixed" = 16 ] && ok 'every account still gets exactly one row' \
+  || bad 'every account still gets exactly one row' "$mixed lines"
+
+run_out list --probe --json --account=scoped
+status 0 'list --probe --json succeeds'
+printf '%s' "$out" | "$PY" -m json.tool > /dev/null 2>&1 \
+  && ok '--probe --json emits valid JSON on stdout alone' \
+  || bad '--probe --json emits valid JSON on stdout alone' "$out"
+has '"source": "probe"' "$out" '--json names the probe as the source'
+has '"rate_limit_info"' "$out" '--json carries the raw event'
+hasnt 'tok-' "$out" '--probe --json never prints a token'
+
+run list --json --account=full
+has '"source": "endpoint"' "$out" '--json names the endpoint as the source'
+
+run list --no-quota --probe
+status 1 '--no-quota and --probe are refused together'
+
+run list --probe --account=gone
+has 'no Keychain item' "$out" 'an account with no secret is never probed'
 
 kill "$SERVER" 2>/dev/null
 

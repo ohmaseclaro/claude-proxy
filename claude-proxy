@@ -178,19 +178,43 @@ cmd_default() {
 
 list_usage() {
   cat <<'USAGE'
-usage: claude-proxy list [--json] [--account <label>] [--timeout <s>] [--no-quota]
+usage: claude-proxy list [--probe] [--json] [--account <label>] [--timeout <s>]
+                         [--no-quota]
 
-Shows every configured account with its quota, read from the Anthropic OAuth
-usage endpoint. One cheap GET per account; no model request, no tokens spent.
+Shows every configured account with its quota, read for free from the Anthropic
+OAuth usage endpoint: one GET per account, no model request, nothing spent.
 
+That endpoint needs a token scoped `user:profile`. A `claude setup-token`
+token is not, and answers 403 — those accounts read as "needs --probe".
+
+  --probe             ask `claude` itself for the quota of the accounts the
+                      endpoint could not answer. COSTS ONE SMALL REQUEST per
+                      such account. Off by default.
   --json              the collected data as JSON (never a token)
   --account <label>   only this account
-  --timeout <s>       give up on one request after s seconds (default 10)
+  --timeout <s>       give up on one read after s seconds (default 10)
   --no-quota          skip the network entirely: labels and Keychain state only
 USAGE
 }
 
 jesc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+# Both sources flatten to the same key=value records.
+read_flat() {
+  while IFS='=' read -r k v; do
+    case $k in
+      five_hour.percent) P_5=$v ;;
+      five_hour.resets_epoch) P_5R=$v ;;
+      seven_day.percent) P_7=$v ;;
+      seven_day.resets_epoch) P_7R=$v ;;
+      scoped)
+        n=${v%%|*}; rest=${v#*|}; sp=${rest%%|*}; se=${rest##*|}
+        P_TAIL="${P_TAIL:+$P_TAIL · }$n $(fmt_pct "$sp") $(when "$se")" ;;
+      tail) P_TAIL="${P_TAIL:+$P_TAIL · }$v" ;;
+      error) P_ERR=$v ;;
+    esac
+  done < "$1"
+}
 
 fmt_pct() {
   [ -n "$1" ] || { printf '?'; return; }
@@ -283,11 +307,65 @@ if isinstance(extra, dict) and extra.get("is_enabled"):
         return None if v is None else ("%.*f" % (dp, v / (10 ** dp)))
     used, cap = money(extra.get("used_credits")), money(extra.get("monthly_limit"))
     if used is not None and cap is not None:
-        print("extra=extra %s %s of %s" % (cur, used, cap))
+        print("tail=extra %s %s of %s" % (cur, used, cap))
     elif used is not None:
-        print("extra=extra %s %s used" % (cur, used))
+        print("tail=extra %s %s used" % (cur, used))
     else:
-        print("extra=extra usage on")
+        print("tail=extra usage on")
+PYEOF
+)
+
+# The stream-json rate_limit_event says the same things in different units:
+# utilization is a 0..1 fraction and resetsAt is epoch seconds. Normalise to
+# the endpoint's shape so one table can mix both sources.
+PROBE_FLATTEN=$(cat <<'PYEOF'
+import json, sys
+
+def num(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+try:
+    info = json.load(open(sys.argv[1]))["rate_limit_info"]
+    if not isinstance(info, dict):
+        raise ValueError
+except Exception:
+    print("error=unreadable rate_limit_event")
+    sys.exit(0)
+
+def window(name, obj):
+    if not isinstance(obj, dict):
+        return None, None
+    pct, at = num(obj.get("utilization")), num(obj.get("resetsAt"))
+    return (None if pct is None else pct * 100), (None if at is None else int(at))
+
+windows = info.get("unifiedWindows")
+windows = windows if isinstance(windows, dict) else {}
+for key in ("five_hour", "seven_day"):
+    pct, at = window(key, windows.get(key))
+    if pct is not None:
+        print("%s.percent=%s" % (key, pct))
+    if at is not None:
+        print("%s.resets_epoch=%s" % (key, at))
+
+for key, obj in windows.items():
+    if key in ("five_hour", "seven_day"):
+        continue
+    pct, at = window(key, obj)
+    if pct is not None:
+        print("scoped=%s|%s|%s" % (key.replace("|", "/"), pct, "" if at is None else at))
+
+bits = []
+if info.get("status"):
+    bits.append("status %s" % info["status"])
+if info.get("isUsingOverage") is True:
+    bits.append("overage in use")
+elif info.get("overageStatus"):
+    over = "overage %s" % info["overageStatus"]
+    if info.get("overageDisabledReason"):
+        over += " (%s)" % info["overageDisabledReason"]
+    bits.append(over)
+if bits:
+    print("tail=%s" % " · ".join(bits))
 PYEOF
 )
 
@@ -305,13 +383,14 @@ usage_fetch() {
         "$USAGE_URL" 2>"$_body.err"
 }
 
-probe() {
-  label=$1 timeout=$2
-  P_ERR=''; P_5=''; P_5R=''; P_7=''; P_7R=''; P_TAIL=''; P_BODY=''
+account_token() {
+  "$SECURITY" find-generic-password -a "$KC_ACCOUNT" -s "$(registry_service "$1")" -w 2>/dev/null || true
+}
 
-  svc=$(registry_service "$label")
-  tok=$("$SECURITY" find-generic-password -a "$KC_ACCOUNT" -s "$svc" -w 2>/dev/null || true)
-  [ -n "$tok" ] || { P_ERR='no Keychain item'; return 1; }
+read_endpoint() {
+  label=$1 timeout=$2
+  tok=$(account_token "$label")
+  [ -n "$tok" ] || { P_ERR='no Keychain item'; P_NOKEY=1; return 1; }
 
   body=$WORK/body
   curl_st=0
@@ -330,8 +409,16 @@ probe() {
 
   case $code in
     2*) ;;
-    401|403)
-      P_ERR="$code — token rejected: expired, or a setup-token without the usage scope"
+    403)
+      # The expected, ordinary answer for a setup-token: not something to fix.
+      if grep -q 'oauth_scope_insufficient\|user:profile' "$body" 2>/dev/null; then
+        P_ERR='needs --probe (token lacks the user:profile scope)'
+      else
+        P_ERR="403 — forbidden: $(tr -d '\n' < "$body" 2>/dev/null | cut -c1-80)"
+      fi
+      return 1 ;;
+    401)
+      P_ERR='401 — token rejected: expired or revoked'
       return 1 ;;
     429)
       P_ERR='429 — rate limited by the usage endpoint'
@@ -346,33 +433,113 @@ probe() {
     P_ERR='could not parse the usage response'; return 1; }
   P_BODY=$body
 
-  while IFS='=' read -r k v; do
-    case $k in
-      five_hour.percent) P_5=$v ;;
-      five_hour.resets_epoch) P_5R=$v ;;
-      seven_day.percent) P_7=$v ;;
-      seven_day.resets_epoch) P_7R=$v ;;
-      scoped)
-        n=${v%%|*}; rest=${v#*|}; sp=${rest%%|*}; se=${rest##*|}
-        P_TAIL="${P_TAIL:+$P_TAIL · }$n $(fmt_pct "$sp") $(when "$se")" ;;
-      extra) P_TAIL="${P_TAIL:+$P_TAIL · }$v" ;;
-      error) P_ERR=$v ;;
-    esac
-  done < "$flat"
+  read_flat "$flat"
 
   [ -z "$P_ERR" ] || return 1
   if [ -z "$P_5" ] && [ -z "$P_7" ] && [ -z "$P_TAIL" ]; then
     P_ERR='usage response carried no windows'
     return 1
   fi
+  P_SOURCE=endpoint
+  return 0
+}
+
+# --- the probe: the only quota source a setup-token has ---------------------
+
+spawn() {
+  _o=$1; _e=$2; _d=$3; shift 3
+  rm -f "$_d"
+  ( claude "$@" >"$_o" 2>"$_e"; printf '%s' "$?" >"$_d" ) 2>/dev/null &
+  SPAWN_PID=$!
+}
+
+# 0 = pattern seen, 1 = child finished, 2 = timed out.
+await() {
+  _pid=$1; _done=$2; _out=$3; _pat=$4; _ticks=$(( $5 * 4 ))
+  while [ "$_ticks" -gt 0 ]; do
+    if [ -n "$_pat" ] && grep -q "$_pat" "$_out" 2>/dev/null; then return 0; fi
+    [ -f "$_done" ] && return 1
+    sleep 0.25
+    _ticks=$((_ticks - 1))
+  done
+  return 2
+}
+
+reap() {
+  pkill -P "$1" >/dev/null 2>&1 || true
+  kill "$1" >/dev/null 2>&1 || true
+  wait "$1" >/dev/null 2>&1 || true
+}
+
+# A chatty CLI must not be able to put the token into a row we then print.
+redact() {
+  awk -v t="$2" '{ if (t != "") { i = index($0, t); while (i > 0) { $0 = substr($0, 1, i - 1) "<redacted>" substr($0, i + length(t)); i = index($0, t) } } print }' <<REDACT
+$1
+REDACT
+}
+
+probe_claude() {
+  label=$1 timeout=$2
+  P_ERR=''; P_5=''; P_5R=''; P_7=''; P_7R=''; P_TAIL=''; P_BODY=''; P_SOURCE=''
+
+  command -v claude >/dev/null 2>&1 || { P_ERR='probe: claude is not on PATH'; return 1; }
+  tok=$(account_token "$label")
+  [ -n "$tok" ] || { P_ERR='no Keychain item'; P_NOKEY=1; return 1; }
+
+  printf '%s: --probe: asking claude for %s (one small request).\n' "$PROG" "$label" >&2
+
+  out=$WORK/probe.out; err=$WORK/probe.err; fin=$WORK/probe.done
+  CLAUDE_CODE_OAUTH_TOKEN=$tok
+  export CLAUDE_CODE_OAUTH_TOKEN
+  spawn "$out" "$err" "$fin" -p . --output-format stream-json --verbose --max-turns 1
+  await "$SPAWN_PID" "$fin" "$out" '"rate_limit_info"' "$timeout"
+  st=$?
+  reap "$SPAWN_PID"
+  CLAUDE_CODE_OAUTH_TOKEN=''
+  unset CLAUDE_CODE_OAUTH_TOKEN
+
+  line=$(grep -m 1 '"rate_limit_info"' "$out" 2>/dev/null || true)
+  if [ -z "$line" ]; then
+    if [ "$st" = 2 ]; then
+      P_ERR="probe: timed out after ${timeout}s"
+    else
+      code=$(cat "$fin" 2>/dev/null || true)
+      if [ "${code:-0}" = 0 ]; then
+        P_ERR='probe: no rate_limit_event in the response'
+      else
+        why=$(head -n 1 "$err" 2>/dev/null || true)
+        [ -n "$why" ] || why=$(head -n 1 "$out" 2>/dev/null || true)
+        why=$(redact "$why" "$tok" | cut -c1-100)
+        P_ERR="probe failed (exit $code)${why:+: $why}"
+      fi
+    fi
+    tok=''; unset tok
+    return 1
+  fi
+  tok=''; unset tok
+
+  event=$WORK/event.json
+  printf '%s\n' "$line" > "$event"
+  flat=$WORK/probe.flat
+  printf '%s' "$PROBE_FLATTEN" | "$PYTHON" - "$event" > "$flat" 2>/dev/null || {
+    P_ERR='probe: could not parse the rate_limit_event'; return 1; }
+  read_flat "$flat"
+  [ -z "$P_ERR" ] || { P_ERR="probe: $P_ERR"; return 1; }
+  if [ -z "$P_5" ] && [ -z "$P_7" ] && [ -z "$P_TAIL" ]; then
+    P_ERR='probe: rate_limit_event carried no windows'
+    return 1
+  fi
+  P_BODY=$event
+  P_SOURCE=probe
   return 0
 }
 
 cmd_list_rich() {
-  quota=1 as_json=0 only='' timeout=10
+  quota=1 as_json=0 only='' timeout=10 do_probe=0
   while [ $# -gt 0 ]; do
     case $1 in
       --no-quota) quota=0 ;;
+      --probe) do_probe=1 ;;
       --json) as_json=1 ;;
       --account=*) only=${1#--account=} ;;
       --account) shift; only=${1:-}; [ -n "$only" ] || die '--account requires a value' ;;
@@ -385,6 +552,7 @@ cmd_list_rich() {
   done
   case $timeout in ''|*[!0-9]*) die 'list: --timeout wants whole seconds' ;; esac
   [ "$timeout" -gt 0 ] || die 'list: --timeout wants at least 1 second'
+  [ "$quota" = 1 ] || [ "$do_probe" = 0 ] || die 'list: --no-quota and --probe contradict each other'
 
   labels=$(registry_labels)
   if [ -n "$only" ]; then
@@ -399,6 +567,7 @@ cmd_list_rich() {
   def=$(registry_default)
 
   if [ "$quota" = 1 ]; then
+    unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN 2>/dev/null || true
     command -v curl >/dev/null 2>&1 || die 'curl is not on PATH (use --no-quota)'
     command -v "$PYTHON" >/dev/null 2>&1 || die "$PYTHON is not on PATH (use --no-quota)"
     WORK=$(mktemp -d "${TMPDIR:-/tmp}/claude-proxy.XXXXXX")
@@ -407,8 +576,8 @@ cmd_list_rich() {
 
   if [ "$as_json" = 0 ]; then
     if [ "$quota" = 1 ]; then
-      printf '%-14s %-4s %-9s %-6s %-24s %-6s %-24s %s\n' \
-        LABEL DEF KEYCHAIN 5H '5H RESETS' 7D '7D RESETS' OTHER
+      printf '%-14s %-4s %-9s %-9s %-6s %-24s %-6s %-24s %s\n' \
+        LABEL DEF KEYCHAIN SOURCE 5H '5H RESETS' 7D '7D RESETS' OTHER
     else
       printf '%-14s %-4s %-9s %s\n' LABEL DEF KEYCHAIN SERVICE
     fi
@@ -425,10 +594,17 @@ cmd_list_rich() {
     [ "$l" = "$def" ] && mark='*' || mark='-'
 
     P_ERR=''; P_5=''; P_5R=''; P_7=''; P_7R=''; P_TAIL=''; P_BODY=''
-    [ "$quota" = 1 ] && { probe "$l" "$timeout" || true; }
+    P_SOURCE=''; P_NOKEY=''
+    [ "$quota" = 1 ] && { read_endpoint "$l" "$timeout" || true; }
+    # Probe only what the endpoint could not answer for free, and only when
+    # the caller asked for it: each one costs a request.
+    if [ "$do_probe" = 1 ] && [ -n "$P_ERR" ] && [ "$P_NOKEY" != 1 ]; then
+      probe_claude "$l" "$timeout" || true
+    fi
 
     if [ "$as_json" = 1 ]; then
       row="  {\"label\": \"$(jesc "$l")\", \"default\": $([ "$l" = "$def" ] && printf true || printf false), \"keychain\": \"$kc\""
+      [ -n "$P_SOURCE" ] && row="$row, \"source\": \"$P_SOURCE\""
       [ -n "$P_ERR" ] && row="$row, \"error\": \"$(jesc "$P_ERR")\""
       if [ -n "$P_BODY" ]; then
         raw=$("$PYTHON" -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])), separators=(", ", ": ")))' "$P_BODY" 2>/dev/null || true)
@@ -443,10 +619,10 @@ $row"; else rows=$row; fi
     if [ "$quota" = 0 ]; then
       printf '%-14s %-4s %-9s %s\n' "$l" "$mark" "$kc" "$svc"
     elif [ -n "$P_ERR" ]; then
-      printf '%-14s %-4s %-9s %s\n' "$l" "$mark" "$kc" "$P_ERR"
+      printf '%-14s %-4s %-9s %-9s %s\n' "$l" "$mark" "$kc" '-' "$P_ERR"
     else
-      printf '%-14s %-4s %-9s %-6s %-24s %-6s %-24s %s\n' \
-        "$l" "$mark" "$kc" \
+      printf '%-14s %-4s %-9s %-9s %-6s %-24s %-6s %-24s %s\n' \
+        "$l" "$mark" "$kc" "$P_SOURCE" \
         "$(fmt_pct "$P_5")" "$(when "$P_5R")" \
         "$(fmt_pct "$P_7")" "$(when "$P_7R")" "${P_TAIL:--}"
     fi

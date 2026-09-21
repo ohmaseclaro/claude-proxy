@@ -24,6 +24,13 @@ FULL = {
          "scope": {"model": {"display_name": "Fable 5"}}},
     ],
 }
+# Verified against the live endpoint with a `claude setup-token` token.
+SCOPE_403 = {"type": "error", "error": {
+    "type": "permission_error",
+    "message": "OAuth token does not meet scope requirement user:profile",
+    "details": {"required_scopes": ["user:profile"], "match": "any",
+                "error_code": "oauth_scope_insufficient",
+                "error_visibility": "user_facing"}}}
 MINIMAL = {"five_hour": {"utilization": 77, "resets_at": at(minutes=35)}}
 FAR = {"five_hour": {"utilization": 1, "resets_at": "2099-01-01T10:00:00Z"}}
 
@@ -52,6 +59,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(200, json.dumps(FULL))
         if token == "tok-minimal":
             return self.reply(200, json.dumps(MINIMAL))
+        # Every setup-token account: the endpoint cannot answer them for free.
+        if token.startswith("tok-scope"):
+            return self.reply(403, json.dumps(SCOPE_403))
+        if token == "tok-forbidden":
+            return self.reply(403, json.dumps({"error": "not for you"}))
         if token == "tok-far":
             return self.reply(200, json.dumps(FAR))
         if token == "tok-garbage":
