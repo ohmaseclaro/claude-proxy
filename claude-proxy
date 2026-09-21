@@ -1,0 +1,236 @@
+#!/bin/sh
+# claude-proxy — run Claude Code under one of several accounts' OAuth tokens.
+#
+# The token lives only in the macOS Keychain and in the environment of the
+# exec'd `claude`. It is never written to a file and never printed back.
+#
+#   claude-proxy config add work      # paste the token once, silently
+#   claude-proxy --account=work -p "hello"
+#
+# Mint a token with `claude setup-token` while logged into that account, and
+# paste it as ONE unbroken line: a wrapped paste stores truncated and fails
+# later as `401 OAuth access token is invalid`.
+set -eu
+
+PROG=claude-proxy
+CONFIG_DIR=${CLAUDE_PROXY_CONFIG_DIR:-$HOME/.config/claude-proxy}
+REGISTRY=$CONFIG_DIR/accounts.json
+SECURITY=${CLAUDE_PROXY_SECURITY_BIN:-security}
+KC_ACCOUNT=${USER:-$(id -un)}
+
+die() { printf '%s: %s\n' "$PROG" "$1" >&2; exit 1; }
+
+usage() {
+  cat <<'USAGE'
+usage: claude-proxy [--account <label>] [claude args...]
+       claude-proxy config list
+       claude-proxy config add <label>
+       claude-proxy config rm <label> [-y]
+       claude-proxy config default <label>
+
+Everything that is not --account is forwarded to `claude` unchanged.
+Account resolution: --account, then $CLAUDE_PROXY_ACCOUNT, then the default.
+USAGE
+}
+
+service_for() { printf 'claude-proxy-%s' "$1"; }
+
+valid_label() {
+  printf '%s' "$1" | LC_ALL=C grep -qx '[a-z0-9][a-z0-9._-]*'
+}
+
+registry_labels() {
+  [ -f "$REGISTRY" ] || return 0
+  sed -n 's/^[[:space:]]*{ *"label": *"\([^"]*\)".*/\1/p' "$REGISTRY"
+}
+
+registry_default() {
+  [ -f "$REGISTRY" ] || return 0
+  sed -n 's/^[[:space:]]*"default": *"\([^"]*\)".*/\1/p' "$REGISTRY" | head -n 1
+}
+
+registry_has() {
+  registry_labels | grep -qxF "$1"
+}
+
+registry_service() {
+  svc=$(sed -n 's/^.*"label": *"'"$1"'" *, *"service": *"\([^"]*\)".*/\1/p' "$REGISTRY" 2>/dev/null | head -n 1)
+  [ -n "$svc" ] || svc=$(service_for "$1")
+  printf '%s' "$svc"
+}
+
+known_accounts_msg() {
+  labels=$(registry_labels)
+  if [ -z "$labels" ]; then
+    printf 'no accounts configured. Add one with: %s config add <label>' "$PROG"
+  else
+    printf 'known accounts: %s' "$(printf '%s\n' "$labels" | tr '\n' ' ' | sed 's/ $//')"
+  fi
+}
+
+write_registry() {
+  # $1 = default label (may be empty), $2 = newline-separated labels
+  _def=$1
+  _entries=$(printf '%s\n' "$2" | grep -v '^[[:space:]]*$' \
+    | sed 's/.*/    { "label": "&", "service": "claude-proxy-&" },/' | sed '$ s/,$//')
+  mkdir -p "$CONFIG_DIR"
+  chmod 700 "$CONFIG_DIR" 2>/dev/null || true
+  _tmp=$REGISTRY.tmp.$$
+  umask 077
+  {
+    printf '{\n'
+    if [ -n "$_def" ]; then printf '  "default": "%s",\n' "$_def"; else printf '  "default": null,\n'; fi
+    printf '  "accounts": [\n'
+    [ -n "$_entries" ] && printf '%s\n' "$_entries"
+    printf '  ]\n}\n'
+  } > "$_tmp"
+  chmod 600 "$_tmp"
+  mv "$_tmp" "$REGISTRY"
+}
+
+cmd_list() {
+  labels=$(registry_labels)
+  if [ -z "$labels" ]; then
+    printf 'No accounts configured. Add one with: %s config add <label>\n' "$PROG"
+    return 0
+  fi
+  def=$(registry_default)
+  printf '%-16s %-28s %-9s %s\n' LABEL SERVICE KEYCHAIN DEFAULT
+  printf '%s\n' "$labels" | while IFS= read -r l; do
+    [ -n "$l" ] || continue
+    svc=$(registry_service "$l")
+    # Metadata only — never -w, so no token is ever read here, let alone printed.
+    if "$SECURITY" find-generic-password -a "$KC_ACCOUNT" -s "$svc" >/dev/null 2>&1; then
+      kc=present
+    else
+      kc=MISSING
+    fi
+    [ "$l" = "$def" ] && mark='*' || mark=''
+    printf '%-16s %-28s %-9s %s\n' "$l" "$svc" "$kc" "$mark"
+  done
+}
+
+cmd_add() {
+  label=${1:-}
+  [ -n "$label" ] || die 'config add needs a label'
+  valid_label "$label" || die "invalid label '$label': use [a-z0-9][a-z0-9._-]*"
+  registry_has "$label" && die "account '$label' already exists; remove it first ($PROG config rm $label)"
+
+  svc=$(service_for "$label")
+  printf 'Token for %s (input hidden, paste as ONE line): ' "$label" >&2
+  if stty_saved=$(stty -g 2>/dev/null); then
+    stty -echo 2>/dev/null || true
+    IFS= read -r token || token=''
+    stty "$stty_saved" 2>/dev/null || true
+    printf '\n' >&2
+  else
+    IFS= read -r token || token=''
+  fi
+  [ -n "$token" ] || die 'empty token, nothing stored'
+
+  # Value on stdin, never on the command line, so it stays out of `ps`.
+  printf '%s' "$token" | "$SECURITY" add-generic-password -a "$KC_ACCOUNT" -s "$svc" -U -w \
+    || die "could not store the token in the Keychain under '$svc'"
+  token=''
+  unset token
+
+  labels=$(registry_labels; printf '%s\n' "$label")
+  def=$(registry_default)
+  [ -n "$def" ] || def=$label
+  write_registry "$def" "$labels"
+  printf "Stored '%s' (keychain service %s).%s\n" "$label" "$svc" \
+    "$([ "$def" = "$label" ] && printf ' It is now the default.')"
+}
+
+cmd_rm() {
+  label=${1:-}
+  yes=${2:-}
+  [ -n "$label" ] || die 'config rm needs a label'
+  registry_has "$label" || die "unknown account '$label': $(known_accounts_msg)"
+  svc=$(registry_service "$label")
+
+  if [ "$yes" != "-y" ] && [ "$yes" != "--yes" ]; then
+    printf "Remove account '%s' and its Keychain item '%s'? [y/N] " "$label" "$svc" >&2
+    IFS= read -r reply || reply=''
+    case $reply in y|Y|yes|YES) ;; *) printf 'Aborted.\n' >&2; exit 1 ;; esac
+  fi
+
+  "$SECURITY" delete-generic-password -a "$KC_ACCOUNT" -s "$svc" >/dev/null 2>&1 \
+    || printf '%s: no Keychain item for %s (already gone)\n' "$PROG" "$svc" >&2
+
+  labels=$(registry_labels | grep -vxF "$label" || true)
+  def=$(registry_default)
+  [ "$def" = "$label" ] && def=''
+  write_registry "$def" "$labels"
+  printf "Removed '%s'.\n" "$label"
+}
+
+cmd_default() {
+  label=${1:-}
+  [ -n "$label" ] || die 'config default needs a label'
+  registry_has "$label" || die "unknown account '$label': $(known_accounts_msg)"
+  write_registry "$label" "$(registry_labels)"
+  printf "Default account is now '%s'.\n" "$label"
+}
+
+case ${1:-} in
+  help|--help|-h)
+    usage; exit 0 ;;
+  config)
+    shift
+    sub=${1:-}
+    [ -n "$sub" ] && shift
+    case $sub in
+      list) cmd_list ;;
+      add) cmd_add "${1:-}" ;;
+      rm) cmd_rm "${1:-}" "${2:-}" ;;
+      default) cmd_default "${1:-}" ;;
+      *) usage >&2; die "unknown config command '${sub:-}'" ;;
+    esac
+    exit 0 ;;
+esac
+
+# --account may sit anywhere; it and its value are consumed, the rest keeps its
+# original order. Rotating the positional parameters is the POSIX way to do
+# that without arrays.
+account=''
+n=$#
+while [ "$n" -gt 0 ]; do
+  arg=$1; shift; n=$((n - 1))
+  case $arg in
+    --account=*) account=${arg#--account=} ;;
+    --account)
+      [ "$n" -gt 0 ] || die '--account requires a value'
+      account=$1; shift; n=$((n - 1)) ;;
+    --)
+      set -- "$@" "$arg"
+      while [ "$n" -gt 0 ]; do set -- "$@" "$1"; shift; n=$((n - 1)); done ;;
+    *) set -- "$@" "$arg" ;;
+  esac
+done
+
+[ -n "$account" ] || account=${CLAUDE_PROXY_ACCOUNT:-}
+[ -n "$account" ] || account=$(registry_default)
+[ -n "$account" ] || die "no account given and no default set. $(known_accounts_msg)"
+registry_has "$account" || die "unknown account '$account': $(known_accounts_msg)"
+
+command -v claude >/dev/null 2>&1 || die 'claude is not on PATH'
+
+svc=$(registry_service "$account")
+TOKEN=$("$SECURITY" find-generic-password -a "$KC_ACCOUNT" -s "$svc" -w 2>/dev/null || true)
+if [ -z "$TOKEN" ]; then
+  printf '%s: no token in the Keychain for account '\''%s'\'' (service %s).\n' "$PROG" "$account" "$svc" >&2
+  printf "  Add it again with:  %s config rm %s && %s config add %s\n" "$PROG" "$account" "$PROG" "$account" >&2
+  exit 1
+fi
+
+# A stray ANTHROPIC_API_KEY would take precedence and silently bill the wrong
+# account. Drop both for this process.
+unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN 2>/dev/null || true
+
+CLAUDE_CODE_OAUTH_TOKEN=$TOKEN
+export CLAUDE_CODE_OAUTH_TOKEN
+TOKEN=''
+unset TOKEN
+
+exec claude "$@"

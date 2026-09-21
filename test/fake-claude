@@ -1,0 +1,8 @@
+#!/bin/sh
+# Stand-in for the real `claude`: echoes how it was invoked so tests can assert
+# on argument pass-through and on the environment it was handed.
+echo "claude-args: $*"
+echo "claude-argc: $#"
+echo "oauth-token: ${CLAUDE_CODE_OAUTH_TOKEN-<unset>}"
+echo "api-key: ${ANTHROPIC_API_KEY-<unset>}"
+echo "auth-token: ${ANTHROPIC_AUTH_TOKEN-<unset>}"
