@@ -17,12 +17,15 @@ CONFIG_DIR=${CLAUDE_PROXY_CONFIG_DIR:-$HOME/.config/claude-proxy}
 REGISTRY=$CONFIG_DIR/accounts.json
 SECURITY=${CLAUDE_PROXY_SECURITY_BIN:-security}
 KC_ACCOUNT=${USER:-$(id -un)}
+USAGE_URL=${CLAUDE_PROXY_USAGE_URL:-https://api.anthropic.com/api/oauth/usage}
+PYTHON=${CLAUDE_PROXY_PYTHON:-python3}
 
 die() { printf '%s: %s\n' "$PROG" "$1" >&2; exit 1; }
 
 usage() {
   cat <<'USAGE'
 usage: claude-proxy [--account <label>] [claude args...]
+       claude-proxy list [--no-quota] [--json] [--account <label>] [--timeout <s>]
        claude-proxy config list
        claude-proxy config add <label>
        claude-proxy config rm <label> [-y]
@@ -173,9 +176,293 @@ cmd_default() {
   printf "Default account is now '%s'.\n" "$label"
 }
 
+list_usage() {
+  cat <<'USAGE'
+usage: claude-proxy list [--json] [--account <label>] [--timeout <s>] [--no-quota]
+
+Shows every configured account with its quota, read from the Anthropic OAuth
+usage endpoint. One cheap GET per account; no model request, no tokens spent.
+
+  --json              the collected data as JSON (never a token)
+  --account <label>   only this account
+  --timeout <s>       give up on one request after s seconds (default 10)
+  --no-quota          skip the network entirely: labels and Keychain state only
+USAGE
+}
+
+jesc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+fmt_pct() {
+  [ -n "$1" ] || { printf '?'; return; }
+  awk -v p="$1" 'BEGIN { if (p > 0 && p < 1) printf "<1%%"; else printf "%.0f%%", p }' 2>/dev/null || printf '?'
+}
+
+when() {
+  e=$1
+  [ -n "$e" ] || { printf '?'; return; }
+  case $e in *[!0-9]*) printf '?'; return ;; esac
+  now=$(date +%s)
+  d=$((e - now))
+  if [ "$d" -lt 0 ]; then rel=overdue
+  elif [ "$d" -lt 60 ]; then rel='in <1m'
+  elif [ "$d" -lt 3600 ]; then rel="in $((d / 60))m"
+  elif [ "$d" -lt 86400 ]; then rel="in $((d / 3600))h $((d % 3600 / 60))m"
+  elif [ "$d" -lt 8640000 ]; then rel="in $((d / 86400))d $((d % 86400 / 3600))h"
+  else rel='in >99d'
+  fi
+  day=$(date -r "$e" '+%F' 2>/dev/null || date -d "@$e" '+%F' 2>/dev/null || true)
+  if [ -n "$day" ] && [ "$day" = "$(date '+%F')" ]; then
+    abs=$(date -r "$e" '+%H:%M' 2>/dev/null || date -d "@$e" '+%H:%M' 2>/dev/null || true)
+  else
+    abs=$(date -r "$e" '+%b %d %H:%M' 2>/dev/null || date -d "@$e" '+%b %d %H:%M' 2>/dev/null || true)
+  fi
+  if [ -n "$abs" ]; then printf '%s (%s)' "$rel" "$abs"; else printf '%s' "$rel"; fi
+}
+
+# Every field of this response is optional and the shape drifts between plans
+# and releases, so flatten defensively and render whatever came back.
+FLATTEN=$(cat <<'PYEOF'
+import json, sys, datetime
+
+def epoch(s):
+    try:
+        d = datetime.datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=datetime.timezone.utc)
+        return int(d.timestamp())
+    except Exception:
+        return ""
+
+def num(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+try:
+    doc = json.load(open(sys.argv[1]))
+except Exception:
+    print("error=unreadable usage response")
+    sys.exit(0)
+if not isinstance(doc, dict):
+    print("error=unexpected usage response")
+    sys.exit(0)
+
+def window(obj):
+    if not isinstance(obj, dict):
+        return None, ""
+    return num(obj.get("utilization")), epoch(obj.get("resets_at"))
+
+for key in ("five_hour", "seven_day"):
+    pct, at = window(doc.get(key))
+    if pct is not None:
+        print("%s.percent=%s" % (key, pct))
+    if at != "":
+        print("%s.resets_epoch=%s" % (key, at))
+
+seen = set()
+def scoped(name, pct, at):
+    if not name or name.lower() in seen or pct is None:
+        return
+    seen.add(name.lower())
+    print("scoped=%s|%s|%s" % (name.replace("|", "/"), pct, at))
+
+pct, at = window(doc.get("seven_day_sonnet"))
+scoped("Sonnet", pct, at)
+
+for entry in doc.get("limits") or []:
+    if not isinstance(entry, dict) or entry.get("kind") != "weekly_scoped":
+        continue
+    model = ((entry.get("scope") or {}).get("model") or {}) if isinstance(entry.get("scope"), dict) else {}
+    scoped(model.get("display_name"), num(entry.get("percent")), epoch(entry.get("resets_at")))
+
+extra = doc.get("extra_usage")
+if isinstance(extra, dict) and extra.get("is_enabled"):
+    dp = extra.get("decimal_places")
+    dp = dp if isinstance(dp, int) and 0 <= dp <= 6 else 2
+    cur = extra.get("currency") or ""
+    def money(v):
+        v = num(v)
+        return None if v is None else ("%.*f" % (dp, v / (10 ** dp)))
+    used, cap = money(extra.get("used_credits")), money(extra.get("monthly_limit"))
+    if used is not None and cap is not None:
+        print("extra=extra %s %s of %s" % (cur, used, cap))
+    elif used is not None:
+        print("extra=extra %s %s used" % (cur, used))
+    else:
+        print("extra=extra usage on")
+PYEOF
+)
+
+# The token goes to curl through a stdin config file: not in argv (where `ps`
+# would show it) and not on disk.
+usage_fetch() {
+  _tok=$1; _timeout=$2; _body=$3
+  printf 'header = "Authorization: Bearer %s"\n' "$_tok" \
+    | curl -sS -K - \
+        -H 'anthropic-beta: oauth-2025-04-20' \
+        -H 'User-Agent: claude-code/2.1.183' \
+        -H 'Content-Type: application/json' \
+        --max-time "$_timeout" \
+        -o "$_body" -w '%{http_code}' \
+        "$USAGE_URL" 2>"$_body.err"
+}
+
+probe() {
+  label=$1 timeout=$2
+  P_ERR=''; P_5=''; P_5R=''; P_7=''; P_7R=''; P_TAIL=''; P_BODY=''
+
+  svc=$(registry_service "$label")
+  tok=$("$SECURITY" find-generic-password -a "$KC_ACCOUNT" -s "$svc" -w 2>/dev/null || true)
+  [ -n "$tok" ] || { P_ERR='no Keychain item'; return 1; }
+
+  body=$WORK/body
+  curl_st=0
+  code=$(usage_fetch "$tok" "$timeout" "$body") || curl_st=$?
+  tok=''; unset tok
+
+  if [ "$curl_st" != 0 ]; then
+    case $curl_st in
+      28) P_ERR="timed out after ${timeout}s" ;;
+      6)  P_ERR='cannot resolve the API host' ;;
+      7)  P_ERR='cannot reach the API host' ;;
+      *)  P_ERR="network error (curl exit $curl_st): $(head -n 1 "$body.err" 2>/dev/null | cut -c1-90)" ;;
+    esac
+    return 1
+  fi
+
+  case $code in
+    2*) ;;
+    401|403)
+      P_ERR="$code — token rejected: expired, or a setup-token without the usage scope"
+      return 1 ;;
+    429)
+      P_ERR='429 — rate limited by the usage endpoint'
+      return 1 ;;
+    *)
+      P_ERR="HTTP ${code:-?}: $(tr -d '\n' < "$body" 2>/dev/null | cut -c1-90)"
+      return 1 ;;
+  esac
+
+  flat=$WORK/flat
+  printf '%s' "$FLATTEN" | "$PYTHON" - "$body" > "$flat" 2>/dev/null || {
+    P_ERR='could not parse the usage response'; return 1; }
+  P_BODY=$body
+
+  while IFS='=' read -r k v; do
+    case $k in
+      five_hour.percent) P_5=$v ;;
+      five_hour.resets_epoch) P_5R=$v ;;
+      seven_day.percent) P_7=$v ;;
+      seven_day.resets_epoch) P_7R=$v ;;
+      scoped)
+        n=${v%%|*}; rest=${v#*|}; sp=${rest%%|*}; se=${rest##*|}
+        P_TAIL="${P_TAIL:+$P_TAIL · }$n $(fmt_pct "$sp") $(when "$se")" ;;
+      extra) P_TAIL="${P_TAIL:+$P_TAIL · }$v" ;;
+      error) P_ERR=$v ;;
+    esac
+  done < "$flat"
+
+  [ -z "$P_ERR" ] || return 1
+  if [ -z "$P_5" ] && [ -z "$P_7" ] && [ -z "$P_TAIL" ]; then
+    P_ERR='usage response carried no windows'
+    return 1
+  fi
+  return 0
+}
+
+cmd_list_rich() {
+  quota=1 as_json=0 only='' timeout=10
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --no-quota) quota=0 ;;
+      --json) as_json=1 ;;
+      --account=*) only=${1#--account=} ;;
+      --account) shift; only=${1:-}; [ -n "$only" ] || die '--account requires a value' ;;
+      --timeout=*) timeout=${1#--timeout=} ;;
+      --timeout) shift; timeout=${1:-}; [ -n "$timeout" ] || die '--timeout requires a value' ;;
+      -h|--help) list_usage; return 0 ;;
+      *) list_usage >&2; die "list: unknown option '$1'" ;;
+    esac
+    shift
+  done
+  case $timeout in ''|*[!0-9]*) die 'list: --timeout wants whole seconds' ;; esac
+  [ "$timeout" -gt 0 ] || die 'list: --timeout wants at least 1 second'
+
+  labels=$(registry_labels)
+  if [ -n "$only" ]; then
+    registry_has "$only" || die "unknown account '$only': $(known_accounts_msg)"
+    labels=$only
+  fi
+  if [ -z "$labels" ]; then
+    if [ "$as_json" = 1 ]; then printf '[]\n'
+    else printf 'No accounts configured. Add one with: %s config add <label>\n' "$PROG"; fi
+    return 0
+  fi
+  def=$(registry_default)
+
+  if [ "$quota" = 1 ]; then
+    command -v curl >/dev/null 2>&1 || die 'curl is not on PATH (use --no-quota)'
+    command -v "$PYTHON" >/dev/null 2>&1 || die "$PYTHON is not on PATH (use --no-quota)"
+    WORK=$(mktemp -d "${TMPDIR:-/tmp}/claude-proxy.XXXXXX")
+    trap 'rm -rf "$WORK"' EXIT INT TERM
+  fi
+
+  if [ "$as_json" = 0 ]; then
+    if [ "$quota" = 1 ]; then
+      printf '%-14s %-4s %-9s %-6s %-24s %-6s %-24s %s\n' \
+        LABEL DEF KEYCHAIN 5H '5H RESETS' 7D '7D RESETS' OTHER
+    else
+      printf '%-14s %-4s %-9s %s\n' LABEL DEF KEYCHAIN SERVICE
+    fi
+  fi
+
+  rows=''
+  for l in $labels; do
+    svc=$(registry_service "$l")
+    if "$SECURITY" find-generic-password -a "$KC_ACCOUNT" -s "$svc" >/dev/null 2>&1; then
+      kc=present
+    else
+      kc=MISSING
+    fi
+    [ "$l" = "$def" ] && mark='*' || mark='-'
+
+    P_ERR=''; P_5=''; P_5R=''; P_7=''; P_7R=''; P_TAIL=''; P_BODY=''
+    [ "$quota" = 1 ] && { probe "$l" "$timeout" || true; }
+
+    if [ "$as_json" = 1 ]; then
+      row="  {\"label\": \"$(jesc "$l")\", \"default\": $([ "$l" = "$def" ] && printf true || printf false), \"keychain\": \"$kc\""
+      [ -n "$P_ERR" ] && row="$row, \"error\": \"$(jesc "$P_ERR")\""
+      if [ -n "$P_BODY" ]; then
+        raw=$("$PYTHON" -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])), separators=(", ", ": ")))' "$P_BODY" 2>/dev/null || true)
+        [ -n "$raw" ] && row="$row, \"usage\": $raw"
+      fi
+      row="$row}"
+      if [ -n "$rows" ]; then rows="$rows,
+$row"; else rows=$row; fi
+      continue
+    fi
+
+    if [ "$quota" = 0 ]; then
+      printf '%-14s %-4s %-9s %s\n' "$l" "$mark" "$kc" "$svc"
+    elif [ -n "$P_ERR" ]; then
+      printf '%-14s %-4s %-9s %s\n' "$l" "$mark" "$kc" "$P_ERR"
+    else
+      printf '%-14s %-4s %-9s %-6s %-24s %-6s %-24s %s\n' \
+        "$l" "$mark" "$kc" \
+        "$(fmt_pct "$P_5")" "$(when "$P_5R")" \
+        "$(fmt_pct "$P_7")" "$(when "$P_7R")" "${P_TAIL:--}"
+    fi
+  done
+
+  [ "$as_json" = 1 ] && printf '[\n%s\n]\n' "$rows"
+  return 0
+}
+
 case ${1:-} in
   help|--help|-h)
     usage; exit 0 ;;
+  list)
+    shift
+    cmd_list_rich "$@"
+    exit $? ;;
   config)
     shift
     sub=${1:-}

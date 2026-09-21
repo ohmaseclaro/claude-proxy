@@ -14,6 +14,7 @@ cp "$ROOT/test/fake-claude" "$TMP/bin/claude"
 PATH="$TMP/bin:/usr/bin:/bin"; export PATH
 REGISTRY="$CLAUDE_PROXY_CONFIG_DIR/accounts.json"
 unset CLAUDE_PROXY_ACCOUNT
+PY=/usr/bin/python3
 
 pass=0; fail=0
 ok()  { pass=$((pass + 1)); printf '  ok    %s\n' "$1"; }
@@ -24,6 +25,7 @@ run_in() { _in=$1; shift; out=$(printf '%s\n' "$_in" | "$ROOT/claude-proxy" "$@"
 
 has()    { case $2 in *"$1"*) ok "$3" ;; *) bad "$3" "missing '$1' in: $out" ;; esac; }
 hasnt()  { case $2 in *"$1"*) bad "$3" "found '$1' in: $out" ;; *) ok "$3" ;; esac; }
+matches() { if printf '%s\n' "$out" | grep -qE "$1"; then ok "$2"; else bad "$2" "no match for '$1' in: $out"; fi; }
 status() { if [ "$st" = "$1" ]; then ok "$2"; else bad "$2" "exit $st, wanted $1; output: $out"; fi; }
 
 echo "claude-proxy tests"
@@ -143,6 +145,94 @@ has '"default": null' "$(cat "$REGISTRY")" 'removing the default clears it'
 run -p x
 status 1 'no account and no default exits non-zero'
 has 'no accounts configured' "$out" 'empty registry says how to add one'
+
+# --- list -------------------------------------------------------------------
+# A local stand-in for the usage endpoint; the bearer token picks the scenario.
+"$ROOT/test/fake-usage-server.py" > "$TMP/port" 2>"$TMP/server.err" &
+SERVER=$!
+trap 'kill "$SERVER" 2>/dev/null; rm -rf "$TMP"' EXIT INT TERM
+tries=40
+while [ ! -s "$TMP/port" ] && [ "$tries" -gt 0 ]; do sleep 0.25; tries=$((tries - 1)); done
+PORT=$(cat "$TMP/port" 2>/dev/null)
+[ -n "$PORT" ] && ok 'fake usage endpoint started' || bad 'fake usage endpoint started' "$(cat "$TMP/server.err")"
+export CLAUDE_PROXY_USAGE_URL="http://127.0.0.1:$PORT/api/oauth/usage"
+
+for pair in 'full tok-full' 'minimal tok-minimal' 'garbage tok-garbage' 'empty tok-empty' \
+            'dead tok-dead' 'limited tok-limited' 'slow tok-slow' 'gone tok-gone' 'far tok-far'; do
+  run_in "${pair#* }" config add "${pair%% *}" >/dev/null 2>&1
+done
+rm -f "$FAKE_KEYCHAIN_DIR/${USER}.claude-proxy-gone"
+
+run list --account=full
+status 0 'list --account succeeds'
+has 'LABEL' "$out" 'list prints a header row'
+has '4%' "$out" 'five-hour utilization as a percentage'
+has '10%' "$out" 'seven-day utilization as a percentage'
+has 'Sonnet 12%' "$out" 'dedicated sonnet window is shown'
+has 'Fable 5 31%' "$out" 'model-scoped weekly window from limits[] is shown'
+has 'extra USD 1.42 of 20.00' "$out" 'extra usage is formatted in its currency'
+matches 'in 4h 5[0-9]m \([0-9][0-9]:[0-9][0-9]\)' 'reset shows both relative and absolute time'
+matches 'in 6d 2[23]h \([A-Z][a-z][a-z] [0-9][0-9] [0-9][0-9]:[0-9][0-9]\)' 'a reset on another day carries its date'
+lines=$(printf '%s\n' "$out" | grep -c .)
+[ "$lines" = 2 ] && ok '--account limits the table to one row' || bad '--account limits the table to one row' "$lines lines"
+
+run list --account minimal
+has '77%' "$out" 'a response with only five_hour still renders'
+has '?' "$out" 'absent windows render as ?'
+
+run list --timeout 2
+status 0 'list over every account exits 0 despite failures'
+has 'Sonnet 12%' "$out" 'a healthy row survives its failing neighbours'
+has 'unreadable usage response' "$out" 'invalid JSON is reported in the row'
+has 'carried no windows' "$out" 'a response with no windows is reported'
+has 'usage scope' "$out" '401 explains the token may lack the usage scope'
+has '429' "$out" '429 is reported as rate limiting'
+has 'no Keychain item' "$out" 'an account without a keychain item is reported'
+has 'MISSING' "$out" 'keychain column still says MISSING'
+rows=$(printf '%s\n' "$out" | grep -c .)
+[ "$rows" = 10 ] && ok 'every account gets a row' || bad 'every account gets a row' "$rows lines"
+hasnt 'tok-' "$out" 'list never prints a token'
+
+run list --account=far
+has 'in >99d' "$out" 'an absurd reset time cannot smear the table'
+
+run list --account=slow --timeout 1
+has 'timed out after 1s' "$out" 'a hanging endpoint hits the per-probe timeout'
+
+run list --no-quota
+status 0 'list --no-quota succeeds'
+has 'claude-proxy-full' "$out" '--no-quota falls back to the offline table'
+hasnt '%' "$out" '--no-quota makes no request'
+
+run list --json --account=full
+status 0 'list --json succeeds'
+printf '%s' "$out" | "$PY" -m json.tool > /dev/null 2>&1 \
+  && ok '--json emits valid JSON' || bad '--json emits valid JSON' "$out"
+has '"usage"' "$out" '--json carries the raw usage payload'
+has '"five_hour"' "$out" '--json keeps the endpoint field names'
+has '"default": true' "$out" '--json marks the default account'
+hasnt 'tok-' "$out" '--json never prints a token'
+
+run list --json --account=dead
+has '"error"' "$out" '--json reports a failure per account'
+printf '%s' "$out" | "$PY" -m json.tool > /dev/null 2>&1 \
+  && ok '--json stays valid when a probe fails' || bad '--json stays valid when a probe fails' "$out"
+
+run list --account=nope
+status 1 'list rejects an unknown account'
+run list --bogus
+status 1 'list rejects an unknown option'
+run list --timeout x
+status 1 'list rejects a non-numeric timeout'
+run list --help
+has 'no model request' "$out" 'list --help says the probe costs nothing'
+
+# The endpoint rate-limits without a claude-code User-Agent; the fake enforces
+# it, so a healthy row proves we send it.
+run list --account=full
+has '4%' "$out" 'the claude-code User-Agent and beta header are sent'
+
+kill "$SERVER" 2>/dev/null
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" = 0 ]
