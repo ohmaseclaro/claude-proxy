@@ -88,7 +88,9 @@ pub fn login(label: &str, interactive: bool) -> Result<String, String> {
     let url = authorize_url(&pkce);
 
     eprintln!("\nSigning in {label:?}.");
-    eprintln!("Your browser will open so you can authorize the account you want {label:?} to use.");
+    eprintln!("Your browser will open to authorize the account.");
+    eprintln!("IMPORTANT: it uses whichever account your browser is signed in to at claude.com —");
+    eprintln!("switch accounts there first if you want {label:?} to be a different one.");
     open_browser(&url);
     eprintln!("\nIf it did not open, visit this URL:\n\n{url}\n");
     eprint!("After authorizing, paste the code shown on the page and press Enter:\n> ");

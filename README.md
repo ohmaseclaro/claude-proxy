@@ -54,15 +54,20 @@ export PATH="$HOME/.local/bin:$PATH"
 $ claude-proxy add claude-gmail
 ```
 
-This runs `claude setup-token`, which opens your browser. Sign in with the
-account you want this command to use and authorize it. `claude-proxy` captures
-the long-lived token, stores it securely, and copies itself into `~/.local/bin`
-as `claude-gmail`. The login runs in an isolated, throwaway config directory, so
-completing it never disturbs your existing `claude` login.
+This opens your browser to authorize an account, then asks you to paste back
+the short code the page shows. `claude-proxy` exchanges that code for a
+long-lived token, stores it securely, and copies itself into `~/.local/bin` as
+`claude-gmail`. The token is never printed, written to a file, or logged — it
+goes straight into the keychain.
 
-> `claude setup-token` requires a Claude subscription. The token it mints is
-> long-lived, which is what lets the proxy inject it on every run without a
-> refresh step.
+> **The account is the one your browser is signed in to at claude.com, not the
+> name you chose.** `claude-gmail` is just the command name. If you want this
+> command to use a specific account, sign in to that account at claude.com (or
+> switch to it) *before* you authorize. To point it at a different account
+> later, `claude-proxy remove <name>` and add it again.
+
+> A long-lived token requires a Claude subscription — it is what lets the proxy
+> inject it on every run without a refresh step.
 
 ### Use it
 
@@ -100,6 +105,12 @@ $ claude-proxy remove claude-gmail   # deletes the stored token and the installe
   it installed it is the proxy. `add` makes a command by copying the binary into
   your bin directory under the chosen name — a copy, not a symlink, so it keeps
   working if the original is moved or upgraded.
+- **The login runs Claude Code's own OAuth flow.** `add` builds the same
+  authorization request the `claude` CLI uses (public client id, `user:inference`
+  scope, PKCE S256), opens your browser, and reads back the short code the
+  callback page shows. It exchanges that code for the long-lived token over
+  HTTPS itself — so, unlike `claude setup-token`, the token is never shown on
+  screen.
 - **Token injection, nothing else.** The proxy sets
   `CLAUDE_CODE_OAUTH_TOKEN` to that account's token and unsets
   `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` (either would override the OAuth
@@ -115,9 +126,12 @@ $ claude-proxy remove claude-gmail   # deletes the stored token and the installe
 
 - Tokens are read from and written to the OS keychain (macOS) or an owner-only
   file (everywhere else). They never appear in `argv`, in environment dumps, or
-  in program output.
-- The login flow for a new account runs under a temporary `CLAUDE_CONFIG_DIR`,
-  so it cannot modify your real `~/.claude` login.
+  in program output. On macOS the keychain write goes through `security -i`
+  (the secret on stdin), so it is never an argument and never a terminal prompt.
+- The token is obtained by exchanging the OAuth code ourselves, so it is never
+  displayed — not even once.
+- The proxy injects the token only into the child process's environment and
+  leaves `~/.claude` untouched, so it never disturbs your primary login.
 - `claude-proxy` never commits secrets. See `.gitignore`.
 
 If you find a security issue, please open an issue describing the impact
