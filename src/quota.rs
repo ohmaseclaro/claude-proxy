@@ -168,7 +168,9 @@ pub fn report(account: &Account, force: bool) -> Report {
     let blob = match creds::read(&source) {
         Ok(Some(b)) => b,
         Ok(None) => {
+            // Claude leaves the last identity in `.claude.json` after a logout.
             r.logged_in = false;
+            r.email = None;
             return r;
         }
         Err(e) => {
@@ -505,6 +507,8 @@ pub fn short_duration(secs: i64) -> String {
         format!("{d}d{h}h")
     } else if h > 0 {
         format!("{h}h{m:02}m")
+    } else if m == 0 && secs > 0 {
+        "<1m".into()
     } else {
         format!("{m}m")
     }
@@ -634,6 +638,7 @@ mod tests {
         assert_eq!(short_duration(40 * 60), "40m");
         assert_eq!(short_duration(2 * 3600 + 10 * 60), "2h10m");
         assert_eq!(short_duration(3 * 86_400 + 4 * 3600), "3d4h");
+        assert_eq!(short_duration(30), "<1m");
         assert_eq!(short_duration(-5), "0m");
     }
 }
