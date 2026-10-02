@@ -1,11 +1,11 @@
 # claude-proxy
 
 Run [Claude Code](https://docs.claude.com/en/docs/claude-code) under more than
-one account at the same time — each account becomes its own command, with its
-own credential, and they never conflict.
+one account at the same time — each account becomes its own command, backed by
+its own fully independent Claude profile, so they never conflict.
 
 ```console
-$ claude-proxy add claude-gmail     # sign in once; installs a `claude-gmail` command
+$ claude-proxy add claude-gmail     # creates a profile, logs it in, installs a `claude-gmail` command
 $ claude-gmail                       # a full Claude Code session on that account
 $ claude-gmail -p "summarize this"   # every claude flag works — it is a transparent proxy
 $ claude                             # your original login is completely untouched
@@ -17,22 +17,20 @@ One binary. The name you invoke it under decides what it does: run it as
 
 ## Why
 
-Claude Code keeps a single logged-in account per machine. If you work across a
-personal account, a work account, and a client account, you are stuck logging
-in and out. `claude-proxy` gives each account a dedicated command that runs
-Claude Code under that account's own token **and** its own config directory, so
-the accounts are fully independent: each has its own identity, settings, and
-transcripts, and logging one out (or switching the primary login) never touches
-another. Your primary `claude` is left completely alone.
+Claude Code keeps a single logged-in account per machine, so working across a
+personal, a work, and a client account means logging in and out all day.
 
-Each proxy's transcripts live under its account directory
-(`~/.config/claude-proxy/accounts/<name>/projects`), not the primary
-`~/.claude/projects` — that separation is what keeps accounts from bleeding into
-each other.
+`claude-proxy` gives each account its own command and its own Claude
+**profile** — a dedicated `CLAUDE_CONFIG_DIR`. Each profile has its own login,
+identity, settings, and transcripts, so the accounts are completely independent:
+logging one out, or switching your primary login, never touches another. Your
+primary `claude` is left entirely alone.
+
+The trade-off of real isolation is that a proxy's transcripts live under its
+profile (`~/.config/claude-proxy/accounts/<name>/projects`), not the primary
+`~/.claude/projects`.
 
 ## Install
-
-### From source
 
 Requires a Rust toolchain (1.82+) and [Claude Code](https://docs.claude.com/en/docs/claude-code) on your `PATH`.
 
@@ -59,25 +57,14 @@ export PATH="$HOME/.local/bin:$PATH"
 $ claude-proxy add claude-gmail
 ```
 
-This opens your browser to authorize an account, then asks you to paste back
-the short code the page shows. `claude-proxy` exchanges that code for a
-long-lived token, stores it securely, and copies itself into `~/.local/bin` as
-`claude-gmail`. The token is never printed, written to a file, or logged — it
-goes straight into the keychain.
+This creates an isolated profile and opens **Claude's own login** inside it. Log
+in with the account you want this command to use, then type `/exit`.
+`claude-proxy` confirms the login landed and installs the `claude-gmail`
+command.
 
-> **The account is the one your browser is signed in to at claude.com, not the
-> name you chose.** `claude-gmail` is just the command name. If you want this
-> command to use a specific account, sign in to that account at claude.com (or
-> switch to it) *before* you authorize. The browser's consent screen shows which
-> account you are authorizing — that is the moment to confirm it is the right
-> one. To point a command at a different account later, `claude-proxy remove
-> <name>` and add it again.
->
-> Because each proxy runs in its own config dir, `claude-<name> /status` shows
-> that proxy's real account — a quick way to confirm which account a command is.
-
-> A long-lived token requires a Claude subscription — it is what lets the proxy
-> inject it on every run without a refresh step.
+> Each `add` signs in a separate account — log in as a different one each time.
+> Because each proxy has its own profile, `claude-<name> /status` shows that
+> command's real account, so you can always confirm which is which.
 
 ### Use it
 
@@ -88,6 +75,7 @@ everything after the name is forwarded to `claude` verbatim:
 $ claude-gmail                       # interactive session
 $ claude-gmail -p "fix the failing test"
 $ claude-gmail --model opus mcp list
+$ claude-gmail /status               # shows this account, in its own profile
 ```
 
 ### List what you have
@@ -96,17 +84,17 @@ $ claude-gmail --model opus mcp list
 $ claude-proxy list
   claude-gmail
   work
-
-$ claude-proxy list --quota          # also fetch each account's remaining usage
-  claude-gmail  [session 13%, weekly 4%]
-  work          [token lacks usage scope]
 ```
 
 ### Remove an account
 
 ```console
-$ claude-proxy remove claude-gmail   # deletes the stored token and the installed command
+$ claude-proxy remove claude-gmail
 ```
+
+This removes the command. The account's profile (its login and transcripts) is
+kept; `claude-proxy` prints where it is so you can delete it yourself if you
+want.
 
 ## How it works
 
@@ -115,54 +103,43 @@ $ claude-proxy remove claude-gmail   # deletes the stored token and the installe
   it installed it is the proxy. `add` makes a command by copying the binary into
   your bin directory under the chosen name — a copy, not a symlink, so it keeps
   working if the original is moved or upgraded.
-- **The login runs Claude Code's own OAuth flow.** `add` builds the same
-  authorization request the `claude` CLI uses (public client id, `user:inference`
-  scope, PKCE S256), opens your browser, and reads back the short code the
-  callback page shows. It exchanges that code for the long-lived token over
-  HTTPS itself — so, unlike `claude setup-token`, the token is never shown on
-  screen.
-- **Token plus an isolated config dir.** The proxy sets
-  `CLAUDE_CODE_OAUTH_TOKEN` to that account's token, points `CLAUDE_CONFIG_DIR`
-  at that account's own directory, and unsets `ANTHROPIC_API_KEY` /
-  `ANTHROPIC_AUTH_TOKEN` (either would override the OAuth token and silently bill
-  the wrong account), then `exec`s `claude` with your arguments. The config dir
-  is what makes accounts independent: Claude keeps each login's identity,
-  settings, and transcripts there, so a proxy resolves its *own* account and is
-  unaffected by the primary login. (Without it, a proxy shares `~/.claude` — its
-  `/status` and logged-in state track the primary, which is a common surprise.)
-  The primary `~/.claude` is never modified.
-- **Credentials stay out of reach.** On macOS the token lives in the login
-  Keychain (via `security`, the same place Claude Code keeps its own). Elsewhere
-  it is a mode-`0600` file under `~/.config/claude-proxy`. The token is never
-  passed on a command line, never written into the repo, and never printed.
+- **Each account is its own Claude profile.** `add` creates a dedicated
+  `CLAUDE_CONFIG_DIR` and runs Claude's own login into it, so Claude mints,
+  stores, and refreshes that account's credentials itself. `claude-proxy` never
+  handles a token.
+- **The proxy just points Claude at the profile.** It sets `CLAUDE_CONFIG_DIR`
+  to the account's directory and clears any inherited `CLAUDE_CODE_OAUTH_TOKEN`
+  / `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` (so a global credential can't
+  override the account), then `exec`s `claude` with your arguments. The config
+  dir is the whole mechanism: Claude keys its login, identity, settings, and
+  transcripts off it, so the account resolves correctly for both interactive and
+  `-p` runs and is unaffected by the primary login. The primary `~/.claude` is
+  never modified.
 
 ## Security
 
-- Tokens are read from and written to the OS keychain (macOS) or an owner-only
-  file (everywhere else). They never appear in `argv`, in environment dumps, or
-  in program output. On macOS the keychain write goes through `security -i`
-  (the secret on stdin), so it is never an argument and never a terminal prompt.
-- The token is obtained by exchanging the OAuth code ourselves, so it is never
-  displayed — not even once.
-- The proxy injects the token only into the child process's environment and
-  leaves `~/.claude` untouched, so it never disturbs your primary login.
-- `claude-proxy` never commits secrets. See `.gitignore`.
+- `claude-proxy` never handles your credentials. Each account logs in through
+  Claude's own flow, and Claude stores the credentials in that profile exactly
+  as it does for a normal login. There is no token in `argv`, in the repo, in
+  program output, or anywhere `claude-proxy` writes.
+- A proxy clears any inherited credential from the environment before running
+  Claude, so a `CLAUDE_CODE_OAUTH_TOKEN` exported in your shell cannot silently
+  override the account's own login.
+- The primary `~/.claude` is never touched.
 
-If you find a security issue, please open an issue describing the impact
-(without including any real tokens).
+If you find a security issue, please open an issue describing the impact.
 
 ## Building and testing
 
 ```console
 $ cargo build
-$ cargo test                                 # hermetic — no real keychain, HOME, or network
+$ cargo test                                 # hermetic — no real HOME, keychain, or network
 $ cargo clippy --all-targets -- -D warnings
 $ cargo fmt --all -- --check
 ```
 
-Tests never touch a real credential store, home directory, or the network: the
-file-backed store and all path resolvers take an injected directory, and the
-usage lookup is exercised through its pure response parser.
+Tests never touch a real home directory, credential store, or the network: the
+path resolvers and the login check take an injected directory.
 
 ## Contributing
 
