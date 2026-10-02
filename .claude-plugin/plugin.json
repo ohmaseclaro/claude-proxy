@@ -1,0 +1,12 @@
+{
+  "name": "quota-router",
+  "version": "0.2.0",
+  "description": "Teaches agents to run Claude through `claude-proxy auto`, which spreads work across your Claude accounts by remaining quota.",
+  "author": {
+    "name": "ohmaseclaro",
+    "url": "https://github.com/ohmaseclaro"
+  },
+  "homepage": "https://github.com/ohmaseclaro/claude-proxy",
+  "repository": "https://github.com/ohmaseclaro/claude-proxy",
+  "license": "MIT"
+}

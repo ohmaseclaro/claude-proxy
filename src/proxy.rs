@@ -22,8 +22,9 @@ use crate::paths::account_config_dir;
 /// The environment `claude` sees under a proxy, as (key, value|unset) pairs.
 ///
 /// Pure, so the policy is testable without spawning anything:
-/// - `CLAUDE_CONFIG_DIR` points at the account's own dir, isolating login,
-///   identity, settings, and transcripts from the primary and other proxies;
+/// - `CLAUDE_CONFIG_DIR` points at the account's own dir (or is unset for the
+///   primary profile — it may be inherited when `auto` runs inside a proxy
+///   session), isolating login and identity from every other account;
 /// - `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, and `ANTHROPIC_AUTH_TOKEN`
 ///   are unset, because any inherited one would override the account's own
 ///   stored login and silently use the wrong credentials.
@@ -32,26 +33,37 @@ pub enum EnvOp {
     Unset(&'static str),
 }
 
-pub fn proxy_env(config_dir: &str) -> Vec<EnvOp> {
+pub fn proxy_env(config_dir: Option<&str>) -> Vec<EnvOp> {
     vec![
-        EnvOp::Set("CLAUDE_CONFIG_DIR", config_dir.to_string()),
+        match config_dir {
+            Some(dir) => EnvOp::Set("CLAUDE_CONFIG_DIR", dir.to_string()),
+            None => EnvOp::Unset("CLAUDE_CONFIG_DIR"),
+        },
         EnvOp::Unset("CLAUDE_CODE_OAUTH_TOKEN"),
         EnvOp::Unset("ANTHROPIC_API_KEY"),
         EnvOp::Unset("ANTHROPIC_AUTH_TOKEN"),
     ]
 }
 
-/// Run `claude` as `label`, forwarding `args`. Returns the child's exit code,
-/// or an error before the child is reached.
+/// Run `claude` as the proxy `label`, forwarding `args`. Returns the child's
+/// exit code, or an error before the child is reached.
 pub fn run(label: &str, args: &[OsString]) -> Result<i32, String> {
     let config_dir = account_config_dir(label);
     std::fs::create_dir_all(&config_dir)
         .map_err(|e| format!("could not create the config dir for {label:?}: {e}"))?;
-    let config_dir = config_dir.to_string_lossy().into_owned();
+    crate::shared::link_shared(&config_dir);
+    exec_claude(Some(&config_dir.to_string_lossy()), args, label)
+}
 
+/// Run `claude` on the primary (`~/.claude`) profile, forwarding `args`.
+pub fn run_primary(args: &[OsString]) -> Result<i32, String> {
+    exec_claude(None, args, crate::quota::PRIMARY_LABEL)
+}
+
+fn exec_claude(config_dir: Option<&str>, args: &[OsString], label: &str) -> Result<i32, String> {
     let mut command = std::process::Command::new("claude");
     command.args(args);
-    for op in proxy_env(&config_dir) {
+    for op in proxy_env(config_dir) {
         match op {
             EnvOp::Set(k, v) => {
                 command.env(k, v);
@@ -94,9 +106,12 @@ fn classify_spawn_error(err: std::io::Error) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn proxy_env_sets_the_config_dir_and_clears_inherited_credentials() {
-        let ops = proxy_env("/home/me/.config/claude-proxy/accounts/gmail");
+    fn split(
+        ops: Vec<EnvOp>,
+    ) -> (
+        std::collections::HashMap<&'static str, String>,
+        Vec<&'static str>,
+    ) {
         let mut set = std::collections::HashMap::new();
         let mut unset = Vec::new();
         for op in ops {
@@ -107,6 +122,14 @@ mod tests {
                 EnvOp::Unset(k) => unset.push(k),
             }
         }
+        (set, unset)
+    }
+
+    #[test]
+    fn proxy_env_sets_the_config_dir_and_clears_inherited_credentials() {
+        let (set, unset) = split(proxy_env(Some(
+            "/home/me/.config/claude-proxy/accounts/gmail",
+        )));
         assert_eq!(
             set.get("CLAUDE_CONFIG_DIR").map(String::as_str),
             Some("/home/me/.config/claude-proxy/accounts/gmail")
@@ -116,5 +139,13 @@ mod tests {
         assert!(unset.contains(&"CLAUDE_CODE_OAUTH_TOKEN"));
         assert!(unset.contains(&"ANTHROPIC_API_KEY"));
         assert!(unset.contains(&"ANTHROPIC_AUTH_TOKEN"));
+    }
+
+    #[test]
+    fn the_primary_profile_clears_an_inherited_config_dir() {
+        let (set, unset) = split(proxy_env(None));
+        assert!(!set.contains_key("CLAUDE_CONFIG_DIR"));
+        assert!(unset.contains(&"CLAUDE_CONFIG_DIR"));
+        assert!(unset.contains(&"CLAUDE_CODE_OAUTH_TOKEN"));
     }
 }

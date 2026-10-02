@@ -51,6 +51,7 @@ pub fn run(
     let dir = account_config_dir(label);
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("could not create the profile dir for {label:?}: {e}"))?;
+    crate::shared::link_shared(&dir);
     seed_profile(&dir);
 
     eprintln!("\nSigning in {label:?} — opening Claude's login.");

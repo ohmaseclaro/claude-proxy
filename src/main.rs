@@ -14,10 +14,13 @@
 
 mod add;
 mod cli;
+mod creds;
 mod install;
 mod paths;
 mod proxy;
+mod quota;
 mod registry;
+mod shared;
 
 use std::ffi::OsString;
 use std::path::PathBuf;

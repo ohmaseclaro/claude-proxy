@@ -66,7 +66,10 @@ impl Registry {
 /// A proxy label must be a safe command name: it becomes a file in the user's
 /// bin and a Keychain service, so no slashes, spaces, or leading dash.
 pub fn valid_label(label: &str) -> bool {
-    !label.is_empty()
+    // `claude` would shadow the real binary (the proxy would exec itself) and
+    // names the primary profile in `list`/`auto`.
+    !matches!(label, "claude" | "claude-proxy")
+        && !label.is_empty()
         && label.len() <= 64
         && label
             .bytes()
@@ -86,7 +89,17 @@ mod tests {
         for ok in ["claude-gmail", "work", "acct.2", "a_b-c", "x"] {
             assert!(valid_label(ok), "{ok} should be valid");
         }
-        for bad in ["", "-leading", "has space", "a/b", "a;b", "../etc", "a$b"] {
+        for bad in [
+            "",
+            "-leading",
+            "has space",
+            "a/b",
+            "a;b",
+            "../etc",
+            "a$b",
+            "claude",
+            "claude-proxy",
+        ] {
             assert!(!valid_label(bad), "{bad:?} should be rejected");
         }
     }

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "quota-router",
+  "description": "Run Claude Code under multiple accounts and let agents pick the one with the most quota left.",
+  "owner": {
+    "name": "ohmaseclaro",
+    "url": "https://github.com/ohmaseclaro"
+  },
+  "plugins": [
+    {
+      "name": "quota-router",
+      "description": "Teaches agents to run Claude through `claude-proxy auto`, which spreads work across your Claude accounts by remaining quota.",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}
