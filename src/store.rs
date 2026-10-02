@@ -49,6 +49,15 @@ fn credentials_dir() -> PathBuf {
     config_dir().join("credentials")
 }
 
+/// The isolated Claude config directory for one proxy.
+///
+/// Each proxy gets its own, so its login identity, settings, and transcripts
+/// never share state with the primary `~/.claude` login or with another proxy.
+/// `claude` is pointed here via `CLAUDE_CONFIG_DIR`.
+pub fn account_config_dir(label: &str) -> PathBuf {
+    config_dir().join("accounts").join(label)
+}
+
 /// The user's home directory, cross-platform.
 pub fn home() -> PathBuf {
     if let Ok(h) = std::env::var("HOME") {

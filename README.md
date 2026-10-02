@@ -19,11 +19,16 @@ One binary. The name you invoke it under decides what it does: run it as
 
 Claude Code keeps a single logged-in account per machine. If you work across a
 personal account, a work account, and a client account, you are stuck logging
-in and out. `claude-proxy` gives each account a dedicated command that injects
-that account's token for just that run. Nothing is shared, nothing is
-clobbered, and your transcripts still land in the usual
-`~/.claude/projects` directory because the proxy changes **only** the
-credential — not where Claude Code reads and writes.
+in and out. `claude-proxy` gives each account a dedicated command that runs
+Claude Code under that account's own token **and** its own config directory, so
+the accounts are fully independent: each has its own identity, settings, and
+transcripts, and logging one out (or switching the primary login) never touches
+another. Your primary `claude` is left completely alone.
+
+Each proxy's transcripts live under its account directory
+(`~/.config/claude-proxy/accounts/<name>/projects`), not the primary
+`~/.claude/projects` — that separation is what keeps accounts from bleeding into
+each other.
 
 ## Install
 
@@ -68,10 +73,8 @@ goes straight into the keychain.
 > one. To point a command at a different account later, `claude-proxy remove
 > <name>` and add it again.
 >
-> The token is inference-only, so `claude-<name> /status` does not display the
-> account email (it shows `Auth token: CLAUDE_CODE_OAUTH_TOKEN`). The account is
-> verified on the consent screen at `add` time, and the command name is the
-> label you go by afterward.
+> Because each proxy runs in its own config dir, `claude-<name> /status` shows
+> that proxy's real account — a quick way to confirm which account a command is.
 
 > A long-lived token requires a Claude subscription — it is what lets the proxy
 > inject it on every run without a refresh step.
@@ -118,12 +121,16 @@ $ claude-proxy remove claude-gmail   # deletes the stored token and the installe
   callback page shows. It exchanges that code for the long-lived token over
   HTTPS itself — so, unlike `claude setup-token`, the token is never shown on
   screen.
-- **Token injection, nothing else.** The proxy sets
-  `CLAUDE_CODE_OAUTH_TOKEN` to that account's token and unsets
-  `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` (either would override the OAuth
-  token and silently bill the wrong account), then `exec`s `claude` with your
-  arguments. The default config directory is left alone, so transcripts,
-  settings, and MCP config are exactly where `claude` always puts them.
+- **Token plus an isolated config dir.** The proxy sets
+  `CLAUDE_CODE_OAUTH_TOKEN` to that account's token, points `CLAUDE_CONFIG_DIR`
+  at that account's own directory, and unsets `ANTHROPIC_API_KEY` /
+  `ANTHROPIC_AUTH_TOKEN` (either would override the OAuth token and silently bill
+  the wrong account), then `exec`s `claude` with your arguments. The config dir
+  is what makes accounts independent: Claude keeps each login's identity,
+  settings, and transcripts there, so a proxy resolves its *own* account and is
+  unaffected by the primary login. (Without it, a proxy shares `~/.claude` — its
+  `/status` and logged-in state track the primary, which is a common surprise.)
+  The primary `~/.claude` is never modified.
 - **Credentials stay out of reach.** On macOS the token lives in the login
   Keychain (via `security`, the same place Claude Code keeps its own). Elsewhere
   it is a mode-`0600` file under `~/.config/claude-proxy`. The token is never

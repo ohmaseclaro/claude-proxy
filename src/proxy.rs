@@ -1,20 +1,29 @@
 //! Running as a proxy: become `claude` for one account.
 //!
 //! When the binary is invoked under a proxy name (via `argv[0]`), it injects
-//! that account's long-lived token and hands off to the real `claude` with
-//! every argument untouched. The default config dir is left alone, so
-//! transcripts land in `~/.claude/projects` exactly as they would for plain
-//! `claude` — the token is the only thing that differs, and it lives only in
-//! this process's environment.
+//! that account's long-lived token **and** points `claude` at that account's own
+//! config directory, then hands off to the real `claude` with every argument
+//! untouched.
+//!
+//! The dedicated config dir is what makes accounts truly independent: Claude
+//! keeps each login's identity, settings, and transcripts under
+//! `CLAUDE_CONFIG_DIR`, so without it a proxy would share `~/.claude` with the
+//! primary login — its `/status`, account identity, and logged-in state would
+//! track whatever the primary did (logging the primary out appeared to log the
+//! proxy out too). With a per-account dir, the proxy resolves its *own* account
+//! and is unaffected by the primary login. The cost is that a proxy's
+//! transcripts live under its account dir, not `~/.claude/projects`.
 
 use std::ffi::OsString;
 
-use crate::store::Store;
+use crate::store::{account_config_dir, Store};
 
 /// The environment `claude` sees under a proxy, as (key, value|unset) pairs.
 ///
 /// Pure, so the policy is testable without spawning anything:
 /// - `CLAUDE_CODE_OAUTH_TOKEN` is set to the account's token;
+/// - `CLAUDE_CONFIG_DIR` points at the account's own dir, isolating identity,
+///   settings, and transcripts from the primary login and other proxies;
 /// - `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` are unset, because either
 ///   would take precedence over the OAuth token and silently bill the wrong
 ///   account (the gatik wrapper's hard-won note).
@@ -23,9 +32,10 @@ pub enum EnvOp {
     Unset(&'static str),
 }
 
-pub fn proxy_env(token: &str) -> Vec<EnvOp> {
+pub fn proxy_env(token: &str, config_dir: &str) -> Vec<EnvOp> {
     vec![
         EnvOp::Set("CLAUDE_CODE_OAUTH_TOKEN", token.to_string()),
+        EnvOp::Set("CLAUDE_CONFIG_DIR", config_dir.to_string()),
         EnvOp::Unset("ANTHROPIC_API_KEY"),
         EnvOp::Unset("ANTHROPIC_AUTH_TOKEN"),
     ]
@@ -41,9 +51,14 @@ pub fn run(store: &dyn Store, label: &str, args: &[OsString]) -> Result<i32, Str
             format!("no token stored for {label:?}. Create it with:  claude-proxy add {label}")
         })?;
 
+    let config_dir = account_config_dir(label);
+    std::fs::create_dir_all(&config_dir)
+        .map_err(|e| format!("could not create the config dir for {label:?}: {e}"))?;
+    let config_dir = config_dir.to_string_lossy().into_owned();
+
     let mut command = std::process::Command::new("claude");
     command.args(args);
-    for op in proxy_env(&token) {
+    for op in proxy_env(&token, &config_dir) {
         match op {
             EnvOp::Set(k, v) => {
                 command.env(k, v);
@@ -87,19 +102,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn proxy_env_injects_the_token_and_clears_the_overriding_keys() {
-        let ops = proxy_env("sk-ant-oat01-tok");
-        let mut set = None;
+    fn proxy_env_injects_the_token_the_config_dir_and_clears_the_overriding_keys() {
+        let ops = proxy_env(
+            "sk-ant-oat01-tok",
+            "/home/me/.config/claude-proxy/accounts/gmail",
+        );
+        let mut set = std::collections::HashMap::new();
         let mut unset = Vec::new();
         for op in ops {
             match op {
-                EnvOp::Set(k, v) => set = Some((k, v)),
+                EnvOp::Set(k, v) => {
+                    set.insert(k, v);
+                }
                 EnvOp::Unset(k) => unset.push(k),
             }
         }
         assert_eq!(
-            set,
-            Some(("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-tok".to_string()))
+            set.get("CLAUDE_CODE_OAUTH_TOKEN").map(String::as_str),
+            Some("sk-ant-oat01-tok")
+        );
+        assert_eq!(
+            set.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+            Some("/home/me/.config/claude-proxy/accounts/gmail")
         );
         assert!(unset.contains(&"ANTHROPIC_API_KEY"));
         assert!(unset.contains(&"ANTHROPIC_AUTH_TOKEN"));
