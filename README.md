@@ -63,8 +63,15 @@ goes straight into the keychain.
 > **The account is the one your browser is signed in to at claude.com, not the
 > name you chose.** `claude-gmail` is just the command name. If you want this
 > command to use a specific account, sign in to that account at claude.com (or
-> switch to it) *before* you authorize. To point it at a different account
-> later, `claude-proxy remove <name>` and add it again.
+> switch to it) *before* you authorize. The browser's consent screen shows which
+> account you are authorizing — that is the moment to confirm it is the right
+> one. To point a command at a different account later, `claude-proxy remove
+> <name>` and add it again.
+>
+> The token is inference-only, so `claude-<name> /status` does not display the
+> account email (it shows `Auth token: CLAUDE_CODE_OAUTH_TOKEN`). The account is
+> verified on the consent screen at `add` time, and the command name is the
+> label you go by afterward.
 
 > A long-lived token requires a Claude subscription — it is what lets the proxy
 > inject it on every run without a refresh step.
