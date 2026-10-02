@@ -15,11 +15,9 @@
 mod add;
 mod cli;
 mod install;
-mod oauth;
+mod paths;
 mod proxy;
-mod quota;
 mod registry;
-mod store;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -37,8 +35,7 @@ fn main() {
     // program name is forwarded to `claude` verbatim.
     if invoked != MANAGER_NAME {
         let args: Vec<OsString> = raw.split_off(1);
-        let store = store::default_store();
-        match proxy::run(store.as_ref(), &invoked, &args) {
+        match proxy::run(&invoked, &args) {
             Ok(code) => std::process::exit(code),
             Err(message) => {
                 eprintln!("{invoked}: {message}");

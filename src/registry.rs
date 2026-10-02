@@ -1,14 +1,14 @@
 //! The list of configured proxies and which one is the default.
 //!
-//! A small JSON file beside the config dir. It holds no secrets — only labels
-//! and the default choice; the tokens live in the [`crate::store`].
+//! A small JSON file beside the config dir. It holds no secrets — only the list
+//! of proxy labels.
 
 use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::store::config_dir;
+use crate::paths::config_dir;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Registry {

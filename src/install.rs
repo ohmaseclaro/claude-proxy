@@ -9,7 +9,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::store::home;
+use crate::paths::home;
 
 /// The default install directory: `~/.local/bin`.
 ///
