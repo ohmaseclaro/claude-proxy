@@ -59,3 +59,23 @@ fn basename(arg: &OsString) -> String {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| MANAGER_NAME.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn name_of(arg: &str) -> String {
+        basename(&OsString::from(arg))
+    }
+
+    #[test]
+    fn basename_is_the_invoked_command_not_the_path() {
+        assert_eq!(name_of("/usr/local/bin/claude-proxy"), MANAGER_NAME);
+        assert_eq!(name_of("claude-proxy"), MANAGER_NAME);
+        assert_eq!(name_of("./target/release/claude-proxy"), MANAGER_NAME);
+        // An installed proxy routes to the proxy role.
+        assert_eq!(name_of("/home/me/.local/bin/claude-gmail"), "claude-gmail");
+        // The `.exe` suffix is dropped so a Windows label still matches.
+        assert_eq!(name_of("claude-gmail.exe"), "claude-gmail");
+    }
+}
