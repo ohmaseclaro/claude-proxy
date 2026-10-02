@@ -105,37 +105,14 @@ impl Store for KeychainStore {
     }
 
     fn set(&self, label: &str, token: &str) -> io::Result<()> {
-        use std::io::Write;
-        use std::process::Stdio;
-        // `-w` with no value reads the secret from stdin, keeping it out of the
-        // process table. `-U` replaces an existing item.
-        let mut child = std::process::Command::new("/usr/bin/security")
-            .args([
-                "add-generic-password",
-                "-a",
-                &Self::account(),
-                "-s",
-                &Self::service(label),
-                "-U",
-                "-w",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        child
-            .stdin
-            .take()
-            .expect("stdin was piped")
-            .write_all(token.as_bytes())?;
-        let out = child.wait_with_output()?;
-        if !out.status.success() {
-            return Err(io::Error::other(format!(
-                "security add-generic-password failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            )));
-        }
-        Ok(())
+        // `security add-generic-password -w <value>` with no value reads the
+        // passphrase from /dev/tty, so a piped stdin is ignored and the user is
+        // prompted. Feeding the whole command to `security -i` instead puts the
+        // secret on stdin — out of the process table *and* out of the tty
+        // prompt. Pattern borrowed from ai-usagebar.
+        let command = compose_write_command(&Self::account(), &Self::service(label), token)
+            .ok_or_else(|| io::Error::other("token is not storable (newline or too long)"))?;
+        write_via_security_stdin(&command)
     }
 
     fn delete(&self, label: &str) -> io::Result<()> {
@@ -158,6 +135,70 @@ impl Store for KeychainStore {
 
 #[cfg(target_os = "macos")]
 use std::process::Stdio;
+
+/// Operational cap for one `security -i` command line, a margin below the
+/// undocumented reader limit. Our tokens are ~100 bytes, far under it.
+#[cfg(target_os = "macos")]
+const SECURITY_STDIN_SAFE_MAX: usize = 4000;
+
+/// Quote one value for `security -i`'s line tokenizer (backslash escapes inside
+/// a double-quoted token). `None` on a newline, which would end the line early
+/// and let the rest be read as a further command.
+#[cfg(target_os = "macos")]
+fn quote_for_security_stdin(value: &str) -> Option<String> {
+    if value.contains('\n') || value.contains('\r') {
+        return None;
+    }
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        if ch == '\\' || ch == '"' {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out.push('"');
+    Some(out)
+}
+
+/// Compose the `add-generic-password` line, `None` if any part cannot be quoted
+/// or the whole exceeds the reader's safe maximum.
+#[cfg(target_os = "macos")]
+fn compose_write_command(account: &str, service: &str, token: &str) -> Option<String> {
+    let command = format!(
+        "add-generic-password -U -a {} -s {} -w {}\n",
+        quote_for_security_stdin(account)?,
+        quote_for_security_stdin(service)?,
+        quote_for_security_stdin(token)?,
+    );
+    (command.len() <= SECURITY_STDIN_SAFE_MAX).then_some(command)
+}
+
+/// Feed one composed command to `security -i` over stdin, keeping the secret out
+/// of argv and off the tty prompt.
+#[cfg(target_os = "macos")]
+fn write_via_security_stdin(command: &str) -> io::Result<()> {
+    use std::io::Write;
+    let mut child = std::process::Command::new("/usr/bin/security")
+        .arg("-i")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .expect("stdin was piped")
+        .write_all(command.as_bytes())?;
+    let out = child.wait_with_output()?;
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(io::Error::other(format!(
+        "security add-generic-password failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    )))
+}
 
 /// A mode-0600 file per label under a directory. The store off macOS, and the
 /// one every test uses — hence unused only in a non-test macOS build.
@@ -264,5 +305,24 @@ mod tests {
         std::fs::write(dir.path().join("blank.token"), "   \n").unwrap();
         let store = FileStore::at(dir.path().to_path_buf());
         assert_eq!(store.get("blank").unwrap(), None);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod keychain_tests {
+    use super::*;
+
+    #[test]
+    fn compose_quotes_bounds_and_refuses_newlines() {
+        let c = compose_write_command("me", "claude-proxy-x", "sk-ant-oat01-tok").unwrap();
+        assert!(c.starts_with(
+            "add-generic-password -U -a \"me\" -s \"claude-proxy-x\" -w \"sk-ant-oat01-tok\""
+        ));
+        assert!(c.ends_with('\n'));
+        // A newline in the secret is refused rather than splitting the command.
+        assert!(compose_write_command("me", "svc", "a\nb").is_none());
+        // Quotes and backslashes in the secret are escaped for the tokenizer.
+        let c2 = compose_write_command("me", "svc", "a\"b\\c").unwrap();
+        assert!(c2.contains("-w \"a\\\"b\\\\c\""));
     }
 }

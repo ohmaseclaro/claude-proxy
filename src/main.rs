@@ -15,6 +15,7 @@
 mod add;
 mod cli;
 mod install;
+mod oauth;
 mod proxy;
 mod quota;
 mod registry;
