@@ -1,0 +1,12 @@
+# Build output
+/target
+
+# Secrets must never be committed (defense in depth; the tool stores tokens in
+# the OS keychain or a mode-0600 file under ~/.config, never in the repo).
+.env
+*.token
+*.credentials.json
+
+# Editor / OS noise
+**/*.rs.bk
+.DS_Store

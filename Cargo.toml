@@ -1,0 +1,33 @@
+[package]
+name = "claude-proxy"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Run Claude Code under multiple accounts at once — each as its own command, with its own credential, never conflicting."
+license = "MIT"
+repository = "https://github.com/ohmaseclaro/claude-proxy"
+readme = "README.md"
+keywords = ["claude", "claude-code", "cli", "oauth", "accounts"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "claude-proxy"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Blocking HTTP for the quota listing: a CLI wants one synchronous call, not an
+# async runtime. ureq is tiny and brings rustls, so there is no system OpenSSL.
+ureq = { version = "2", features = ["json"] }
+# Hidden token entry on the fallback paste path, cross-platform.
+rpassword = "7"
+# Isolated config dir for the login probe, so `claude setup-token` never
+# touches the user's real `~/.claude`.
+tempfile = "3"
+
+[profile.release]
+strip = true
+lto = true
+opt-level = "z"
