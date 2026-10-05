@@ -3,20 +3,18 @@
 //! One binary, two roles, chosen by the name it is invoked under (`argv[0]`),
 //! the busybox pattern:
 //!
-//! - invoked as **`claude-proxy`**: the manager (`add`, `list`, `remove`,
-//!   `default`);
+//! - invoked as **`claude-proxy`**: the manager (`add`, `list`, `auto`, `run`,
+//!   …);
 //! - invoked as **any other name** (e.g. `claude-gmail`, installed by `add`):
-//!   the proxy — inject that account's token and become `claude`.
-//!
-//! The token is injected only into the child's environment; the default config
-//! directory is untouched, so transcripts land in the usual place and the
-//! primary `claude` login is never disturbed.
+//!   the proxy — become `claude` on that account's own profile.
 
 mod add;
 mod agents;
+mod asks;
 mod cli;
 mod creds;
 mod install;
+mod mcp;
 mod paths;
 mod proxy;
 mod quota;
@@ -33,6 +31,17 @@ use std::path::PathBuf;
 const MANAGER_NAME: &str = "claude-proxy";
 
 fn main() {
+    // `claude-proxy status x | head` closes stdout early: end quietly, as the
+    // signal would, instead of panicking in `println!`.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let message = info.payload().downcast_ref::<String>();
+        if message.is_some_and(|m| m.contains("Broken pipe")) {
+            std::process::exit(141);
+        }
+        default_hook(info);
+    }));
+
     let mut raw: Vec<OsString> = std::env::args_os().collect();
     let argv0 = raw.first().cloned().unwrap_or_default();
     let invoked = basename(&argv0);

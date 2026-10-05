@@ -8,50 +8,88 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use crate::quota::{now_secs, short_duration, PRIMARY_LABEL};
-use crate::render::render_line;
-use crate::runs::{self, Meta, NewRun, State, WaitError};
+use crate::asks::{self, Reply};
+use crate::paths::home;
+use crate::quota::{now_secs, short_duration};
+use crate::render::{ask_lines, render_line};
+use crate::runs::{self, Meta, NewRun, State, Waited};
 
-pub fn run(
-    message: &str,
-    account: &str,
-    name: Option<String>,
-    cwd: Option<PathBuf>,
-    wait: bool,
-    as_json: bool,
-    claude_args: Vec<String>,
-) -> Result<i32, String> {
-    let message = read_message(message)?;
-    let pool = runs::parse_pool(account)?;
+pub struct RunOpts {
+    pub message: String,
+    pub account: String,
+    pub name: Option<String>,
+    pub cwd: Option<PathBuf>,
+    pub wait: bool,
+    pub json: bool,
+    /// `Some("")` forks the calling Claude session.
+    pub fork: Option<String>,
+    pub worktree: bool,
+    pub agent: Option<String>,
+    pub claude_args: Vec<String>,
+}
+
+pub fn run(opts: RunOpts) -> Result<i32, String> {
+    let message = read_message(&opts.message)?;
+    let pool = runs::parse_pool(&opts.account)?;
+    let fork_from = opts.fork.map(fork_source).transpose()?;
     let first = runs::first_account(&pool)?;
-    let cwd = match cwd {
+    let cwd = match opts.cwd {
         Some(dir) => dir,
         None => std::env::current_dir().map_err(|e| format!("no current directory: {e}"))?,
     };
     let cwd = cwd
         .canonicalize()
         .map_err(|e| format!("bad --cwd {}: {e}", cwd.display()))?;
+    let mut claude_args = opts.claude_args;
+    if let Some(agent) = opts.agent {
+        claude_args.extend(["--agent".to_string(), agent]);
+    }
     let meta = runs::start(NewRun {
         account: first,
         pool,
-        name,
+        name: opts.name,
         cwd: cwd.to_string_lossy().into_owned(),
         claude_args,
         message,
+        fork_from,
+        worktree: opts.worktree,
     })?;
     eprintln!(
-        "claude-proxy: run {} on {} — `claude-proxy watch {}` to follow",
+        "claude-proxy: run {} on {} — follow it with:  claude-proxy watch {}",
         meta.id, meta.account, meta.id
     );
-    if as_json {
+    if let Some(w) = &meta.worktree {
+        eprintln!("claude-proxy: working in {} (branch {})", w.path, w.branch);
+    }
+    if opts.json {
         println!("{}", status_json(&meta));
-    } else if !wait {
+    } else if !opts.wait {
         println!("{}", meta.id);
     }
-    if wait {
+    if opts.wait {
         return wait_and_print(&meta.id, None);
     }
     Ok(0)
+}
+
+/// The session `--fork` starts from: the one given, or the Claude session
+/// this command runs inside.
+fn fork_source(id: String) -> Result<String, String> {
+    let id = if id.is_empty() {
+        std::env::var("CLAUDE_CODE_SESSION_ID")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .ok_or(
+                "--fork copies the Claude session it runs inside, \
+                 but CLAUDE_CODE_SESSION_ID is not set; use --fork-from <session-id>",
+            )?
+    } else {
+        id
+    };
+    if runs::find_session(&home().join(".claude").join("projects"), &id).is_none() {
+        return Err(format!("no session {id} in ~/.claude/projects to fork"));
+    }
+    Ok(id)
 }
 
 pub fn runs(as_json: bool) -> Result<i32, String> {
@@ -125,6 +163,13 @@ pub fn status(id: &str, as_json: bool) -> Result<i32, String> {
     }
     let row = |k: &str, v: &str| println!("  {k:<8} {v}");
     row("state", &state_line);
+    if state == State::Waiting {
+        for ask in asks::pending(&runs::run_dir(id)) {
+            for line in ask_lines(id, &ask.tool, &ask.input, true) {
+                println!("    {line}");
+            }
+        }
+    }
     let failover = match m.pool.as_slice() {
         [] => "auto failover".to_string(),
         [_] => "pinned".to_string(),
@@ -153,17 +198,17 @@ pub fn status(id: &str, as_json: bool) -> Result<i32, String> {
     }
     row("cost", &format!("${:.2}", m.cost_usd));
     row("cwd", &m.cwd);
-    let resume = if m.account == PRIMARY_LABEL {
-        "claude".to_string()
-    } else {
-        m.account.clone()
-    };
+    if let Some(w) = &m.worktree {
+        row("worktree", &format!("branch {} (of {})", w.branch, w.repo));
+    }
+    if let Some(parent) = &m.fork_from {
+        row("forked", &format!("from session {parent}"));
+    }
+    row("session", &m.session_id);
+    row("watch", &format!("claude-proxy watch {id}"));
     row(
-        "session",
-        &format!(
-            "{}  (take over when idle: cd {} && {resume} --resume {})",
-            m.session_id, m.cwd, m.session_id
-        ),
+        "take over",
+        &format!("claude-proxy attach {id}  (when it is not working)"),
     );
     Ok(0)
 }
@@ -186,6 +231,9 @@ fn status_json(m: &Meta) -> serde_json::Value {
         "working": runs::alive(&dir),
         "cost_usd": m.cost_usd,
         "cwd": m.cwd,
+        "worktree": m.worktree,
+        "fork_from": m.fork_from,
+        "asks": asks::pending(&dir).iter().map(|a| json!({"tool": a.tool, "input": a.input})).collect::<Vec<_>>(),
         "session_id": m.session_id,
         "created_at": m.created_at,
         "updated_at": m.updated_at,
@@ -292,8 +340,8 @@ pub fn wait(id: &str, timeout: Option<u64>) -> Result<i32, String> {
 }
 
 fn wait_and_print(id: &str, timeout: Option<Duration>) -> Result<i32, String> {
-    match runs::wait(id, timeout) {
-        Ok(m) => {
+    match runs::wait(id, timeout)? {
+        Waited::Done(m) => {
             let state = runs::effective_state(&m);
             if let Some((text, _)) = runs::last_result(id) {
                 println!("{text}");
@@ -301,15 +349,43 @@ fn wait_and_print(id: &str, timeout: Option<Duration>) -> Result<i32, String> {
             eprintln!("claude-proxy: run {id} is {}", state.as_str());
             Ok(if state == State::Idle { 0 } else { 1 })
         }
-        Err(WaitError::Timeout(m)) => {
+        Waited::Asking(pending) => {
+            for ask in &pending {
+                for line in ask_lines(id, &ask.tool, &ask.input, true) {
+                    println!("{line}");
+                }
+            }
+            eprintln!(
+                "claude-proxy: run {id} is waiting for an answer; reply, then \
+                 `claude-proxy wait {id}` again"
+            );
+            Ok(2)
+        }
+        Waited::TimedOut(m) => {
             eprintln!(
                 "claude-proxy: run {id} is still {} (timed out)",
                 runs::effective_state(&m).as_str()
             );
             Ok(124)
         }
-        Err(WaitError::Other(e)) => Err(e),
     }
+}
+
+pub fn reply(id: &str, reply: Reply) -> Result<i32, String> {
+    let ask = asks::reply(id, reply)?;
+    eprintln!(
+        "claude-proxy: answered run {id}'s {} — `claude-proxy wait {id}` to continue waiting",
+        if ask.is_question() {
+            "question".to_string()
+        } else {
+            format!("request to use {}", ask.tool)
+        }
+    );
+    Ok(0)
+}
+
+pub fn attach(id: &str) -> Result<i32, String> {
+    runs::attach(id)
 }
 
 pub fn kill(id: &str) -> Result<i32, String> {
@@ -324,8 +400,11 @@ pub fn kill(id: &str) -> Result<i32, String> {
 }
 
 pub fn rm(id: &str) -> Result<i32, String> {
-    runs::remove(id)?;
+    let kept = runs::remove(id)?;
     println!("Removed run {id}.");
+    for k in kept {
+        println!("Kept {k}.");
+    }
     Ok(0)
 }
 

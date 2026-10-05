@@ -66,6 +66,23 @@ fn marker(v: &Value, full: bool) -> Vec<String> {
                 )],
             }
         }
+        Some("ask") => ask_lines(
+            v.get("run").and_then(Value::as_str).unwrap_or("<id>"),
+            v.get("tool").and_then(Value::as_str).unwrap_or("tool"),
+            v.get("input").unwrap_or(&Value::Null),
+            full,
+        ),
+        Some("answer") => match (v["behavior"].as_str(), v["answers"].as_object()) {
+            (Some("allow"), Some(answers)) if !answers.is_empty() => answers
+                .iter()
+                .map(|(q, a)| format!("  ↪ {q} → {}", a.as_str().unwrap_or("")))
+                .collect(),
+            (Some("allow"), _) => vec!["  ↪ allowed".into()],
+            _ => vec![format!(
+                "  ↪ denied: {}",
+                v["message"].as_str().unwrap_or("")
+            )],
+        },
         Some("note") => vec![format!(
             "  · {}",
             v.get("text").and_then(Value::as_str).unwrap_or("")
@@ -84,6 +101,58 @@ fn marker(v: &Value, full: bool) -> Vec<String> {
         }
         _ => Vec::new(),
     }
+}
+
+/// A pending question or permission prompt, with the commands that answer it.
+pub fn ask_lines(id: &str, tool: &str, input: &Value, full: bool) -> Vec<String> {
+    if tool == "AskUserQuestion" {
+        let mut out: Vec<String> = input["questions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|q| {
+                let options: Vec<&str> = q["options"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|o| o.as_str().or_else(|| o["label"].as_str()))
+                    .collect();
+                let mut line = format!("? {}", q["question"].as_str().unwrap_or(""));
+                if !options.is_empty() {
+                    line.push_str(&format!("  [{}]", options.join(" | ")));
+                }
+                if q["multiSelect"].as_bool() == Some(true) {
+                    line.push_str("  (any of them)");
+                }
+                line
+            })
+            .collect();
+        let slots = vec!["\"…\""; out.len().max(1)].join(" ");
+        out.push(format!(
+            "    claude-proxy answer {id} {slots}   or let it decide:  claude-proxy deny {id} \"decide yourself\""
+        ));
+        return out;
+    }
+    let mut out = vec![format!(
+        "? permission to use {tool}  {}",
+        tool_summary(tool, input)
+    )];
+    if full {
+        let pretty = serde_json::to_string_pretty(input).unwrap_or_default();
+        let mut lines = indented(&pretty, "      ", true);
+        if lines.len() > 40 {
+            let more = lines.len() - 40;
+            lines.truncate(40);
+            lines.push(format!(
+                "      (+{more} lines: claude-proxy status {id} --json)"
+            ));
+        }
+        out.extend(lines);
+    }
+    out.push(format!(
+        "    claude-proxy allow {id}   or   claude-proxy deny {id} \"<reason>\""
+    ));
+    out
 }
 
 fn blocks(v: &Value) -> Vec<Value> {
@@ -326,6 +395,42 @@ mod tests {
                 "reason":"could not sign in"}"#
             ),
             ["⇄ a could not sign in — no other account to continue on"]
+        );
+    }
+
+    #[test]
+    fn asks_and_answers() {
+        assert_eq!(
+            r(
+                r#"{"type":"claude_proxy","event":"ask","run":"abc123","tool":"AskUserQuestion",
+                "input":{"questions":[{"question":"Which colour?","options":[{"label":"Red"},{"label":"Blue"}],
+                "multiSelect":false}]}}"#
+            ),
+            [
+                "? Which colour?  [Red | Blue]",
+                "    claude-proxy answer abc123 \"…\"   or let it decide:  claude-proxy deny abc123 \"decide yourself\""
+            ]
+        );
+        assert_eq!(
+            r(
+                r#"{"type":"claude_proxy","event":"ask","run":"abc123","tool":"Bash",
+                "input":{"command":"cargo publish"}}"#
+            ),
+            [
+                "? permission to use Bash  cargo publish",
+                "    claude-proxy allow abc123   or   claude-proxy deny abc123 \"<reason>\""
+            ]
+        );
+        assert_eq!(
+            r(
+                r#"{"type":"claude_proxy","event":"answer","behavior":"allow",
+                "answers":{"Which colour?":"blue"}}"#
+            ),
+            ["  ↪ Which colour? → blue"]
+        );
+        assert_eq!(
+            r(r#"{"type":"claude_proxy","event":"answer","behavior":"deny","message":"no"}"#),
+            ["  ↪ denied: no"]
         );
     }
 

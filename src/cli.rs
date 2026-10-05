@@ -12,6 +12,7 @@ use std::io::IsTerminal;
 use clap::{Parser, Subcommand};
 use serde_json::json;
 
+use crate::asks::Reply;
 use crate::install;
 use crate::paths::account_config_dir;
 use crate::quota::{self, Report};
@@ -60,8 +61,8 @@ enum Command {
     ///
     /// Claude flags go after `--`, e.g.
     /// `claude-proxy run "fix the tests" -- --permission-mode acceptEdits`.
-    /// A background run cannot answer permission prompts, so pass the
-    /// permission mode or allowed tools the task needs.
+    /// Permission prompts and questions the run cannot settle wait for
+    /// `allow`, `deny`, or `answer`; `wait` returns when one comes up.
     Run {
         /// The task. `-` reads it from stdin.
         message: String,
@@ -82,6 +83,19 @@ enum Command {
         /// Print the run as JSON instead of just its id.
         #[arg(long)]
         json: bool,
+        /// Start from a copy of the conversation of the Claude session this
+        /// runs inside (`$CLAUDE_CODE_SESSION_ID`).
+        #[arg(long)]
+        fork: bool,
+        /// Start from a copy of this Claude session's conversation.
+        #[arg(long, value_name = "SESSION_ID")]
+        fork_from: Option<String>,
+        /// Work in a new git worktree on its own branch (`claude-proxy/<id>`).
+        #[arg(long)]
+        worktree: bool,
+        /// Run as one of your Claude agents (`~/.claude/agents`), e.g. a GSD one.
+        #[arg(long)]
+        agent: Option<String>,
         /// Arguments for `claude`, after `--`.
         #[arg(last = true)]
         claude_args: Vec<String>,
@@ -146,19 +160,37 @@ enum Command {
     },
     /// Block until a run has nothing running or queued, then print its answer.
     /// Exits 0 when the last turn succeeded, 1 when it failed or was killed,
-    /// 124 on timeout.
+    /// 2 when it is waiting for an answer (printed), 124 on timeout.
     Wait {
         id: String,
         /// Give up after this many seconds.
         #[arg(long)]
         timeout: Option<u64>,
     },
+    /// Let a waiting run use the tool it asked for.
+    Allow { id: String },
+    /// Refuse what a waiting run asked for; it reads your reason and carries on.
+    Deny {
+        id: String,
+        /// What to tell it instead.
+        reason: Option<String>,
+    },
+    /// Answer a waiting run's question, one answer per question, in order.
+    Answer {
+        id: String,
+        #[arg(required = true)]
+        answers: Vec<String>,
+    },
+    /// Open a run's session interactively in this terminal.
+    Attach { id: String },
     /// Stop a run's current turn. Queued messages are kept; `send` resumes.
     Kill { id: String },
-    /// Delete a run that is not working.
+    /// Delete a run that is not working, and its clean worktree.
     Rm { id: String },
     #[command(name = "__drain", hide = true)]
     Drain { id: String },
+    #[command(name = "__permit", hide = true)]
+    Permit { id: String },
 }
 
 /// Entry point for the manager role. Returns a process exit code.
@@ -188,8 +220,23 @@ fn dispatch(command: Command) -> Result<i32, String> {
             cwd,
             wait,
             json,
+            fork,
+            fork_from,
+            worktree,
+            agent,
             claude_args,
-        } => crate::agents::run(&message, &account, name, cwd, wait, json, claude_args),
+        } => crate::agents::run(crate::agents::RunOpts {
+            message,
+            account,
+            name,
+            cwd,
+            wait,
+            json,
+            fork: fork_from.or(fork.then(String::new)),
+            worktree,
+            agent,
+            claude_args,
+        }),
         Command::Runs { json } => crate::agents::runs(json),
         Command::Status { id, json } => crate::agents::status(&id, json),
         Command::Read {
@@ -214,9 +261,19 @@ fn dispatch(command: Command) -> Result<i32, String> {
             account,
         } => crate::agents::send(&id, &message, account.as_deref()),
         Command::Wait { id, timeout } => crate::agents::wait(&id, timeout),
+        Command::Allow { id } => crate::agents::reply(&id, Reply::Allow),
+        Command::Deny { id, reason } => crate::agents::reply(
+            &id,
+            Reply::Deny(reason.unwrap_or_else(|| {
+                "Declined. Carry on without it, or say what you need and why.".into()
+            })),
+        ),
+        Command::Answer { id, answers } => crate::agents::reply(&id, Reply::Answer(answers)),
+        Command::Attach { id } => crate::agents::attach(&id),
         Command::Kill { id } => crate::agents::kill(&id),
         Command::Rm { id } => crate::agents::rm(&id),
         Command::Drain { id } => crate::runs::drain(&id).map(|()| 0),
+        Command::Permit { id } => crate::asks::serve(&id).map(|()| 0),
     }
 }
 

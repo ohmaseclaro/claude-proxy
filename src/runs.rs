@@ -15,7 +15,8 @@
 //! stream-json plus our message/turn markers), `inbox/` (queued messages),
 //! `account` (a pending account switch), `stop` (a kill in progress),
 //! `pending` (a drainer was requested and has not taken the lock yet),
-//! `stderr.log`, `run.lock`.
+//! `asks/` (decisions Claude is waiting for, see `asks`), `mcp.json` (the MCP
+//! servers each turn starts with), `stderr.log`, `run.lock`.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -26,6 +27,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::asks::{self, Ask};
 use crate::paths::{account_config_dir, config_dir, home};
 use crate::quota::{self, now_secs, PRIMARY_LABEL};
 use crate::registry::Registry;
@@ -37,6 +39,9 @@ pub enum State {
     Queued,
     /// A turn is running.
     Working,
+    /// A turn is blocked on a question or permission prompt (`allow`, `deny`,
+    /// `answer`). Never stored: derived from the run's pending asks.
+    Waiting,
     /// The last turn finished cleanly; `send` continues the conversation.
     Idle,
     /// The last turn failed; queued messages wait for the next `send`.
@@ -50,6 +55,7 @@ impl State {
         match self {
             State::Queued => "queued",
             State::Working => "working",
+            State::Waiting => "waiting",
             State::Idle => "idle",
             State::Failed => "failed",
             State::Killed => "killed",
@@ -97,6 +103,19 @@ pub struct Meta {
     /// Why the run last moved to another account.
     #[serde(default)]
     pub moved: Option<String>,
+    /// The session the first turn forks (`--fork-session`).
+    #[serde(default)]
+    pub fork_from: Option<String>,
+    #[serde(default)]
+    pub worktree: Option<Worktree>,
+}
+
+/// A git worktree created for the run, on its own branch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Worktree {
+    pub path: String,
+    pub branch: String,
+    pub repo: String,
 }
 
 pub fn runs_dir() -> PathBuf {
@@ -142,6 +161,8 @@ pub struct NewRun {
     pub cwd: String,
     pub claude_args: Vec<String>,
     pub message: String,
+    pub fork_from: Option<String>,
+    pub worktree: bool,
 }
 
 /// Create a run, queue its first message, and start it in the background.
@@ -154,12 +175,23 @@ pub fn start(new: NewRun) -> Result<Meta, String> {
         }
     };
     fs::create_dir_all(dir.join("inbox")).map_err(|e| format!("could not create the run: {e}"))?;
+    let (worktree, cwd) = if new.worktree {
+        match make_worktree(Path::new(&new.cwd), &id) {
+            Ok((w, cwd)) => (Some(w), cwd.to_string_lossy().into_owned()),
+            Err(e) => {
+                let _ = fs::remove_dir_all(&dir);
+                return Err(e);
+            }
+        }
+    } else {
+        (None, new.cwd)
+    };
     let now = now_secs();
     let mut meta = Meta {
         id: id.clone(),
         name: new.name,
         account: new.account,
-        cwd: new.cwd,
+        cwd,
         session_id: new_uuid(),
         claude_args: new.claude_args,
         created_at: now,
@@ -176,6 +208,8 @@ pub fn start(new: NewRun) -> Result<Meta, String> {
         cost_usd: 0.0,
         pool: new.pool,
         moved: None,
+        fork_from: new.fork_from,
+        worktree,
     };
     save(&dir, &mut meta);
     enqueue(&dir, &new.message)?;
@@ -287,11 +321,15 @@ fn pending(dir: &Path) -> bool {
 /// The state to show: a run the drainer abandoned mid-turn is failed.
 pub fn effective_state(meta: &Meta) -> State {
     let dir = run_dir(&meta.id);
-    if !alive(&dir) && pending(&dir) {
+    let alive = alive(&dir);
+    if !alive && pending(&dir) {
         return State::Queued;
     }
+    if alive && !asks::pending(&dir).is_empty() {
+        return State::Waiting;
+    }
     match meta.state {
-        State::Working if !alive(&dir) => State::Failed,
+        State::Working if !alive => State::Failed,
         State::Idle if queued(&dir) > 0 => State::Queued,
         s => s,
     }
@@ -534,13 +572,16 @@ pub fn first_account(pool: &[String]) -> Result<String, String> {
         .ok_or_else(|| "no logged-in account to use. Add one with:  claude-proxy add <name>".into())
 }
 
-/// The session's transcript as the current account's Claude sees it. Searched
-/// by id, so the project-directory naming does not matter.
+/// The session's transcript as the current account's Claude sees it.
 fn session_file(meta: &Meta) -> Option<PathBuf> {
-    let projects = account_dir(&meta.account)
-        .unwrap_or_else(|| home().join(".claude"))
-        .join("projects");
-    let name = format!("{}.jsonl", meta.session_id);
+    let config = account_dir(&meta.account).unwrap_or_else(|| home().join(".claude"));
+    find_session(&config.join("projects"), &meta.session_id)
+}
+
+/// A session's transcript, searched by id so the project-directory naming
+/// does not matter. Every profile shares `~/.claude/projects`.
+pub fn find_session(projects: &Path, session_id: &str) -> Option<PathBuf> {
+    let name = format!("{session_id}.jsonl");
     fs::read_dir(projects)
         .ok()?
         .flatten()
@@ -568,42 +609,18 @@ fn run_turn(dir: &Path, meta: &mut Meta, text: &str) -> TurnEnd {
         json!({"event": "turn_start", "turn": meta.turns, "account": meta.account}),
     );
 
-    // Built first: it links the shared setup, so the session is visible below.
-    let mut cmd = crate::proxy::claude_command(account_dir(&meta.account).as_deref());
-    let session_flag = if session_file(meta).is_some() {
-        "--resume"
-    } else {
-        "--session-id"
-    };
-    cmd.args(["-p", "--output-format", "stream-json", "--verbose"])
-        .arg(session_flag)
-        .arg(&meta.session_id)
-        .args(&meta.claude_args)
-        .current_dir(&meta.cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped());
-    if let Ok(log) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("stderr.log"))
-    {
-        cmd.stderr(log);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // Its own group, so `kill` stops it and every tool process it started.
-        cmd.process_group(0);
-    }
-
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            let error = if e.kind() == std::io::ErrorKind::NotFound {
+    let spawned = turn_command(dir, meta).and_then(|mut cmd| {
+        cmd.spawn().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
                 "`claude` is not on PATH".to_string()
             } else {
                 format!("could not start claude: {e}")
-            };
+            }
+        })
+    });
+    let mut child = match spawned {
+        Ok(c) => c,
+        Err(error) => {
             marker(
                 dir,
                 json!({"event": "turn_end", "turn": meta.turns, "exit": null, "error": error}),
@@ -629,7 +646,8 @@ fn run_turn(dir: &Path, meta: &mut Meta, text: &str) -> TurnEnd {
             .open(dir.join("events.jsonl")),
     ) {
         for line in BufReader::new(out).lines().map_while(Result::ok) {
-            let _ = writeln!(events, "{line}");
+            // One write per line: `__permit` appends to the same file.
+            let _ = events.write_all(format!("{line}\n").as_bytes());
             match serde_json::from_str::<Value>(&line) {
                 Ok(v) => {
                     if observe(meta, &v, &mut signals) {
@@ -644,6 +662,7 @@ fn run_turn(dir: &Path, meta: &mut Meta, text: &str) -> TurnEnd {
         }
     }
     let code = child.wait().ok().and_then(|s| s.code());
+    asks::clear(dir);
     let killed = dir.join("stop").exists();
     meta.turn_pid = None;
     meta.last_exit = code;
@@ -666,6 +685,70 @@ fn run_turn(dir: &Path, meta: &mut Meta, text: &str) -> TurnEnd {
     };
     save(dir, meta);
     end
+}
+
+/// The `claude` process for one turn: the run's account, session, MCP servers
+/// (the user's, plus `__permit` for the decisions it cannot make alone), and
+/// the caller's Claude flags.
+fn turn_command(dir: &Path, meta: &Meta) -> Result<Command, String> {
+    let account = account_dir(&meta.account);
+    // Built first: it links the shared setup, so the session is visible below.
+    let mut cmd = crate::proxy::claude_command(account.as_deref());
+    let mut servers = match account {
+        Some(_) => crate::mcp::user_servers(Path::new(&meta.cwd)),
+        None => Default::default(),
+    };
+    let exe = std::env::current_exe().map_err(|e| format!("could not locate claude-proxy: {e}"))?;
+    servers.insert(
+        asks::SERVER.into(),
+        // An ask may wait for a person: allow it a day rather than Claude's
+        // default tool timeout.
+        json!({"type": "stdio", "command": exe, "args": ["__permit", meta.id], "timeout": 86_400_000}),
+    );
+    let config = dir.join("mcp.json");
+    crate::mcp::write(&config, servers)
+        .map_err(|e| format!("could not write the MCP config: {e}"))?;
+    cmd.args(["-p", "--output-format", "stream-json", "--verbose"])
+        .arg(crate::mcp::flag(&config));
+    if !meta
+        .claude_args
+        .iter()
+        .any(|a| a.starts_with("--permission-prompt-tool"))
+    {
+        cmd.args(["--permission-prompt-tool", asks::PROMPT_TOOL]);
+    }
+    match (session_file(meta).is_some(), &meta.fork_from) {
+        (true, _) => cmd.args(["--resume", &meta.session_id]),
+        (false, Some(parent)) => cmd.args([
+            "--resume",
+            parent,
+            "--fork-session",
+            "--session-id",
+            &meta.session_id,
+        ]),
+        (false, None) => cmd.args(["--session-id", &meta.session_id]),
+    };
+    cmd.args(&meta.claude_args)
+        .current_dir(&meta.cwd)
+        .env("CLAUDE_CODE_ENABLE_ASK_USER_QUESTION_TOOL", "1")
+        // Lets hooks and skills inside the run know they are in one.
+        .env("CLAUDE_PROXY_RUN", &meta.id)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
+    if let Ok(log) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("stderr.log"))
+    {
+        cmd.stderr(log);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Its own group, so `kill` stops it and every tool process it started.
+        cmd.process_group(0);
+    }
+    Ok(cmd)
 }
 
 /// Fold one stream-json event into the run's status and the turn's signals.
@@ -719,7 +802,9 @@ fn observe(meta: &mut Meta, v: &Value, signals: &mut Signals) -> bool {
     }
 }
 
-fn marker(dir: &Path, mut event: Value) {
+/// Append one of our own events to the transcript, in a single write so it
+/// never interleaves with another process appending.
+pub fn marker(dir: &Path, mut event: Value) {
     event["type"] = json!("claude_proxy");
     event["at"] = json!(now_secs());
     if let Ok(mut f) = OpenOptions::new()
@@ -727,7 +812,7 @@ fn marker(dir: &Path, mut event: Value) {
         .append(true)
         .open(dir.join("events.jsonl"))
     {
-        let _ = writeln!(f, "{event}");
+        let _ = f.write_all(format!("{event}\n").as_bytes());
     }
 }
 
@@ -776,23 +861,71 @@ fn signal_group(pid: u32, _force: bool) {
         .status();
 }
 
-pub enum WaitError {
-    Timeout(Box<Meta>),
-    Other(String),
+pub enum Waited {
+    Done(Meta),
+    /// Blocked on decisions only the caller can make.
+    Asking(Vec<Ask>),
+    TimedOut(Meta),
 }
 
-/// Block until the run has nothing running or queued.
-pub fn wait(id: &str, timeout: Option<Duration>) -> Result<Meta, WaitError> {
+/// Block until the run has nothing running or queued, or needs an answer.
+pub fn wait(id: &str, timeout: Option<Duration>) -> Result<Waited, String> {
     let started = Instant::now();
+    let dir = run_dir(id);
     loop {
-        if finished(id).map_err(WaitError::Other)? {
-            return load(id).map_err(WaitError::Other);
+        if finished(id)? {
+            return Ok(Waited::Done(load(id)?));
+        }
+        let asks = asks::pending(&dir);
+        if !asks.is_empty() && alive(&dir) {
+            return Ok(Waited::Asking(asks));
         }
         if timeout.is_some_and(|t| started.elapsed() >= t) {
-            return Err(load(id).map_or_else(WaitError::Other, |m| WaitError::Timeout(Box::new(m))));
+            return Ok(Waited::TimedOut(load(id)?));
         }
         std::thread::sleep(Duration::from_millis(500));
     }
+}
+
+/// Open the run's session interactively in this terminal. Messages sent
+/// meanwhile wait behind the run lock and are delivered after it closes.
+pub fn attach(id: &str) -> Result<i32, String> {
+    let mut meta = load(id)?;
+    let dir = run_dir(id);
+    let lock = lock_file(&dir).map_err(|e| e.to_string())?;
+    if pending(&dir) || lock.try_lock().is_err() {
+        return Err(format!(
+            "run {id} is working; wait for it or stop it first:  claude-proxy kill {id}"
+        ));
+    }
+    let mut cmd = crate::proxy::interactive_command(&meta.account, Path::new(&meta.cwd))?;
+    let flag = if session_file(&meta).is_some() {
+        "--resume"
+    } else {
+        "--session-id"
+    };
+    cmd.arg(flag).arg(&meta.session_id).current_dir(&meta.cwd);
+    marker(
+        &dir,
+        json!({"event": "note", "text": "opened interactively"}),
+    );
+    meta.activity = Some("open interactively (claude-proxy attach)".into());
+    save(&dir, &mut meta);
+    let status = cmd.status();
+    let mut meta = load(id)?;
+    meta.activity = None;
+    save(&dir, &mut meta);
+    marker(
+        &dir,
+        json!({"event": "note", "text": "interactive session closed"}),
+    );
+    let _ = lock.unlock();
+    if queued(&dir) > 0 {
+        request_drainer(id)?;
+    }
+    status
+        .map(|s| s.code().unwrap_or(1))
+        .map_err(|e| format!("could not start claude: {e}"))
 }
 
 /// Every run, most recently active first.
@@ -807,15 +940,78 @@ pub fn list() -> Vec<Meta> {
     all
 }
 
-pub fn remove(id: &str) -> Result<(), String> {
-    load(id)?;
+/// Delete a run, and its worktree and branch when nothing would be lost.
+/// Returns what was kept.
+pub fn remove(id: &str) -> Result<Vec<String>, String> {
+    let meta = load(id)?;
     let dir = run_dir(id);
     if alive(&dir) {
         return Err(format!(
             "run {id} is working; kill it first:  claude-proxy kill {id}"
         ));
     }
-    fs::remove_dir_all(&dir).map_err(|e| format!("could not remove run {id}: {e}"))
+    let mut kept = Vec::new();
+    if let Some(w) = &meta.worktree {
+        let repo = Path::new(&w.repo);
+        if git(repo, &["worktree", "remove", &w.path]).is_err() {
+            kept.push(format!(
+                "its worktree {} on branch {} (uncommitted changes)",
+                w.path, w.branch
+            ));
+        } else if git(repo, &["branch", "-d", &w.branch]).is_err() {
+            kept.push(format!("its branch {} (not merged)", w.branch));
+        }
+    }
+    fs::remove_dir_all(&dir).map_err(|e| format!("could not remove run {id}: {e}"))?;
+    Ok(kept)
+}
+
+/// A worktree of the repository containing `cwd`, on a new branch from HEAD.
+/// Returns it and the directory in it matching `cwd`.
+fn make_worktree(cwd: &Path, id: &str) -> Result<(Worktree, PathBuf), String> {
+    let repo = git(cwd, &["rev-parse", "--show-toplevel"]).map_err(|_| {
+        format!(
+            "--worktree needs a git repository; {} is not in one",
+            cwd.display()
+        )
+    })?;
+    let path = config_dir().join("worktrees").join(id);
+    let branch = format!("claude-proxy/{id}");
+    git(
+        Path::new(&repo),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &branch,
+            &path.to_string_lossy(),
+            "HEAD",
+        ],
+    )
+    .map_err(|e| format!("could not create a worktree: {e}"))?;
+    let sub = cwd.strip_prefix(&repo).unwrap_or(Path::new(""));
+    let run_cwd = path.join(sub);
+    let worktree = Worktree {
+        path: path.to_string_lossy().into_owned(),
+        branch,
+        repo,
+    };
+    Ok((worktree, run_cwd))
+}
+
+fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("could not run git: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
 }
 
 /// The final text of the last turn, from the transcript, and whether it
@@ -927,6 +1123,8 @@ mod tests {
             cost_usd: 0.0,
             pool: vec![],
             moved: None,
+            fork_from: None,
+            worktree: None,
         }
     }
 

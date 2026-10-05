@@ -127,19 +127,49 @@ $ claude-proxy wait $id                  # blocks, prints the final answer
 
 | | |
 |---|---|
-| `claude-proxy run "<task>" [-- <claude flags>]` | start; `--account` (`auto`, a name to pin, or `a,b` in order), `--name`, `--cwd`, `--wait`, `--json`; `-` reads the task from stdin |
-| `claude-proxy status <id>` | state, what it is doing right now, Claude's summary of its last turn, cost (`--json`) |
+| `claude-proxy run "<task>" [-- <claude flags>]` | start; `-` reads the task from stdin. `--account` (`auto`, a name to pin, or `a,b` in order), `--agent <type>` (one of your agents, e.g. a GSD one), `--worktree`, `--fork` / `--fork-from <session>`, `--name`, `--cwd`, `--wait`, `--json` |
+| `claude-proxy status <id>` | state, what it is doing right now, what it is asking, Claude's summary of its last turn, cost (`--json`) |
 | `claude-proxy read <id>` | the transcript (`-n N`, `-f` to follow, `--full`, `--json` raw events) |
 | `claude-proxy tail <id>` / `watch <id>` | the last entries / follow live until it stops |
 | `claude-proxy result <id>` | the final answer of the last turn |
 | `claude-proxy send <id> "<message>"` | a follow-up, delivered when the current turn ends; `--account` (`auto`, a name, or `a,b`) moves the run to other accounts |
-| `claude-proxy wait <id>` | block until it is done (exit 0 done, 1 failed or killed, 124 `--timeout`) |
+| `claude-proxy wait <id>` | block until it is done (exit 0 done, 1 failed or killed, 2 waiting for an answer, 124 `--timeout`) |
+| `claude-proxy allow <id>` / `deny <id> ["why"]` | settle a permission prompt the run is waiting on |
+| `claude-proxy answer <id> "<answer>"…` | answer the question it asked, one answer per question |
+| `claude-proxy attach <id>` | open the session interactively in your terminal |
 | `claude-proxy kill <id>` | stop the current turn (the conversation is kept; `send` resumes it) |
-| `claude-proxy runs` / `rm <id>` | every run / delete one |
+| `claude-proxy runs` / `rm <id>` | every run / delete one (and its worktree, if clean) |
 
 Each run pins one Claude session: every message is one headless turn of it
 (`--session-id`, then `--resume`), so the conversation carries over — even onto
 another account, since transcripts are shared.
+
+**Questions and permission prompts.** When a run needs a decision — a tool its
+permission mode does not allow, or a question Claude asks with AskUserQuestion —
+it waits, `status` shows `waiting`, and `wait` returns with exit code 2 and
+prints what it asks:
+
+```console
+$ claude-proxy wait $id
+? permission to use Bash  cargo publish --dry-run
+    claude-proxy allow 4f2a9c   or   claude-proxy deny 4f2a9c "<reason>"
+$ claude-proxy allow $id && claude-proxy wait $id
+```
+
+`deny` with a reason tells Claude what to do instead, and
+`deny <id> "decide yourself"` lets it choose. Under the hood, every turn starts
+Claude with `--permission-prompt-tool` pointing at a small MCP server inside
+`claude-proxy` that records the request and blocks until it is answered (for up
+to a day). To keep routine work from asking, pass the permission mode or allowed
+tools the task needs after `--`.
+
+**Worktrees and forks.** `--worktree` creates a git worktree of the current
+repository on a new branch, `claude-proxy/<id>`, so parallel runs never edit the
+same checkout; `rm` removes the worktree if it has no uncommitted changes, and
+the branch if it is merged. `--fork` starts the run from a copy of the
+conversation of the Claude session it is called from (`--fork-from <id>` for any
+other) — handy for handing off work with its context, but it re-reads the whole
+conversation, and on another account without the prompt cache.
 
 **Automatic failover.** When the account a run is on hits a usage limit or
 cannot sign in, the run resumes the *same session* on the next account and picks
@@ -150,11 +180,12 @@ carry on rather than given the message twice. `--account auto` (the default)
 moves to the next best account by quota, `--account a,b` tries the list in
 order, and a single name pins the run. The transcript marks each move with `⇄`
 and `status` shows where it moved from. Failures that are not the account's
-fault (an overloaded API, a server error) are not retried elsewhere. A short-lived background process
-works through the run's queued messages and exits when there are none, so an
-idle run costs nothing. A background run cannot answer permission prompts, so
-pass the permission mode or allowed tools the task needs after `--`. Live usage
-that Claude reports during a run updates that account's quota for `auto`.
+fault (an overloaded API, a server error) are not retried elsewhere.
+
+A short-lived background process works through the run's queued messages and
+exits when there are none, so an idle run costs nothing. Each message starts a
+fresh `claude` process, which adds a few seconds per turn. Live usage that
+Claude reports during a run updates that account's quota for `auto`.
 
 ### Remove an account
 
@@ -167,21 +198,25 @@ This removes the command. The account's profile (and its login) is kept;
 
 ## For agents: the `quota-router` plugin
 
-This repository is also a Claude Code plugin whose skill teaches agents to
-delegate work as managed runs they keep control of — and to use `claude-proxy`
-instead of `claude` whenever they start a Claude process (headless `-p` jobs,
-background workers, GSD or autonomous runs) — plus how to read
-`claude-proxy list` and what happens when an account hits its limit. Install it once;
-every profile sees it, since plugins are shared:
+This repository is also a Claude Code plugin. Its skill teaches agents to use
+managed runs in place of subagents — for anything they would hand to the Agent
+tool (GSD's subagents included, via `--agent`), for long or big work, and for
+parallel work — to answer the questions runs ask, and to read
+`claude-proxy list`. A session-start hook makes that the default in every
+session and has the agent tell you whenever it uses `claude-proxy`, with the
+run id and a `claude-proxy watch` command you can paste. Install it once; every
+profile sees it, since plugins are shared:
 
 ```console
 $ claude plugin marketplace add ohmaseclaro/claude-proxy
 $ claude plugin install quota-router@quota-router
 ```
 
-A run or an `auto` call is a *new* Claude process. Subagents an agent starts inside
-its own session stay on that session's account, so for long multi-agent work,
-start the session itself with `claude-proxy auto`.
+Set `CLAUDE_PROXY_POLICY=off` to keep the skill but drop the default. Inside a
+run the hook stays silent, so runs do not start runs of their own.
+
+Subagents an agent starts with its own Agent tool stay on that session's
+account; only runs and `auto` calls are spread across accounts.
 
 ## How it works
 
@@ -197,12 +232,16 @@ start the session itself with `claude-proxy auto`.
   `settings.json`, `CLAUDE.md`, `skills`, `agents`, `commands`, `plugins`,
   `hooks`, `projects`, and similar, plus get-shit-done's install — is linked
   into each profile. Anything not on the list (the login, the account identity
-  in `.claude.json`, org policy, MCP auth state, caches) stays per profile.
-  User-scoped MCP servers live in `~/.claude.json` and are not shared.
+  in `.claude.json`, org policy, MCP sign-ins, caches) stays per profile.
+- **So are your MCP servers.** User- and local-scope MCP servers live in
+  `~/.claude.json` next to the login, so they cannot be linked; each launch on
+  a profile passes them to Claude with `--mcp-config` instead. Servers that
+  need a sign-in (OAuth) ask for it once per account.
 - **The proxy points Claude at the profile.** It sets `CLAUDE_CONFIG_DIR` and
-  clears any inherited `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` /
-  `ANTHROPIC_AUTH_TOKEN`, so a credential exported in your shell cannot override
-  the account, then `exec`s `claude` with your arguments.
+  clears any inherited credential (`CLAUDE_CODE_OAUTH_TOKEN`,
+  `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`) and any host app's session
+  identity, so nothing in your environment can override the account, then
+  `exec`s `claude` with your arguments.
 - **Quota comes from the same endpoint Claude uses.** For each account,
   `claude-proxy` reads that profile's Claude credential, refreshes the access
   token if it is about to expire (writing it back to Claude's own store, under a
@@ -224,6 +263,12 @@ start the session itself with `claude-proxy auto`.
   appear.
 - A proxy clears any inherited credential from the environment before running
   Claude, and the primary `~/.claude` login is never modified.
+- MCP server entries can hold API keys, so the files that pass them to a
+  profile (`~/.config/claude-proxy/mcp/`, and `mcp.json` in each run) are
+  written readable by you only, like `~/.claude.json` itself.
+- A run's questions and permission prompts are answered only through
+  `claude-proxy allow` / `deny` / `answer`, by whoever can write to your
+  `~/.config/claude-proxy`.
 
 If you find a security issue, please open an issue describing the impact.
 
