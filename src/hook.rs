@@ -113,8 +113,9 @@ fn redirect(v: &Value, applies: bool) -> Option<String> {
     Some(format!(
         "The user's claude-proxy policy sends subagent work to managed runs, so this {tool} \
          call was not made. Run instead:\n\n  {cmd} <<'EOF'\n  <the same prompt>\n  EOF\n\n\
-         Then wait for it with a background `claude-proxy wait <id>` (exit code 2 means it is \
-         asking you something), and tell the user the run id, its account, and \
+         Then run `claude-proxy wait <id>` on its own — in the background if you will be \
+         notified when it ends, otherwise in the foreground — where exit code 2 means it is \
+         asking you something; and tell the user the run id, its account, and \
          `claude-proxy watch <id>`. If the user said not to use claude-proxy for this, repeat \
          the {tool} call with \"[direct]\" at the start of its description."
     ))
