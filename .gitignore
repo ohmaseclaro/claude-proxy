@@ -1,12 +1,13 @@
 # Build output
 /target
 
-# Secrets must never be committed (defense in depth; the tool stores tokens in
-# the OS keychain or a mode-0600 file under ~/.config, never in the repo).
+# Secrets must never be committed (defense in depth: credentials live in each
+# profile's Claude credential store, never in this repo).
 .env
 *.token
 *.credentials.json
 
-# Editor / OS noise
+# Editor / OS / local tooling noise
+.serena/
 **/*.rs.bk
 .DS_Store

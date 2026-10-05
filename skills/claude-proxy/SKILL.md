@@ -81,8 +81,10 @@ claude-proxy auto -p "summarize this diff" < diff.txt
 claude-proxy auto                     # an interactive session for the user
 ```
 
-`auto` reports its choice on stderr, so stdout stays clean for `-p` output.
-Prefer `run` for any delegated work you may want to inspect, message, or stop.
+`auto` reports its choice on stderr, so stdout stays clean for `-p` output. It
+chooses once, at launch: if that account hits its limit mid-session, an `auto`
+session does not move. Prefer `run` for any delegated work you may want to
+inspect, message, or stop, or that should survive a usage limit.
 
 Use a specific account (`--account <name>` on `run`/`send`, or the `claude-<name>`
 command) only when the user asks for it.

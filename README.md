@@ -100,6 +100,10 @@ with the least **pressure** — the fullest usage window (5-hour, 7-day, or a
 model-scoped weekly cap) that has not reset yet. Ties go to the emptier 7-day
 window. Its choice is printed on stderr, so stdout stays clean for `-p` output.
 
+`auto` chooses once, at launch, and then hands the terminal to `claude`; if that
+account hits its limit mid-session, it does not move. For work that should
+survive a limit, use a managed run (below), which fails over on its own.
+
 ### Delegate work: managed runs
 
 `run` starts Claude in the background on the best account and prints an id.
@@ -128,7 +132,7 @@ $ claude-proxy wait $id                  # blocks, prints the final answer
 | `claude-proxy read <id>` | the transcript (`-n N`, `-f` to follow, `--full`, `--json` raw events) |
 | `claude-proxy tail <id>` / `watch <id>` | the last entries / follow live until it stops |
 | `claude-proxy result <id>` | the final answer of the last turn |
-| `claude-proxy send <id> "<message>"` | a follow-up, delivered when the current turn ends; `--account auto` moves the run to another account |
+| `claude-proxy send <id> "<message>"` | a follow-up, delivered when the current turn ends; `--account` (`auto`, a name, or `a,b`) moves the run to other accounts |
 | `claude-proxy wait <id>` | block until it is done (exit 0 done, 1 failed or killed, 124 `--timeout`) |
 | `claude-proxy kill <id>` | stop the current turn (the conversation is kept; `send` resumes it) |
 | `claude-proxy runs` / `rm <id>` | every run / delete one |
@@ -167,7 +171,7 @@ This repository is also a Claude Code plugin whose skill teaches agents to
 delegate work as managed runs they keep control of — and to use `claude-proxy`
 instead of `claude` whenever they start a Claude process (headless `-p` jobs,
 background workers, GSD or autonomous runs) — plus how to read
-`claude-proxy list` and move a run that hits a usage limit. Install it once;
+`claude-proxy list` and what happens when an account hits its limit. Install it once;
 every profile sees it, since plugins are shared:
 
 ```console
