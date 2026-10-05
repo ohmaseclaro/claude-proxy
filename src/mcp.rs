@@ -7,6 +7,7 @@ use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::{json, Map, Value};
 
@@ -39,11 +40,21 @@ pub fn flag(file: &Path) -> String {
 }
 
 pub fn write(file: &Path, servers: Map<String, Value>) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(&json!({"mcpServers": servers}))?;
+    if fs::read(file).is_ok_and(|current| current == bytes) {
+        return Ok(());
+    }
     if let Some(parent) = file.parent() {
         fs::create_dir_all(parent)?;
     }
+    // Its own temp file: parallel launches write the same config at once.
+    static WRITES: AtomicUsize = AtomicUsize::new(0);
     let mut tmp = file.as_os_str().to_owned();
-    tmp.push(".tmp");
+    tmp.push(format!(
+        ".{}-{}.tmp",
+        std::process::id(),
+        WRITES.fetch_add(1, Ordering::Relaxed)
+    ));
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -52,7 +63,7 @@ pub fn write(file: &Path, servers: Map<String, Value>) -> std::io::Result<()> {
         options.mode(0o600);
     }
     let mut f = options.open(&tmp)?;
-    f.write_all(&serde_json::to_vec(&json!({"mcpServers": servers}))?)?;
+    f.write_all(&bytes)?;
     fs::rename(tmp, file)
 }
 
@@ -85,6 +96,24 @@ mod tests {
         names.sort();
         assert_eq!(names, ["a", "b"]);
         assert!(servers_in(&t.path().join("missing"), "/repo").is_empty());
+    }
+
+    #[test]
+    fn parallel_launches_can_write_the_same_config() {
+        let t = tempfile::tempdir().unwrap();
+        let file = t.path().join("mcp/same.json");
+        let mut servers = Map::new();
+        servers.insert("a".into(), json!({"command": "x"}));
+        let writers: Vec<_> = (0..8)
+            .map(|_| {
+                let (file, servers) = (file.clone(), servers.clone());
+                std::thread::spawn(move || write(&file, servers))
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap().unwrap();
+        }
+        assert!(servers_in(&file, "/").contains_key("a"));
     }
 
     #[cfg(unix)]
