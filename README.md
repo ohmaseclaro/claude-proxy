@@ -100,6 +100,47 @@ with the least **pressure** — the fullest usage window (5-hour, 7-day, or a
 model-scoped weekly cap) that has not reset yet. Ties go to the emptier 7-day
 window. Its choice is printed on stderr, so stdout stays clean for `-p` output.
 
+### Delegate work: managed runs
+
+`run` starts Claude in the background on the best account and prints an id.
+From then on the session is yours to manage — read it, follow it, message it,
+wait for it, kill it — like a subagent:
+
+```console
+$ id=$(claude-proxy run "fix the failing test in src/parser.rs" -- --permission-mode acceptEdits)
+$ claude-proxy watch $id                 # follow it live until it stops working
+▶ you
+  fix the failing test in src/parser.rs
+● claude-gmail · turn 1
+  ⚙ Bash  cargo test parser
+    ↳ test result: FAILED. 11 passed; 1 failed  (+38 lines)
+  ⚙ Edit  src/parser.rs
+  Fixed the off-by-one in `split_header`; the suite passes now.
+✓ done · 6 steps · 48s · $0.31
+$ claude-proxy send $id "add a regression test for it"   # queued, then resumes the same conversation
+$ claude-proxy wait $id                  # blocks, prints the final answer
+```
+
+| | |
+|---|---|
+| `claude-proxy run "<task>" [-- <claude flags>]` | start; `--account`, `--name`, `--cwd`, `--wait`, `--json`; `-` reads the task from stdin |
+| `claude-proxy status <id>` | state, what it is doing right now, Claude's summary of its last turn, cost (`--json`) |
+| `claude-proxy read <id>` | the transcript (`-n N`, `-f` to follow, `--full`, `--json` raw events) |
+| `claude-proxy tail <id>` / `watch <id>` | the last entries / follow live until it stops |
+| `claude-proxy result <id>` | the final answer of the last turn |
+| `claude-proxy send <id> "<message>"` | a follow-up, delivered when the current turn ends; `--account auto` moves the run to another account |
+| `claude-proxy wait <id>` | block until it is done (exit 0 done, 1 failed or killed, 124 `--timeout`) |
+| `claude-proxy kill <id>` | stop the current turn (the conversation is kept; `send` resumes it) |
+| `claude-proxy runs` / `rm <id>` | every run / delete one |
+
+Each run pins one Claude session: every message is one headless turn of it
+(`--session-id`, then `--resume`), so the conversation carries over — even onto
+another account, since transcripts are shared. A short-lived background process
+works through the run's queued messages and exits when there are none, so an
+idle run costs nothing. A background run cannot answer permission prompts, so
+pass the permission mode or allowed tools the task needs after `--`. Live usage
+that Claude reports during a run updates that account's quota for `auto`.
+
 ### Remove an account
 
 ```console
@@ -111,18 +152,19 @@ This removes the command. The account's profile (and its login) is kept;
 
 ## For agents: the `quota-router` plugin
 
-This repository is also a Claude Code plugin whose skill teaches agents to use
-`claude-proxy auto` instead of `claude` whenever they start a Claude process —
-headless `-p` jobs, background workers, GSD or autonomous runs — and how to read
-`claude-proxy list`. Install it once; every profile sees it, since plugins are
-shared:
+This repository is also a Claude Code plugin whose skill teaches agents to
+delegate work as managed runs they keep control of — and to use `claude-proxy`
+instead of `claude` whenever they start a Claude process (headless `-p` jobs,
+background workers, GSD or autonomous runs) — plus how to read
+`claude-proxy list` and move a run that hits a usage limit. Install it once;
+every profile sees it, since plugins are shared:
 
 ```console
 $ claude plugin marketplace add ohmaseclaro/claude-proxy
 $ claude plugin install quota-router@quota-router
 ```
 
-`auto` chooses the account for a *new* process. Subagents an agent starts inside
+A run or an `auto` call is a *new* Claude process. Subagents an agent starts inside
 its own session stay on that session's account, so for long multi-agent work,
 start the session itself with `claude-proxy auto`.
 
@@ -182,6 +224,8 @@ $ cargo fmt --all -- --check
 Tests never touch a real home directory, credential store, or the network: path
 resolvers, the shared-config linker, and the login check take injected
 directories, and quota selection is tested through its pure parser and ranking.
+Managed runs are tested end to end (`tests/runs.rs`) against a fake `claude` on
+`PATH` in a throwaway home.
 
 ## Contributing
 

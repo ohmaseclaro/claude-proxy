@@ -13,6 +13,7 @@
 //! primary `claude` login is never disturbed.
 
 mod add;
+mod agents;
 mod cli;
 mod creds;
 mod install;
@@ -20,6 +21,8 @@ mod paths;
 mod proxy;
 mod quota;
 mod registry;
+mod render;
+mod runs;
 mod shared;
 
 use std::ffi::OsString;

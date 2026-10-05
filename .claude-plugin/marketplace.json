@@ -9,7 +9,7 @@
   "plugins": [
     {
       "name": "quota-router",
-      "description": "Teaches agents to run Claude through `claude-proxy auto`, which spreads work across your Claude accounts by remaining quota.",
+      "description": "Lets agents delegate work to background Claude sessions they can follow, message, wait for, and kill by id, spread across your Claude accounts by remaining quota (`claude-proxy run` / `auto`).",
       "source": "./",
       "category": "productivity"
     }

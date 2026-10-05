@@ -16,6 +16,7 @@
 //! proxy's transcripts live under its account dir, not `~/.claude/projects`.
 
 use std::ffi::OsString;
+use std::path::Path;
 
 use crate::paths::account_config_dir;
 
@@ -51,19 +52,29 @@ pub fn run(label: &str, args: &[OsString]) -> Result<i32, String> {
     let config_dir = account_config_dir(label);
     std::fs::create_dir_all(&config_dir)
         .map_err(|e| format!("could not create the config dir for {label:?}: {e}"))?;
-    crate::shared::link_shared(&config_dir);
-    exec_claude(Some(&config_dir.to_string_lossy()), args, label)
+    let mut command = claude_command(Some(&config_dir));
+    command.args(args);
+    exec_or_status(command, label)
 }
 
 /// Run `claude` on the primary (`~/.claude`) profile, forwarding `args`.
 pub fn run_primary(args: &[OsString]) -> Result<i32, String> {
-    exec_claude(None, args, crate::quota::PRIMARY_LABEL)
+    let mut command = claude_command(None);
+    command.args(args);
+    exec_or_status(command, crate::quota::PRIMARY_LABEL)
 }
 
-fn exec_claude(config_dir: Option<&str>, args: &[OsString], label: &str) -> Result<i32, String> {
+/// A `claude` command for an account — `None` is the primary profile — with
+/// the shared setup linked, the config dir set, and inherited credentials
+/// cleared. Not yet run.
+pub fn claude_command(config_dir: Option<&Path>) -> std::process::Command {
+    if let Some(dir) = config_dir {
+        let _ = std::fs::create_dir_all(dir);
+        crate::shared::link_shared(dir);
+    }
+    let dir = config_dir.map(|d| d.to_string_lossy().into_owned());
     let mut command = std::process::Command::new("claude");
-    command.args(args);
-    for op in proxy_env(config_dir) {
+    for op in proxy_env(dir.as_deref()) {
         match op {
             EnvOp::Set(k, v) => {
                 command.env(k, v);
@@ -73,7 +84,7 @@ fn exec_claude(config_dir: Option<&str>, args: &[OsString], label: &str) -> Resu
             }
         }
     }
-    exec_or_status(command, label)
+    command
 }
 
 /// On Unix, replace this process with `claude` so signals and the exit code

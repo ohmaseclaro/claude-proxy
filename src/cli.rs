@@ -56,6 +56,107 @@ enum Command {
         /// The command name to remove.
         label: String,
     },
+    /// Start a background Claude session you can manage by id. Prints the id.
+    ///
+    /// Claude flags go after `--`, e.g.
+    /// `claude-proxy run "fix the tests" -- --permission-mode acceptEdits`.
+    /// A background run cannot answer permission prompts, so pass the
+    /// permission mode or allowed tools the task needs.
+    Run {
+        /// The task. `-` reads it from stdin.
+        message: String,
+        /// Account to use: a proxy name, `claude` for the primary, or `auto`.
+        #[arg(long, default_value = "auto")]
+        account: String,
+        /// A label to recognise the run by.
+        #[arg(long)]
+        name: Option<String>,
+        /// Working directory for the session (default: the current one).
+        #[arg(long)]
+        cwd: Option<std::path::PathBuf>,
+        /// Block until it finishes and print its final answer.
+        #[arg(long)]
+        wait: bool,
+        /// Print the run as JSON instead of just its id.
+        #[arg(long)]
+        json: bool,
+        /// Arguments for `claude`, after `--`.
+        #[arg(last = true)]
+        claude_args: Vec<String>,
+    },
+    /// List managed runs, most recently active first.
+    Runs {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show a run's state, current activity, and last result.
+    Status {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a run's transcript.
+    Read {
+        id: String,
+        /// Only the last N entries.
+        #[arg(short = 'n', long = "lines")]
+        lines: Option<usize>,
+        /// Keep printing until the run stops working.
+        #[arg(short, long)]
+        follow: bool,
+        /// Whole tool inputs and outputs instead of one line each.
+        #[arg(long)]
+        full: bool,
+        /// Raw stream-json events.
+        #[arg(long)]
+        json: bool,
+    },
+    /// The last entries of a transcript (`read -n 20`).
+    Tail {
+        id: String,
+        #[arg(short = 'n', long = "lines", default_value_t = 20)]
+        lines: usize,
+        #[arg(short, long)]
+        follow: bool,
+        #[arg(long)]
+        full: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Follow a run live until it stops working (`read -n 10 -f`).
+    Watch {
+        id: String,
+        #[arg(long)]
+        full: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the final answer of a run's last turn.
+    Result { id: String },
+    /// Send a follow-up message; delivered when the current turn ends.
+    Send {
+        id: String,
+        /// The message. `-` reads it from stdin.
+        message: String,
+        /// Continue on another account (a proxy name, `claude`, or `auto`).
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Block until a run has nothing running or queued, then print its answer.
+    /// Exits 0 when the last turn succeeded, 1 when it failed or was killed,
+    /// 124 on timeout.
+    Wait {
+        id: String,
+        /// Give up after this many seconds.
+        #[arg(long)]
+        timeout: Option<u64>,
+    },
+    /// Stop a run's current turn. Queued messages are kept; `send` resumes.
+    Kill { id: String },
+    /// Delete a run that is not working.
+    Rm { id: String },
+    #[command(name = "__drain", hide = true)]
+    Drain { id: String },
 }
 
 /// Entry point for the manager role. Returns a process exit code.
@@ -78,6 +179,59 @@ fn dispatch(command: Command) -> Result<i32, String> {
         Command::List { json, refresh } => list_cmd(json, refresh),
         Command::Auto { args } => auto_cmd(&args),
         Command::Remove { label } => remove_cmd(&label),
+        Command::Run {
+            message,
+            account,
+            name,
+            cwd,
+            wait,
+            json,
+            claude_args,
+        } => crate::agents::run(&message, &account, name, cwd, wait, json, claude_args),
+        Command::Runs { json } => crate::agents::runs(json),
+        Command::Status { id, json } => crate::agents::status(&id, json),
+        Command::Read {
+            id,
+            lines,
+            follow,
+            full,
+            json,
+        } => crate::agents::read(&id, lines, follow, full, json),
+        Command::Tail {
+            id,
+            lines,
+            follow,
+            full,
+            json,
+        } => crate::agents::read(&id, Some(lines), follow, full, json),
+        Command::Watch { id, full, json } => crate::agents::read(&id, Some(10), true, full, json),
+        Command::Result { id } => crate::agents::result(&id),
+        Command::Send {
+            id,
+            message,
+            account,
+        } => crate::agents::send(&id, &message, account.as_deref()),
+        Command::Wait { id, timeout } => crate::agents::wait(&id, timeout),
+        Command::Kill { id } => crate::agents::kill(&id),
+        Command::Rm { id } => crate::agents::rm(&id),
+        Command::Drain { id } => crate::runs::drain(&id).map(|()| 0),
+    }
+}
+
+/// Resolve an account choice: `auto`, `claude` (the primary), or a proxy name.
+pub fn resolve_account(choice: &str) -> Result<String, String> {
+    match choice {
+        "auto" => {
+            let reports = quota::reports(&quota::accounts(), false);
+            let pick = quota::choose(&reports, quota::now_secs())
+                .ok_or("no logged-in account to use. Add one with:  claude-proxy add <name>")?;
+            Ok(reports[pick].label.clone())
+        }
+        quota::PRIMARY_LABEL => Ok(quota::PRIMARY_LABEL.into()),
+        label if Registry::load().has(label) => Ok(label.into()),
+        label => Err(format!(
+            "no account named {label:?}. See:  claude-proxy list"
+        )),
     }
 }
 

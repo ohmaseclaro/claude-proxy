@@ -360,10 +360,7 @@ pub fn parse_usage(v: &Value) -> Vec<Window> {
             out.push(Window {
                 name: name.into(),
                 used,
-                resets_at: w
-                    .get("resets_at")
-                    .and_then(Value::as_str)
-                    .and_then(parse_rfc3339),
+                resets_at: resets(w.get("resets_at")),
             });
         }
     }
@@ -391,14 +388,21 @@ pub fn parse_usage(v: &Value) -> Vec<Window> {
             out.push(Window {
                 name,
                 used,
-                resets_at: limit
-                    .get("resets_at")
-                    .and_then(Value::as_str)
-                    .and_then(parse_rfc3339),
+                resets_at: resets(limit.get("resets_at")),
             });
         }
     }
     out
+}
+
+/// RFC 3339 from the usage endpoint, or Unix seconds from a live
+/// `rate_limit_event` folded into the cache.
+fn resets(v: Option<&Value>) -> Option<i64> {
+    match v? {
+        Value::Number(n) => n.as_i64(),
+        Value::String(s) => parse_rfc3339(s),
+        _ => None,
+    }
 }
 
 fn percent(v: Option<&Value>) -> Option<f64> {
@@ -418,6 +422,36 @@ fn email(config_dir: Option<&Path>) -> Option<String> {
     v.pointer("/oauthAccount/emailAddress")
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+/// Fold the live usage a running Claude reports in its `rate_limit_event` into
+/// the account's cache, so `auto` sees it without another lookup.
+pub fn record_rate_limit(label: &str, info: &Value) {
+    record_rate_limit_at(&cache_path(label), info, now_secs());
+}
+
+fn record_rate_limit_at(path: &Path, info: &Value, now: i64) {
+    let Some(windows) = info.get("unifiedWindows") else {
+        return;
+    };
+    let mut usage = read_cache(path)
+        .map(|(_, u)| u)
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    let mut changed = false;
+    for key in ["five_hour", "seven_day"] {
+        let Some(w) = windows.get(key) else {
+            continue;
+        };
+        let Some(used) = w.get("utilization").and_then(Value::as_f64) else {
+            continue;
+        };
+        usage[key] = json!({ "utilization": used * 100.0, "resets_at": w.get("resetsAt") });
+        changed = true;
+    }
+    if changed {
+        write_cache(path, now, &usage);
+    }
 }
 
 fn cache_path(label: &str) -> PathBuf {
@@ -631,6 +665,32 @@ mod tests {
         assert!(needs_refresh(&soon, now));
         assert!(!needs_refresh(&later, now));
         assert!(!needs_refresh(&no_rt, now));
+    }
+
+    #[test]
+    fn live_rate_limit_updates_the_cache_and_keeps_other_windows() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("acct.json");
+        write_cache(
+            &path,
+            1,
+            &json!({"seven_day": {"utilization": 10.0},
+                    "limits": [{"kind": "weekly_scoped", "percent": 5,
+                                "scope": {"model": {"display_name": "Fable"}}}]}),
+        );
+        let info = json!({"unifiedWindows": {
+            "five_hour": {"utilization": 0.25, "resetsAt": 2000},
+            "seven_day": {"utilization": 0.97, "resetsAt": 3000}}});
+        record_rate_limit_at(&path, &info, 500);
+
+        let (at, usage) = read_cache(&path).unwrap();
+        assert_eq!(at, 500);
+        let w = parse_usage(&usage);
+        let get = |n: &str| w.iter().find(|w| w.name == n).unwrap();
+        assert_eq!(get("5h").used, 25.0);
+        assert_eq!(get("5h").resets_at, Some(2000));
+        assert_eq!(get("7d").used, 97.0);
+        assert_eq!(get("7d fable").used, 5.0);
     }
 
     #[test]
