@@ -690,14 +690,22 @@ pub fn kill(id: &str) -> Result<bool, String> {
     Ok(true)
 }
 
+/// Signal the process group led by `pid` (Claude starts as a group leader).
+/// Never through the `kill` binary: Linux procps reads `kill -TERM -<pgid>`
+/// as "every process you own".
 #[cfg(unix)]
 pub(crate) fn signal_group(pid: u32, force: bool) {
-    let signal = if force { "-KILL" } else { "-TERM" };
-    let _ = Command::new("kill")
-        .args([signal, &format!("-{pid}")])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    let Ok(pgid) = libc::pid_t::try_from(pid) else {
+        return;
+    };
+    if pgid <= 1 {
+        return;
+    }
+    let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
+    // SAFETY: killpg only sends a signal; a stale group id fails with ESRCH.
+    unsafe {
+        libc::killpg(pgid, signal);
+    }
 }
 
 #[cfg(not(unix))]
@@ -1091,6 +1099,26 @@ mod tests {
             r#"{"type":"claude_proxy","event":"turn_end","exit":null,"killed":true}"#
         );
         assert_eq!(last_result_in(&t2), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signalling_a_group_reaches_only_that_group() {
+        use std::os::unix::process::CommandExt;
+        let mut group = Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut outsider = Command::new("sleep").arg("30").spawn().unwrap();
+        signal_group(group.id(), false);
+        assert!(!group.wait().unwrap().success(), "the group is stopped");
+        assert!(
+            outsider.try_wait().unwrap().is_none(),
+            "nothing outside the group is touched"
+        );
+        outsider.kill().unwrap();
+        outsider.wait().unwrap();
     }
 
     #[test]
