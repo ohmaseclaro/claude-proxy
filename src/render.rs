@@ -47,7 +47,11 @@ fn marker(v: &Value, full: bool) -> Vec<String> {
     match v.get("event").and_then(Value::as_str) {
         Some("message") => {
             let text = v.get("text").and_then(Value::as_str).unwrap_or("");
-            let mut out = vec!["▶ you".to_string()];
+            let mut out = vec![if v["during_turn"] == true {
+                "▶ you (while it works)".to_string()
+            } else {
+                "▶ you".to_string()
+            }];
             out.extend(indented(text, "  ", full));
             out
         }
@@ -77,7 +81,7 @@ fn marker(v: &Value, full: bool) -> Vec<String> {
                 .iter()
                 .map(|(q, a)| format!("  ↪ {q} → {}", a.as_str().unwrap_or("")))
                 .collect(),
-            (Some("allow"), _) => vec!["  ↪ allowed".into()],
+            (Some("allow"), _) => vec![format!("  ↪ allowed{}", granted(&v["granted"]))],
             _ => vec![format!(
                 "  ↪ denied: {}",
                 v["message"].as_str().unwrap_or("")
@@ -100,6 +104,34 @@ fn marker(v: &Value, full: bool) -> Vec<String> {
             }
         }
         _ => Vec::new(),
+    }
+}
+
+/// What an `allow` granted for good, as a suffix.
+fn granted(updates: &Value) -> String {
+    let parts: Vec<String> = updates
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|u| match u["type"].as_str() {
+            Some("setMode") if u["mode"] == "acceptEdits" => Some("accepting edits".to_string()),
+            Some("addRules") => u["rules"].as_array().map(|rules| {
+                rules
+                    .iter()
+                    .map(|r| match r["ruleContent"].as_str() {
+                        Some(c) => format!("{}({c})", r["toolName"].as_str().unwrap_or("")),
+                        None => r["toolName"].as_str().unwrap_or("").to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }),
+            _ => None,
+        })
+        .collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" · from now on: {}", parts.join(", "))
     }
 }
 
@@ -149,8 +181,13 @@ pub fn ask_lines(id: &str, tool: &str, input: &Value, full: bool) -> Vec<String>
         }
         out.extend(lines);
     }
+    let always = if tool == "ExitPlanMode" {
+        format!("claude-proxy allow {id} --accept-edits")
+    } else {
+        format!("claude-proxy allow {id} --always")
+    };
     out.push(format!(
-        "    claude-proxy allow {id}   or   claude-proxy deny {id} \"<reason>\""
+        "    claude-proxy allow {id}   or   {always}   or   claude-proxy deny {id} \"<reason>\""
     ));
     out
 }
@@ -418,7 +455,7 @@ mod tests {
             ),
             [
                 "? permission to use Bash  cargo publish",
-                "    claude-proxy allow abc123   or   claude-proxy deny abc123 \"<reason>\""
+                "    claude-proxy allow abc123   or   claude-proxy allow abc123 --always   or   claude-proxy deny abc123 \"<reason>\""
             ]
         );
         assert_eq!(
@@ -431,6 +468,14 @@ mod tests {
         assert_eq!(
             r(r#"{"type":"claude_proxy","event":"answer","behavior":"deny","message":"no"}"#),
             ["  ↪ denied: no"]
+        );
+        assert_eq!(
+            r(
+                r#"{"type":"claude_proxy","event":"answer","behavior":"allow","granted":[
+                {"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"cargo test:*"}]},
+                {"type":"setMode","mode":"acceptEdits"}]}"#
+            ),
+            ["  ↪ allowed · from now on: Bash(cargo test:*), accepting edits"]
         );
     }
 

@@ -121,7 +121,7 @@ $ claude-proxy watch $id                 # follow it live until it stops working
   ⚙ Edit  src/parser.rs
   Fixed the off-by-one in `split_header`; the suite passes now.
 ✓ done · 6 steps · 48s · $0.31
-$ claude-proxy send $id "add a regression test for it"   # queued, then resumes the same conversation
+$ claude-proxy send $id "add a regression test for it"   # continues the same conversation
 $ claude-proxy wait $id                  # blocks, prints the final answer
 ```
 
@@ -132,17 +132,21 @@ $ claude-proxy wait $id                  # blocks, prints the final answer
 | `claude-proxy read <id>` | the transcript (`-n N`, `-f` to follow, `--full`, `--json` raw events) |
 | `claude-proxy tail <id>` / `watch <id>` | the last entries / follow live until it stops |
 | `claude-proxy result <id>` | the final answer of the last turn |
-| `claude-proxy send <id> "<message>"` | a follow-up, delivered when the current turn ends; `--account` (`auto`, a name, or `a,b`) moves the run to other accounts |
+| `claude-proxy send <id> "<message>"` | a follow-up; sent while it works, Claude folds it into the turn in progress. `--account` (`auto`, a name, or `a,b`) moves the run to other accounts |
 | `claude-proxy wait <id>` | block until it is done (exit 0 done, 1 failed or killed, 2 waiting for an answer, 124 `--timeout`) |
-| `claude-proxy allow <id>` / `deny <id> ["why"]` | settle a permission prompt the run is waiting on |
+| `claude-proxy allow <id>` / `deny <id> ["why"]` | settle a permission prompt the run is waiting on; `allow --always`, `--rule "<rule>"`, or `--accept-edits` also stop it asking again |
 | `claude-proxy answer <id> "<answer>"…` | answer the question it asked, one answer per question |
 | `claude-proxy attach <id>` | open the session interactively in your terminal |
-| `claude-proxy kill <id>` | stop the current turn (the conversation is kept; `send` resumes it) |
+| `claude-proxy kill <id>` | stop the current turn (the conversation is kept; `send` resumes it); on an idle run, free its Claude process |
 | `claude-proxy runs` / `rm <id>` | every run / delete one (and its worktree, if clean) |
 
-Each run pins one Claude session: every message is one headless turn of it
-(`--session-id`, then `--resume`), so the conversation carries over — even onto
-another account, since transcripts are shared.
+Each run pins one Claude session, so the conversation carries over — across
+Claude processes and onto other accounts, since transcripts are shared. A
+background process keeps a headless Claude (`--input-format stream-json`) open
+for the run: messages go straight in, one sent mid-turn steers the work in
+progress, and a follow-up within five minutes of the last turn
+(`CLAUDE_PROXY_IDLE_SECS`) starts without Claude's startup or a cold prompt
+cache. Then both exit, so an idle run costs nothing.
 
 **Questions and permission prompts.** When a run needs a decision — a tool its
 permission mode does not allow, or a question Claude asks with AskUserQuestion —
@@ -157,11 +161,17 @@ $ claude-proxy allow $id && claude-proxy wait $id
 ```
 
 `deny` with a reason tells Claude what to do instead, and
-`deny <id> "decide yourself"` lets it choose. Under the hood, every turn starts
-Claude with `--permission-prompt-tool` pointing at a small MCP server inside
+`deny <id> "decide yourself"` lets it choose. Like Claude's own prompt, `allow`
+can grant more than the one request: `--always` (that exact command, that
+domain, or that tool — for edits, accepting edits), `--rule "Bash(cargo
+test:*)"`, or `--accept-edits` (approving a plan). Under the hood, Claude runs
+with `--permission-prompt-tool` pointing at a small MCP server inside
 `claude-proxy` that records the request and blocks until it is answered (for up
-to a day). To keep routine work from asking, pass the permission mode or allowed
-tools the task needs after `--`.
+to a day).
+
+A run starts with the permission mode of the Claude session that started it,
+the way a subagent inherits it (the plugin's hook records it), unless you pass
+one after `--`.
 
 **Worktrees and forks.** `--worktree` creates a git worktree of the current
 repository on a new branch, `claude-proxy/<id>`, so parallel runs never edit the
@@ -182,10 +192,8 @@ order, and a single name pins the run. The transcript marks each move with `⇄`
 and `status` shows where it moved from. Failures that are not the account's
 fault (an overloaded API, a server error) are not retried elsewhere.
 
-A short-lived background process works through the run's queued messages and
-exits when there are none, so an idle run costs nothing. Each message starts a
-fresh `claude` process, which adds a few seconds per turn. Live usage that
-Claude reports during a run updates that account's quota for `auto`.
+Live usage that Claude reports during a run updates that account's quota for
+`auto`.
 
 ### Remove an account
 
@@ -202,18 +210,22 @@ This repository is also a Claude Code plugin. Its skill teaches agents to use
 managed runs in place of subagents — for anything they would hand to the Agent
 tool (GSD's subagents included, via `--agent`), for long or big work, and for
 parallel work — to answer the questions runs ask, and to read
-`claude-proxy list`. A session-start hook makes that the default in every
-session and has the agent tell you whenever it uses `claude-proxy`, with the
-run id and a `claude-proxy watch` command you can paste. Install it once; every
-profile sees it, since plugins are shared:
+`claude-proxy list`. Its hooks make that the default in every session: the
+policy is added to each session's context, ahead of any workflow that says to
+use the Agent tool; an Agent call that slips through is turned back with the
+equivalent `claude-proxy run`; and each session's permission mode is recorded
+for its runs to inherit. The agent tells you whenever it uses `claude-proxy`,
+with the run id and a `claude-proxy watch` command you can paste. Install it
+once; every profile sees it, since plugins are shared:
 
 ```console
 $ claude plugin marketplace add ohmaseclaro/claude-proxy
 $ claude plugin install quota-router@quota-router
 ```
 
-Set `CLAUDE_PROXY_POLICY=off` to keep the skill but drop the default. Inside a
-run the hook stays silent, so runs do not start runs of their own.
+Set `CLAUDE_PROXY_POLICY=off` to keep the skill but drop the default; tell an
+agent not to use `claude-proxy` and it marks that Agent call `[direct]`. Inside
+a run the hooks stay silent, so runs do not start runs of their own.
 
 Agents call `claude-proxy` through their Bash tool, so each call asks for your
 permission unless you allow it — add `"Bash(claude-proxy:*)"` to
@@ -221,8 +233,11 @@ permission unless you allow it — add `"Bash(claude-proxy:*)"` to
 its runs' permission prompts on its own, so allow it only if you would let the
 agent take those actions itself.
 
-Subagents an agent starts with its own Agent tool stay on that session's
-account; only runs and `auto` calls are spread across accounts.
+Known limits: each account asks once to trust a folder the first time you open
+it interactively there (runs never ask); `claude-<name> mcp list` does not list
+the MCP servers `claude-proxy` passes in, though sessions have them; MCP
+servers that need a sign-in ask once per account; and `auto` chooses once —
+use `run --wait` for a one-shot that should survive a usage limit.
 
 ## How it works
 

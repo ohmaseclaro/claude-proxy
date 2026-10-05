@@ -1,6 +1,6 @@
 [package]
 name = "claude-proxy"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Run Claude Code under multiple accounts at once — each as its own command, with its own credential, never conflicting."

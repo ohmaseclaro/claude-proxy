@@ -29,6 +29,13 @@ Unless the user says not to for this task, use a managed run instead of:
   investigations, anything that would eat a lot of your context);
 - a bare **`claude -p`** or `claude` process from a shell.
 
+This takes precedence over any skill, command, or workflow that says to use the
+Agent/Task tool: where GSD (or anything else) says to spawn a subagent, start a
+run with the same prompt and `--agent <subagent_type>`, and wait for it where
+the workflow would wait for the subagent. The plugin turns back an Agent/Task
+call that slips through, with the equivalent command. When the user says not to
+use claude-proxy for something, start that call's description with `[direct]`.
+
 Do the work yourself when it is a few quick tool calls. If `$CLAUDE_PROXY_RUN`
 is set, you *are* a managed run: do not start runs of your own unless your task
 explicitly asks for it.
@@ -48,7 +55,7 @@ finishes. Do this for one-shots (`auto`) too.
 ## Delegate a task
 
 ```bash
-claude-proxy run "fix the failing test in src/parser.rs" -- --permission-mode acceptEdits
+claude-proxy run "fix the failing test in src/parser.rs"
 # → prints the id, e.g. a1b2c3
 claude-proxy wait a1b2c3       # as a background command
 ```
@@ -61,7 +68,7 @@ long task on stdin: `claude-proxy run - <<'EOF' … EOF`. Flags:
 
 | Flag | Use |
 |---|---|
-| `--agent <type>` | run as one of the user's agents (`~/.claude/agents`), e.g. `gsd-executor` |
+| `--agent <type>` | run as one of the user's agents (`~/.claude/agents`, plugins), e.g. `gsd-executor`. Not for Claude's built-in types (`general-purpose`, `Explore`, `Plan`): leave it out |
 | `--worktree` | work in a new git worktree on branch `claude-proxy/<id>` — for parallel runs that touch the same files |
 | `--fork` | start from a copy of *your own* conversation (`--fork-from <session-id>` for another one). Costly: the whole context is re-read, with no prompt cache on another account. Use only when the task truly needs what you know |
 | `--cwd <dir>` | work somewhere else |
@@ -116,10 +123,19 @@ anything outward-facing (pushing, publishing, messaging), credentials, spending,
 or a real product decision. Never allow more than the user allowed you. An
 unanswered ask times out after 24 hours.
 
-**Permissions:** give a run the same latitude you have, so it does not ask
-about routine work — if you may edit files freely, pass
-`-- --permission-mode acceptEdits`; add `--allowedTools "Bash(cargo test:*)"`
-and the like for commands you would run without asking. Never pass
+`allow` can also grant for the rest of the run, the way Claude's own prompt
+does:
+
+```bash
+claude-proxy allow <id> --always                    # and stop asking for requests like this one
+claude-proxy allow <id> --rule "Bash(cargo test:*)" # and stop asking for anything this rule covers
+claude-proxy allow <id> --accept-edits              # and accept edits from now on (approving a plan)
+```
+
+**Permissions:** a run inherits your session's permission mode, as a subagent
+would (`claude-proxy` says so when it does), so it only asks about what you
+would have been asked about. Pass `-- --permission-mode <mode>` or
+`--allowedTools "Bash(cargo test:*)"` to give it more or less; never
 `bypassPermissions` or `--dangerously-skip-permissions` unless the user asked.
 
 ## Everything else you can do
@@ -139,8 +155,10 @@ and the like for commands you would run without asking. Never pass
 
 - **States:** `queued` → `working` (`waiting` while it needs an answer) →
   `idle` (done; it takes more messages), or `failed`, or `killed`.
-- **Messages queue.** A `send` while it works is delivered when the turn ends;
-  a `send` to an `idle`, `failed`, or `killed` run resumes the same conversation.
+- **Steer it while it works.** A `send` during a turn reaches Claude at once and
+  it folds the message into the work in progress, as when you type into a
+  running Claude session. A `send` to an `idle`, `failed`, or `killed` run
+  resumes the same conversation.
 - **It moves itself off a full account.** On a usage limit or a sign-in failure
   it continues *the same session* on the next account — `status` shows `moved`,
   the transcript shows `⇄`. Tell the user when it happens.
@@ -149,8 +167,9 @@ and the like for commands you would run without asking. Never pass
   merge the `claude-proxy/<id>` branches. Keep to the user's concurrency limits.
 - **Context budget:** prefer `status`, `tail -n`, and `result` over `read` on a
   long run; `read --full` only when you need exact tool output.
-- **Cost of a turn:** each message starts a fresh `claude` process (a few
-  seconds), so batch instructions into one message rather than many small ones.
+- **It stays warm.** After a turn the run keeps its Claude process for five
+  minutes (`CLAUDE_PROXY_IDLE_SECS`), so a follow-up starts at once and the
+  prompt cache is still there. `kill` on an idle run frees that process early.
 
 ## One-shots: `auto`
 

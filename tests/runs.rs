@@ -11,15 +11,17 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-/// Echoes the prompt as one stream-json turn, records it in the session file
-/// the way Claude does, and logs how it was called. A prompt starting with
-/// `sleep` hangs (a turn to kill); `nap` takes 2 seconds (a turn to message
-/// while it works); `limited` fails with a usage limit on the account `acct-a`;
-/// `ask` puts a permission prompt (`ask question`: a question) to the run's
-/// `__permit` server, the way Claude does, and echoes the decision.
+/// Speaks Claude's stream-json: reads one user message per stdin line, and
+/// for each echoes it back (`isReplay`), plays one turn, and records it in the
+/// session file the way Claude does. Logs every message with how the process
+/// was started (`new`, `resume`, `fork:<parent>`; `warm` for later messages to
+/// the same process). A prompt starting with `sleep` hangs (a turn to kill);
+/// `nap` takes 2 seconds (a turn to message while it works); `limited` fails
+/// with a usage limit on the account `acct-a`; `ask` puts a permission prompt
+/// to the run's `__permit` server the way Claude does (`ask question`: a
+/// question, `ask plan`: plan approval) and echoes the decision.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
 echo "run=${CLAUDE_PROXY_RUN:-} $*" >> "$FAKE_ARGS_LOG"
-prompt=$(cat)
 sid=""; mode=""; fork=""; cfg=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -32,38 +34,44 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$fork" ] && mode="fork:$fork"
 acct=$(basename "${CLAUDE_CONFIG_DIR:-primary}")
-echo "$mode $sid $acct $prompt" >> "$FAKE_LOG"
-mkdir -p "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/fake"
-echo "$prompt" >> "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/fake/$sid.jsonl"
-echo '{"type":"system","subtype":"init","session_id":"'"$sid"'"}'
-case "$prompt" in
-  sleep*) echo '{"type":"system","subtype":"task_summary","detail":"sleeping"}'; sleep 30 ;;
-  nap*) echo '{"type":"system","subtype":"task_summary","detail":"napping"}'; sleep 2 ;;
-  limited*)
-    if [ "$acct" = "acct-a" ]; then
-      echo '{"type":"assistant","message":{"content":[{"type":"text","text":"usage limit reached"}]},"error":"rate_limit"}'
-      echo '{"type":"result","subtype":"success","is_error":true,"result":"usage limit reached"}'
-      exit 1
-    fi ;;
-  ask*)
-    cmd=$(sed 's/.*"command":"\([^"]*\)".*/\1/' "$cfg")
-    id=$(sed 's/.*"__permit","\([^"]*\)".*/\1/' "$cfg")
-    tool=Bash; input='{"command":"rm -rf build"}'
-    case "$prompt" in *question*)
-      tool=AskUserQuestion
-      input='{"questions":[{"question":"Which colour?","options":[{"label":"Red"},{"label":"Blue"}]}]}' ;;
-    esac
-    prompt=$(printf '%s\n' \
-      '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
-      '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
-      '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"permit","arguments":{"tool_name":"'"$tool"'","input":'"$input"',"tool_use_id":"t1"}}}' \
-      | "$cmd" __permit "$id" | tail -n 1 | sed 's/.*"text":"\(.*\)","type":"text".*/\1/') ;;
-esac
-echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"echo hi"}}]}}'
-echo '{"type":"user","message":{"content":[{"type":"tool_result","content":"hi","is_error":false}]}}'
-echo '{"type":"assistant","message":{"content":[{"type":"text","text":"echo: '"$prompt"'"}]}}'
-echo '{"type":"system","subtype":"post_turn_summary","status_detail":"echoed '"$prompt"'","needs_action":""}'
-echo '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"duration_ms":5,"total_cost_usd":0.01,"result":"echo: '"$prompt"'"}'
+while IFS= read -r line; do
+  prompt=$(printf '%s\n' "$line" | sed 's/.*"content":"\(.*\)","role":"user".*/\1/')
+  echo "$mode $sid $acct $prompt" >> "$FAKE_LOG"
+  mode="warm"
+  mkdir -p "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/fake"
+  echo "$prompt" >> "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/fake/$sid.jsonl"
+  echo '{"type":"system","subtype":"init","session_id":"'"$sid"'"}'
+  echo '{"type":"user","isReplay":true,"message":{"role":"user","content":"'"$prompt"'"}}'
+  case "$prompt" in
+    sleep*) echo '{"type":"system","subtype":"task_summary","detail":"sleeping"}'; sleep 30 ;;
+    nap*) echo '{"type":"system","subtype":"task_summary","detail":"napping"}'; sleep 2 ;;
+    limited*)
+      if [ "$acct" = "acct-a" ]; then
+        echo '{"type":"assistant","message":{"content":[{"type":"text","text":"usage limit reached"}]},"error":"rate_limit"}'
+        echo '{"type":"result","subtype":"success","is_error":true,"result":"usage limit reached"}'
+        exit 1
+      fi ;;
+    ask*)
+      cmd=$(sed 's/.*"command":"\([^"]*\)".*/\1/' "$cfg")
+      id=$(sed 's/.*"__permit","\([^"]*\)".*/\1/' "$cfg")
+      tool=Bash; input='{"command":"rm -rf build"}'
+      case "$prompt" in
+        *question*) tool=AskUserQuestion
+          input='{"questions":[{"question":"Which colour?","options":[{"label":"Red"},{"label":"Blue"}]}]}' ;;
+        *plan*) tool=ExitPlanMode; input='{"plan":"do it"}' ;;
+      esac
+      prompt=$(printf '%s\n' \
+        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
+        '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+        '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"permit","arguments":{"tool_name":"'"$tool"'","input":'"$input"',"tool_use_id":"t1"}}}' \
+        | "$cmd" __permit "$id" | tail -n 1 | sed 's/.*"text":"\(.*\)","type":"text".*/\1/') ;;
+  esac
+  echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"echo hi"}}]}}'
+  echo '{"type":"user","message":{"content":[{"type":"tool_result","content":"hi","is_error":false}]}}'
+  echo '{"type":"assistant","message":{"content":[{"type":"text","text":"echo: '"$prompt"'"}]}}'
+  echo '{"type":"system","subtype":"post_turn_summary","status_detail":"echoed '"$prompt"'","needs_action":""}'
+  echo '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"duration_ms":5,"total_cost_usd":0.01,"result":"echo: '"$prompt"'"}'
+done
 "#;
 
 struct Env {
@@ -115,6 +123,8 @@ fn run_as(env: &Env, exe: &Path, args: &[&str], vars: &[(&str, &str)]) -> Output
         .env("PATH", &env.path)
         .env("FAKE_LOG", &env.log)
         .env("FAKE_ARGS_LOG", &env.args_log)
+        // Each turn's drainer exits at once unless a test asks for a warm one.
+        .env("CLAUDE_PROXY_IDLE_SECS", "0")
         .current_dir(&env.home);
     for (k, v) in vars {
         cmd.env(k, v);
@@ -604,4 +614,219 @@ fn profiles_get_the_users_mcp_servers() {
     let last = args.lines().last().unwrap();
     assert!(last.starts_with("run= --mcp-config="), "{last}");
     assert!(last.ends_with(" mcp list"), "{last}");
+}
+
+#[test]
+fn a_warm_claude_takes_follow_ups_without_restarting() {
+    let env = setup();
+    let warm = [("CLAUDE_PROXY_IDLE_SECS", "60")];
+    let exe = Path::new(env!("CARGO_BIN_EXE_claude-proxy"));
+    let id = stdout(&run_as(
+        &env,
+        exe,
+        &["run", "--account", "claude", "hello"],
+        &warm,
+    ));
+    assert_eq!(
+        stdout(&cp(&env, &["wait", &id, "--timeout", "30"])),
+        "echo: hello"
+    );
+    // Idle, yet still holding its Claude: `wait` returned all the same.
+    assert_eq!(status(&env, &id)["state"], "idle");
+
+    assert!(cp(&env, &["send", &id, "again"]).status.success());
+    assert_eq!(
+        stdout(&cp(&env, &["wait", &id, "--timeout", "30"])),
+        "echo: again"
+    );
+    let log = std::fs::read_to_string(&env.log).unwrap();
+    let modes: Vec<&str> = log.lines().map(|l| l.split(' ').next().unwrap()).collect();
+    assert_eq!(modes, ["new", "warm"], "one process for both messages");
+
+    // `kill` on an idle run only lets go of its Claude.
+    let out = cp(&env, &["kill", &id]);
+    assert!(stdout(&out).contains("is not running"), "{}", stdout(&out));
+    assert_eq!(status(&env, &id)["state"], "idle");
+    assert!(cp(&env, &["send", &id, "later"]).status.success());
+    assert_eq!(
+        stdout(&cp(&env, &["wait", &id, "--timeout", "30"])),
+        "echo: later"
+    );
+    let log = std::fs::read_to_string(&env.log).unwrap();
+    assert!(log.lines().last().unwrap().starts_with("resume "), "{log}");
+    assert!(
+        cp(&env, &["rm", &id]).status.success(),
+        "rm lets go of a warm run"
+    );
+}
+
+#[test]
+fn always_and_accept_edits_outlive_the_request() {
+    let env = setup();
+    let id = stdout(&cp(&env, &["run", "--account", "claude", "ask first"]));
+    assert_eq!(
+        cp(&env, &["wait", &id, "--timeout", "30"]).status.code(),
+        Some(2)
+    );
+    assert!(cp(&env, &["allow", &id, "--always"]).status.success());
+    let out = stdout(&cp(&env, &["wait", &id, "--timeout", "30"]));
+    assert!(
+        out.contains(r#""updatedPermissions":[{"behavior":"allow","destination":"session","rules":[{"ruleContent":"rm -rf build","toolName":"Bash"}],"type":"addRules"}]"#),
+        "{out}"
+    );
+    assert!(
+        stdout(&cp(&env, &["read", &id])).contains("↪ allowed · from now on: Bash(rm -rf build)")
+    );
+    // A later Claude process starts with the rule.
+    assert!(cp(&env, &["send", &id, "hi"]).status.success());
+    cp(&env, &["wait", &id, "--timeout", "30"]);
+    let args = std::fs::read_to_string(&env.args_log).unwrap();
+    assert!(
+        args.lines()
+            .last()
+            .unwrap()
+            .contains("--allowedTools Bash(rm -rf build) --permission-prompt-tool"),
+        "{args}"
+    );
+
+    // Approving a plan: later processes accept edits instead of planning again.
+    let id = stdout(&cp(
+        &env,
+        &[
+            "run",
+            "--account",
+            "claude",
+            "ask plan",
+            "--",
+            "--permission-mode",
+            "plan",
+        ],
+    ));
+    assert_eq!(
+        cp(&env, &["wait", &id, "--timeout", "30"]).status.code(),
+        Some(2)
+    );
+    assert!(cp(&env, &["allow", &id, "--accept-edits"]).status.success());
+    assert!(
+        stdout(&cp(&env, &["wait", &id, "--timeout", "30"])).contains(r#""mode":"acceptEdits""#)
+    );
+    assert!(cp(&env, &["send", &id, "go"]).status.success());
+    cp(&env, &["wait", &id, "--timeout", "30"]);
+    let args = std::fs::read_to_string(&env.args_log).unwrap();
+    assert!(
+        args.lines()
+            .last()
+            .unwrap()
+            .ends_with("--permission-mode plan --permission-mode acceptEdits"),
+        "{args}"
+    );
+}
+
+#[test]
+fn a_run_inherits_the_permission_mode_of_the_session_starting_it() {
+    use std::io::Write;
+    let env = setup();
+    let exe = Path::new(env!("CARGO_BIN_EXE_claude-proxy"));
+    let session = "11111111-2222-4333-8444-555555555555";
+    let mut hook = Command::new(exe)
+        .args(["__hook", "prompt"])
+        .env_clear()
+        .env("HOME", &env.home)
+        .env("XDG_CONFIG_HOME", env.home.join(".config"))
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    hook.stdin
+        .take()
+        .unwrap()
+        .write_all(
+            format!(r#"{{"session_id":"{session}","permission_mode":"acceptEdits"}}"#).as_bytes(),
+        )
+        .unwrap();
+    assert!(hook.wait().unwrap().success());
+
+    let vars = [("CLAUDE_CODE_SESSION_ID", session)];
+    let id = stdout(&run_as(
+        &env,
+        exe,
+        &["run", "--account", "claude", "hi"],
+        &vars,
+    ));
+    cp(&env, &["wait", &id, "--timeout", "30"]);
+    let args = std::fs::read_to_string(&env.args_log).unwrap();
+    assert!(
+        args.lines()
+            .last()
+            .unwrap()
+            .ends_with("--permission-mode acceptEdits"),
+        "{args}"
+    );
+
+    // An explicit mode wins.
+    let id = stdout(&run_as(
+        &env,
+        exe,
+        &[
+            "run",
+            "--account",
+            "claude",
+            "hi",
+            "--",
+            "--permission-mode",
+            "plan",
+        ],
+        &vars,
+    ));
+    cp(&env, &["wait", &id, "--timeout", "30"]);
+    let args = std::fs::read_to_string(&env.args_log).unwrap();
+    let last = args.lines().last().unwrap();
+    assert!(
+        last.ends_with("--permission-mode plan") && !last.contains("acceptEdits"),
+        "{last}"
+    );
+}
+
+#[test]
+fn the_hook_turns_subagent_calls_into_runs() {
+    use std::io::Write;
+    let env = setup();
+    let hook = |vars: &[(&str, &str)], description: &str| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_claude-proxy"));
+        cmd.args(["__hook", "pre-tool-use"])
+            .env_clear()
+            .env("HOME", &env.home)
+            .stdin(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        for (k, v) in vars {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().unwrap();
+        let input = format!(
+            r#"{{"tool_name":"Agent","tool_input":{{"subagent_type":"gsd-executor","description":"{description}","prompt":"p"}}}}"#
+        );
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let out = hook(&[], "fix it");
+    assert_eq!(out.status.code(), Some(2), "blocked");
+    assert!(String::from_utf8_lossy(&out.stderr)
+        .contains("claude-proxy run --agent gsd-executor --name 'fix it' -"));
+    assert_eq!(hook(&[], "[direct] fix it").status.code(), Some(0));
+    assert_eq!(
+        hook(&[("CLAUDE_PROXY_RUN", "abc123")], "fix it")
+            .status
+            .code(),
+        Some(0)
+    );
+    assert_eq!(
+        hook(&[("CLAUDE_PROXY_POLICY", "off")], "fix it")
+            .status
+            .code(),
+        Some(0)
+    );
 }

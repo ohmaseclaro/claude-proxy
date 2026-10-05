@@ -2,24 +2,25 @@
 //! start it in the background, read or follow its transcript, check its status,
 //! send follow-up messages, wait for it, or kill it.
 //!
-//! Each run pins one Claude session id. Every message becomes one headless turn
-//! (`claude -p --output-format stream-json`, the first with `--session-id`, the
-//! rest with `--resume`), so the conversation carries over, and a message sent
-//! while a turn is working is delivered when that turn ends. A detached drainer
-//! (`claude-proxy __drain <id>`) works through the run's inbox and exits once it
-//! is empty. It holds `run.lock` while alive — that lock, not a pid, is how
-//! every other command knows whether the run is working.
+//! Each run pins one Claude session id, so the conversation carries over —
+//! across Claude processes and across accounts. Messages go through the run's
+//! inbox to a detached drainer (`claude-proxy __drain <id>`, see `drainer`),
+//! which keeps a `claude` process warm for the run and exits once it has been
+//! idle a while. It holds `run.lock` while alive — that lock, not a pid, is how
+//! every other command knows it is there.
 //!
 //! `~/.config/claude-proxy/runs/<id>/`: `meta.json` (written only by the
 //! drainer once it starts), `events.jsonl` (the transcript: Claude's
 //! stream-json plus our message/turn markers), `inbox/` (queued messages),
 //! `account` (a pending account switch), `stop` (a kill in progress),
 //! `pending` (a drainer was requested and has not taken the lock yet),
-//! `asks/` (decisions Claude is waiting for, see `asks`), `mcp.json` (the MCP
-//! servers each turn starts with), `stderr.log`, `run.lock`.
+//! `release` (attach or rm asking an idle drainer to let go), `asks/`
+//! (decisions Claude is waiting for, see `asks`), `allowed` and `mode` (rules
+//! and a permission mode granted through `allow`), `mcp.json` (the MCP servers
+//! Claude starts with), `stderr.log`, `run.lock`.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -139,7 +140,7 @@ pub fn load(id: &str) -> Result<Meta, String> {
     serde_json::from_slice(&bytes).map_err(|e| format!("run {id:?} is unreadable: {e}"))
 }
 
-fn save(dir: &Path, meta: &mut Meta) {
+pub(crate) fn save(dir: &Path, meta: &mut Meta) {
     meta.updated_at = now_secs();
     let tmp = dir.join("meta.json.tmp");
     if let Ok(bytes) = serde_json::to_vec_pretty(meta) {
@@ -229,16 +230,20 @@ pub fn send(id: &str, message: &str, account: Option<&str>) -> Result<(), String
     // A new message is how a killed run is resumed.
     let _ = fs::remove_file(dir.join("stop"));
     enqueue(&dir, message)?;
-    // Always, even with a drainer alive: it may be exiting after a failure
-    // without looking at the inbox again. An extra one waits on the lock and
-    // finds nothing left to do.
-    request_drainer(id)
+    // A drainer that is working or idling picks the message up itself; one
+    // that is stopping after a failure or a kill does not, so start another
+    // (it waits for the lock).
+    let state = load(id)?.state;
+    if !alive(&dir) || matches!(state, State::Failed | State::Killed) {
+        request_drainer(id)?;
+    }
+    Ok(())
 }
 
 /// Mark the run as having work about to start, then start a drainer. The mark
 /// covers the moment before the drainer holds the lock, so nothing mistakes
 /// the run for finished in between.
-fn request_drainer(id: &str) -> Result<(), String> {
+pub(crate) fn request_drainer(id: &str) -> Result<(), String> {
     fs::write(run_dir(id).join("pending"), "")
         .map_err(|e| format!("could not queue the run: {e}"))?;
     spawn_drainer(id)
@@ -248,7 +253,17 @@ fn enqueue(dir: &Path, message: &str) -> Result<(), String> {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    let name = format!("{nanos:024}-{:016x}.txt", random_u64());
+    enqueue_named(dir, message, nanos)
+}
+
+/// Queue a message ahead of everything already queued (`order` keeps several
+/// in sequence).
+pub(crate) fn enqueue_first(dir: &Path, message: &str, order: usize) -> Result<(), String> {
+    enqueue_named(dir, message, order as u128)
+}
+
+fn enqueue_named(dir: &Path, message: &str, order: u128) -> Result<(), String> {
+    let name = format!("{order:024}-{:016x}.txt", random_u64());
     let tmp = dir.join("inbox").join(format!(".{name}"));
     fs::write(&tmp, message)
         .and_then(|()| fs::rename(&tmp, dir.join("inbox").join(&name)))
@@ -256,7 +271,7 @@ fn enqueue(dir: &Path, message: &str) -> Result<(), String> {
 }
 
 /// Pending messages, oldest first, removed from the inbox.
-fn take_inbox(dir: &Path) -> Vec<String> {
+pub(crate) fn take_inbox(dir: &Path) -> Vec<String> {
     let mut names: Vec<PathBuf> = fs::read_dir(dir.join("inbox"))
         .into_iter()
         .flatten()
@@ -279,15 +294,20 @@ fn take_inbox(dir: &Path) -> Vec<String> {
 }
 
 pub fn queued(dir: &Path) -> usize {
+    inbox_names(dir).len()
+}
+
+pub(crate) fn inbox_names(dir: &Path) -> Vec<String> {
     fs::read_dir(dir.join("inbox"))
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
-        .count()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| !n.starts_with('.'))
+        .collect()
 }
 
-fn lock_file(dir: &Path) -> std::io::Result<File> {
+pub(crate) fn lock_file(dir: &Path) -> std::io::Result<File> {
     OpenOptions::new()
         .read(true)
         .write(true)
@@ -304,14 +324,25 @@ pub fn alive(dir: &Path) -> bool {
     }
 }
 
-/// Nothing running and nothing about to run.
+/// Nothing running and nothing about to run. A drainer idling with a warm
+/// Claude counts as finished.
 pub fn finished(id: &str) -> Result<bool, String> {
-    let meta = load(id)?;
     let dir = run_dir(id);
-    // Messages left queued behind a kill do not keep it unfinished.
-    Ok(!alive(&dir)
-        && !pending(&dir)
-        && (queued(&dir) == 0 || matches!(meta.state, State::Failed | State::Killed)))
+    // In this order: the drainer marks the run working before it empties the
+    // inbox, so a message is always seen in one place or the other.
+    if pending(&dir) {
+        load(id)?;
+        return Ok(false);
+    }
+    let queued = queued(&dir);
+    let state = load(id)?.state;
+    // Messages left queued behind a failure or a kill wait for the next send.
+    let stopped = matches!(state, State::Failed | State::Killed);
+    Ok(if alive(&dir) {
+        queued == 0 && (stopped || state == State::Idle)
+    } else {
+        queued == 0 || stopped
+    })
 }
 
 fn pending(dir: &Path) -> bool {
@@ -359,72 +390,16 @@ fn spawn_drainer(id: &str) -> Result<(), String> {
         .map_err(|e| format!("could not start the run: {e}"))
 }
 
-/// The drainer's main loop: one message batch at a time, until the inbox is
-/// empty, a message cannot be delivered, or the run is killed.
-pub fn drain(id: &str) -> Result<(), String> {
-    let dir = run_dir(id);
-    let lock = lock_file(&dir).map_err(|e| e.to_string())?;
-    // Blocking, never `try_lock`: `alive()` probes this lock by briefly taking
-    // it, and a drainer that gave up on contention could leave its message
-    // queued forever. Behind another drainer, it simply runs after it.
-    lock.lock().map_err(|e| e.to_string())?;
-    let _ = fs::remove_file(dir.join("pending"));
-    let mut meta = load(id)?;
-    loop {
-        if dir.join("stop").exists() {
-            meta.state = State::Killed;
-            save(&dir, &mut meta);
-            return Ok(());
-        }
-        let messages = take_inbox(&dir);
-        if messages.is_empty() {
-            if matches!(meta.state, State::Working | State::Queued) {
-                meta.state = State::Idle;
-            }
-            meta.activity = None;
-            save(&dir, &mut meta);
-            // Re-check after letting go of the lock: a message queued while we
-            // were finishing would otherwise wait for the next `send`.
-            let _ = lock.unlock();
-            if queued(&dir) == 0 || lock.lock().is_err() {
-                return Ok(());
-            }
-            // Another drainer may have run in between.
-            meta = load(id)?;
-            continue;
-        }
-        if let Ok(spec) = fs::read_to_string(dir.join("account")) {
-            let _ = fs::remove_file(dir.join("account"));
-            match parse_pool(spec.trim()).and_then(|pool| Ok((first_account(&pool)?, pool))) {
-                Ok((account, pool)) => {
-                    meta.account = account;
-                    meta.pool = pool;
-                    meta.moved = None;
-                }
-                Err(e) => marker(
-                    &dir,
-                    json!({"event": "note", "text": format!("account switch ignored: {e}")}),
-                ),
-            }
-        }
-        let text = messages.join("\n\n");
-        marker(&dir, json!({"event": "message", "text": text}));
-        if !deliver(&dir, &mut meta, &text) {
-            return Ok(());
-        }
-    }
-}
-
 /// Why an account could not serve a turn — the failures moving to another
 /// account can fix (overloaded or server errors are not account-specific).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Reason {
+pub(crate) enum Reason {
     Limit,
     Auth,
 }
 
 impl Reason {
-    fn describe(self) -> &'static str {
+    pub(crate) fn describe(self) -> &'static str {
         match self {
             Reason::Limit => "hit its usage limit",
             Reason::Auth => "could not sign in",
@@ -434,18 +409,18 @@ impl Reason {
 
 /// What a turn reported besides its transcript.
 #[derive(Default)]
-struct Signals {
-    result_error: bool,
+pub(crate) struct Signals {
+    pub(crate) result_error: bool,
     /// The typed `error` Claude puts on an assistant message wrapping an API
     /// error (`rate_limit`, `billing_error`, `authentication_failed`, …).
-    api_error: Option<String>,
+    pub(crate) api_error: Option<String>,
     /// A `rate_limit_event` with status `rejected`.
-    rejected: bool,
+    pub(crate) rejected: bool,
     /// Claude printed `Not logged in` instead of starting.
-    not_logged_in: bool,
+    pub(crate) not_logged_in: bool,
 }
 
-fn classify(s: &Signals) -> Option<Reason> {
+pub(crate) fn classify(s: &Signals) -> Option<Reason> {
     match s.api_error.as_deref() {
         Some("rate_limit" | "billing_error") => Some(Reason::Limit),
         Some(
@@ -460,65 +435,9 @@ fn classify(s: &Signals) -> Option<Reason> {
     }
 }
 
-enum TurnEnd {
-    Done,
-    Failed(Option<Reason>),
-    Killed,
-}
-
-/// Deliver one message, moving the conversation to another account when the
-/// current one hits a usage limit or cannot sign in. The session is shared by
-/// every profile (`projects` is linked), so the new account resumes the same
-/// session id — nothing is copied. Returns whether the drainer should go on.
-fn deliver(dir: &Path, meta: &mut Meta, original: &str) -> bool {
-    let mut tried = vec![meta.account.clone()];
-    let mut text = original.to_string();
-    loop {
-        let before = session_len(meta);
-        let reason = match run_turn(dir, meta, &text) {
-            TurnEnd::Done => return true,
-            TurnEnd::Killed | TurnEnd::Failed(None) => return false,
-            TurnEnd::Failed(Some(reason)) => reason,
-        };
-        // Measured on the failed account's view, before switching.
-        let reached_session = session_len(meta) > before;
-        let from = meta.account.clone();
-        if reason == Reason::Limit {
-            quota::invalidate(&from);
-        }
-        let next = if dir.join("stop").exists() {
-            None
-        } else {
-            next_account(meta, &tried)
-        };
-        marker(
-            dir,
-            json!({"event": "failover", "from": from, "to": next, "reason": reason.describe()}),
-        );
-        let Some(next) = next else {
-            return false;
-        };
-        meta.moved = Some(format!("from {from}, which {}", reason.describe()));
-        meta.account = next.clone();
-        tried.push(next);
-        text = if reached_session {
-            // The message is already in the session: ask for the rest of the
-            // work instead of repeating it.
-            format!(
-                "(claude-proxy) Your previous turn stopped because the Claude account \
-                 {from} {}. This conversation now continues on another account — pick up \
-                 exactly where you left off.",
-                reason.describe()
-            )
-        } else {
-            original.to_string()
-        };
-    }
-}
-
 /// The account to continue on, never one already tried for this message. One
 /// named account is pinned; a list is tried in order; `auto` picks by quota.
-fn next_account(meta: &Meta, tried: &[String]) -> Option<String> {
+pub(crate) fn next_account(meta: &Meta, tried: &[String]) -> Option<String> {
     match meta.pool.as_slice() {
         [_] => None,
         [] => {
@@ -589,108 +508,16 @@ pub fn find_session(projects: &Path, session_id: &str) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-fn session_len(meta: &Meta) -> u64 {
+pub(crate) fn session_len(meta: &Meta) -> u64 {
     session_file(meta)
         .and_then(|p| fs::metadata(p).ok())
         .map_or(0, |m| m.len())
 }
 
-/// One headless turn on the run's current account.
-fn run_turn(dir: &Path, meta: &mut Meta, text: &str) -> TurnEnd {
-    meta.turns += 1;
-    meta.state = State::Working;
-    meta.turn_started_at = Some(now_secs());
-    meta.activity = None;
-    meta.summary = None;
-    meta.needs_action = None;
-    save(dir, meta);
-    marker(
-        dir,
-        json!({"event": "turn_start", "turn": meta.turns, "account": meta.account}),
-    );
-
-    let spawned = turn_command(dir, meta).and_then(|mut cmd| {
-        cmd.spawn().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                "`claude` is not on PATH".to_string()
-            } else {
-                format!("could not start claude: {e}")
-            }
-        })
-    });
-    let mut child = match spawned {
-        Ok(c) => c,
-        Err(error) => {
-            marker(
-                dir,
-                json!({"event": "turn_end", "turn": meta.turns, "exit": null, "error": error}),
-            );
-            meta.state = State::Failed;
-            meta.last_result = Some(error);
-            save(dir, meta);
-            return TurnEnd::Failed(None);
-        }
-    };
-    meta.turn_pid = Some(child.id());
-    save(dir, meta);
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(text.as_bytes());
-    }
-
-    let mut signals = Signals::default();
-    if let (Some(out), Ok(mut events)) = (
-        child.stdout.take(),
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join("events.jsonl")),
-    ) {
-        for line in BufReader::new(out).lines().map_while(Result::ok) {
-            // One write per line: `__permit` appends to the same file.
-            let _ = events.write_all(format!("{line}\n").as_bytes());
-            match serde_json::from_str::<Value>(&line) {
-                Ok(v) => {
-                    if observe(meta, &v, &mut signals) {
-                        save(dir, meta);
-                    }
-                }
-                Err(_) if line.trim_start().starts_with("Not logged in") => {
-                    signals.not_logged_in = true;
-                }
-                Err(_) => {}
-            }
-        }
-    }
-    let code = child.wait().ok().and_then(|s| s.code());
-    asks::clear(dir);
-    let killed = dir.join("stop").exists();
-    meta.turn_pid = None;
-    meta.last_exit = code;
-    meta.activity = None;
-    marker(
-        dir,
-        json!({"event": "turn_end", "turn": meta.turns, "exit": code, "killed": killed}),
-    );
-    let end = if killed {
-        TurnEnd::Killed
-    } else if code != Some(0) || signals.result_error {
-        TurnEnd::Failed(classify(&signals))
-    } else {
-        TurnEnd::Done
-    };
-    meta.state = match end {
-        TurnEnd::Done => State::Working,
-        TurnEnd::Failed(_) => State::Failed,
-        TurnEnd::Killed => State::Killed,
-    };
-    save(dir, meta);
-    end
-}
-
-/// The `claude` process for one turn: the run's account, session, MCP servers
-/// (the user's, plus `__permit` for the decisions it cannot make alone), and
-/// the caller's Claude flags.
-fn turn_command(dir: &Path, meta: &Meta) -> Result<Command, String> {
+/// The `claude` process for the run: its account, session, MCP servers (the
+/// user's, plus `__permit` for the decisions it cannot make alone), what
+/// `allow` granted, and the caller's Claude flags. Messages go in on stdin.
+pub(crate) fn turn_command(dir: &Path, meta: &Meta) -> Result<Command, String> {
     let account = account_dir(&meta.account);
     // Built first: it links the shared setup, so the session is visible below.
     let mut cmd = crate::proxy::claude_command(account.as_deref());
@@ -708,8 +535,20 @@ fn turn_command(dir: &Path, meta: &Meta) -> Result<Command, String> {
     let config = dir.join("mcp.json");
     crate::mcp::write(&config, servers)
         .map_err(|e| format!("could not write the MCP config: {e}"))?;
-    cmd.args(["-p", "--output-format", "stream-json", "--verbose"])
-        .arg(crate::mcp::flag(&config));
+    cmd.args([
+        "-p",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--replay-user-messages",
+    ])
+    .arg(crate::mcp::flag(&config));
+    let allowed = asks::allowed_rules(dir);
+    if !allowed.is_empty() {
+        cmd.arg("--allowedTools").args(&allowed);
+    }
     if !meta
         .claude_args
         .iter()
@@ -728,8 +567,12 @@ fn turn_command(dir: &Path, meta: &Meta) -> Result<Command, String> {
         ]),
         (false, None) => cmd.args(["--session-id", &meta.session_id]),
     };
-    cmd.args(&meta.claude_args)
-        .current_dir(&meta.cwd)
+    cmd.args(&meta.claude_args);
+    // Last, so a mode granted through `allow` beats the one the run began in.
+    if let Some(mode) = asks::granted_mode(dir) {
+        cmd.args(["--permission-mode", &mode]);
+    }
+    cmd.current_dir(&meta.cwd)
         .env("CLAUDE_CODE_ENABLE_ASK_USER_QUESTION_TOOL", "1")
         // Lets hooks and skills inside the run know they are in one.
         .env("CLAUDE_PROXY_RUN", &meta.id)
@@ -753,7 +596,7 @@ fn turn_command(dir: &Path, meta: &Meta) -> Result<Command, String> {
 
 /// Fold one stream-json event into the run's status and the turn's signals.
 /// Returns whether the status changed.
-fn observe(meta: &mut Meta, v: &Value, signals: &mut Signals) -> bool {
+pub(crate) fn observe(meta: &mut Meta, v: &Value, signals: &mut Signals) -> bool {
     let text = |key: &str| {
         v.get(key)
             .and_then(Value::as_str)
@@ -817,11 +660,16 @@ pub fn marker(dir: &Path, mut event: Value) {
 }
 
 /// Stop a run: the current turn is terminated (escalating to SIGKILL) and the
-/// drainer exits; queued messages are kept. Returns whether it was running.
+/// drainer exits; queued messages are kept. Returns whether it was running —
+/// an idle run just lets go of its warm Claude.
 pub fn kill(id: &str) -> Result<bool, String> {
-    load(id)?;
+    let meta = load(id)?;
     let dir = run_dir(id);
     if !alive(&dir) && !pending(&dir) {
+        return Ok(false);
+    }
+    if !pending(&dir) && queued(&dir) == 0 && is_idle(&meta) {
+        release(&dir)?;
         return Ok(false);
     }
     fs::write(dir.join("stop"), "").map_err(|e| format!("could not stop the run: {e}"))?;
@@ -843,7 +691,7 @@ pub fn kill(id: &str) -> Result<bool, String> {
 }
 
 #[cfg(unix)]
-fn signal_group(pid: u32, force: bool) {
+pub(crate) fn signal_group(pid: u32, force: bool) {
     let signal = if force { "-KILL" } else { "-TERM" };
     let _ = Command::new("kill")
         .args([signal, &format!("-{pid}")])
@@ -853,12 +701,30 @@ fn signal_group(pid: u32, force: bool) {
 }
 
 #[cfg(not(unix))]
-fn signal_group(pid: u32, _force: bool) {
+pub(crate) fn signal_group(pid: u32, _force: bool) {
     let _ = Command::new("taskkill")
         .args(["/T", "/F", "/PID", &pid.to_string()])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
+}
+
+fn is_idle(meta: &Meta) -> bool {
+    !matches!(meta.state, State::Working | State::Queued)
+}
+
+/// Ask an idle drainer to exit and wait until it has.
+fn release(dir: &Path) -> Result<(), String> {
+    fs::write(dir.join("release"), "").map_err(|e| format!("could not release the run: {e}"))?;
+    let started = Instant::now();
+    while alive(dir) {
+        if started.elapsed() > Duration::from_secs(10) {
+            return Err("the run's Claude did not stop within 10s".into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = fs::remove_file(dir.join("release"));
+    Ok(())
 }
 
 pub enum Waited {
@@ -892,6 +758,10 @@ pub fn wait(id: &str, timeout: Option<Duration>) -> Result<Waited, String> {
 pub fn attach(id: &str) -> Result<i32, String> {
     let mut meta = load(id)?;
     let dir = run_dir(id);
+    // Two processes must never hold the same session: let go of a warm one.
+    if alive(&dir) && is_idle(&meta) && queued(&dir) == 0 {
+        release(&dir)?;
+    }
     let lock = lock_file(&dir).map_err(|e| e.to_string())?;
     if pending(&dir) || lock.try_lock().is_err() {
         return Err(format!(
@@ -945,6 +815,9 @@ pub fn list() -> Vec<Meta> {
 pub fn remove(id: &str) -> Result<Vec<String>, String> {
     let meta = load(id)?;
     let dir = run_dir(id);
+    if alive(&dir) && is_idle(&meta) {
+        release(&dir)?;
+    }
     if alive(&dir) {
         return Err(format!(
             "run {id} is working; kill it first:  claude-proxy kill {id}"

@@ -12,7 +12,7 @@ use std::io::IsTerminal;
 use clap::{Parser, Subcommand};
 use serde_json::json;
 
-use crate::asks::Reply;
+use crate::asks::{Grant, Reply};
 use crate::install;
 use crate::paths::account_config_dir;
 use crate::quota::{self, Report};
@@ -168,7 +168,21 @@ enum Command {
         timeout: Option<u64>,
     },
     /// Let a waiting run use the tool it asked for.
-    Allow { id: String },
+    Allow {
+        id: String,
+        /// And stop asking for requests like this one: the exact command, the
+        /// domain, or the tool (for edits: accept edits).
+        #[arg(long)]
+        always: bool,
+        /// And stop asking for requests matching this permission rule, e.g.
+        /// `Bash(cargo test:*)`.
+        #[arg(long, value_name = "RULE")]
+        rule: Option<String>,
+        /// And accept file edits without asking from now on (as when
+        /// approving a plan in Claude).
+        #[arg(long)]
+        accept_edits: bool,
+    },
     /// Refuse what a waiting run asked for; it reads your reason and carries on.
     Deny {
         id: String,
@@ -191,6 +205,8 @@ enum Command {
     Drain { id: String },
     #[command(name = "__permit", hide = true)]
     Permit { id: String },
+    #[command(name = "__hook", hide = true)]
+    Hook { event: String },
 }
 
 /// Entry point for the manager role. Returns a process exit code.
@@ -261,7 +277,19 @@ fn dispatch(command: Command) -> Result<i32, String> {
             account,
         } => crate::agents::send(&id, &message, account.as_deref()),
         Command::Wait { id, timeout } => crate::agents::wait(&id, timeout),
-        Command::Allow { id } => crate::agents::reply(&id, Reply::Allow),
+        Command::Allow {
+            id,
+            always,
+            rule,
+            accept_edits,
+        } => crate::agents::reply(
+            &id,
+            Reply::Allow(Grant {
+                always,
+                rule,
+                accept_edits,
+            }),
+        ),
         Command::Deny { id, reason } => crate::agents::reply(
             &id,
             Reply::Deny(reason.unwrap_or_else(|| {
@@ -272,8 +300,9 @@ fn dispatch(command: Command) -> Result<i32, String> {
         Command::Attach { id } => crate::agents::attach(&id),
         Command::Kill { id } => crate::agents::kill(&id),
         Command::Rm { id } => crate::agents::rm(&id),
-        Command::Drain { id } => crate::runs::drain(&id).map(|()| 0),
+        Command::Drain { id } => crate::drainer::drain(&id).map(|()| 0),
         Command::Permit { id } => crate::asks::serve(&id).map(|()| 0),
+        Command::Hook { event } => Ok(crate::hook::run(&event)),
     }
 }
 

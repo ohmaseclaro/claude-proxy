@@ -13,6 +13,8 @@ mod agents;
 mod asks;
 mod cli;
 mod creds;
+mod drainer;
+mod hook;
 mod install;
 mod mcp;
 mod paths;

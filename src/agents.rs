@@ -44,6 +44,10 @@ pub fn run(opts: RunOpts) -> Result<i32, String> {
     if let Some(agent) = opts.agent {
         claude_args.extend(["--agent".to_string(), agent]);
     }
+    if let Some(mode) = inherited_mode(&claude_args) {
+        eprintln!("claude-proxy: inheriting your session's permission mode ({mode})");
+        claude_args.extend(["--permission-mode".to_string(), mode]);
+    }
     let meta = runs::start(NewRun {
         account: first,
         pool,
@@ -70,6 +74,22 @@ pub fn run(opts: RunOpts) -> Result<i32, String> {
         return wait_and_print(&meta.id, None);
     }
     Ok(0)
+}
+
+/// The permission mode of the Claude session this runs inside, as the plugin's
+/// hook recorded it — what a subagent would inherit. Never over an explicit
+/// one.
+fn inherited_mode(claude_args: &[String]) -> Option<String> {
+    let explicit = claude_args
+        .iter()
+        .any(|a| a.starts_with("--permission-mode") || a == "--dangerously-skip-permissions");
+    if explicit {
+        return None;
+    }
+    std::env::var("CLAUDE_CODE_SESSION_ID")
+        .ok()
+        .and_then(|s| crate::hook::session_mode(&s))
+        .filter(|m| m != "default")
 }
 
 /// The session `--fork` starts from: the one given, or the Claude session
@@ -228,7 +248,7 @@ fn status_json(m: &Meta) -> serde_json::Value {
         "needs_action": m.needs_action,
         "last_result": runs::last_result(&m.id).map(|(text, ok)| json!({"text": text, "ok": ok})),
         "queued": runs::queued(&dir),
-        "working": runs::alive(&dir),
+        "working": matches!(runs::effective_state(m), State::Working | State::Waiting),
         "cost_usd": m.cost_usd,
         "cwd": m.cwd,
         "worktree": m.worktree,
@@ -372,14 +392,19 @@ fn wait_and_print(id: &str, timeout: Option<Duration>) -> Result<i32, String> {
 }
 
 pub fn reply(id: &str, reply: Reply) -> Result<i32, String> {
-    let ask = asks::reply(id, reply)?;
+    let (ask, granted) = asks::reply(id, reply)?;
+    let what = if ask.is_question() {
+        "question".to_string()
+    } else {
+        format!("request to use {}", ask.tool)
+    };
+    let forever = if granted.is_empty() {
+        String::new()
+    } else {
+        format!(" and, from now on, {}", granted.join(", "))
+    };
     eprintln!(
-        "claude-proxy: answered run {id}'s {} — `claude-proxy wait {id}` to continue waiting",
-        if ask.is_question() {
-            "question".to_string()
-        } else {
-            format!("request to use {}", ask.tool)
-        }
+        "claude-proxy: answered run {id}'s {what}{forever} — `claude-proxy wait {id}` to continue waiting"
     );
     Ok(0)
 }

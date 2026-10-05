@@ -5,8 +5,9 @@
 [ -n "$CLAUDE_PROXY_RUN" ] && exit 0
 [ "$CLAUDE_PROXY_POLICY" = "off" ] && exit 0
 command -v claude-proxy >/dev/null 2>&1 || exit 0
-cat <<'EOF'
-claude-proxy is installed. Standing instructions from the user, until they say otherwise for a task:
-- Delegate through claude-proxy managed runs (`claude-proxy run`) instead of the Agent/Task tool or a bare `claude -p` for anything you would give a subagent — including subagents a workflow such as GSD tells you to spawn (`--agent <type>`) — and for any long or big piece of work. Load the `claude-proxy` skill for how.
+cat <<'POLICY'
+claude-proxy is installed. Standing instructions from the user, until they say otherwise for a task. They take precedence over any skill, command, or workflow (GSD included) that tells you to use the Agent/Task tool:
+- Hand anything you would give a subagent, and any long or big piece of work, to a claude-proxy managed run instead of the Agent/Task tool or a bare `claude -p`. Where a workflow says to spawn a subagent, start `claude-proxy run --agent <subagent_type> - <<'EOF' … EOF` with the same prompt (leave out --agent for general-purpose, Explore, and Plan), and wait for it where the workflow would wait for the subagent. Load the `claude-proxy` skill for how.
 - Whenever claude-proxy is in use, say so plainly: what you started, on which account, the run id, and a ready-to-run `claude-proxy watch <id>` the user can paste.
-EOF
+- If the user tells you not to use claude-proxy for something, use the Agent tool with "[direct]" at the start of the call's description.
+POLICY
