@@ -51,6 +51,12 @@ How runs behave:
 - **Messages are queued.** `send` while it is working is delivered when the
   current turn ends. `send` to an `idle`, `failed`, or `killed` run resumes the
   same conversation.
+- **It moves itself off a full account.** If the account hits a usage limit or
+  cannot sign in mid-run, the run continues *the same session* on the next
+  account and picks up where it stopped — `status` shows `moved`, the transcript
+  shows `⇄`. `--account auto` (the default) moves by quota; `--account a,b`
+  tries them in order; a single name pins the run to that account (use that only
+  when the user asked for that account).
 - **Waiting:** for anything longer than a minute, start `claude-proxy wait <id>`
   as a background command so you are notified when it finishes, and do other
   work meanwhile. Do not poll `status` in a loop.
@@ -98,10 +104,10 @@ claude-proxy list --refresh   # ignore the cache
 
 ## When something goes wrong
 
-- **A run hits a usage or rate limit:** `claude-proxy send <id> --account auto
-  "continue"` moves the conversation to the account with the most room and
-  picks up where it stopped. For `auto` one-shots: `claude-proxy list
-  --refresh`, then retry.
+- **A run hits a usage limit:** it moves to the next account on its own. It
+  only stays `failed` when no account is left, or when it was pinned to one —
+  then `claude-proxy send <id> --account auto "continue"` moves it by hand. For
+  `auto` one-shots: `claude-proxy list --refresh`, then retry.
 - **`not logged in` or `sign-in expired`:** tell the user to run that account's
   command (e.g. `claude-gmail`) and log in. Never log in for them.
 - **`no logged-in account`:** ask the user to add one with

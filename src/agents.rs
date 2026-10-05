@@ -22,7 +22,8 @@ pub fn run(
     claude_args: Vec<String>,
 ) -> Result<i32, String> {
     let message = read_message(message)?;
-    let account = crate::cli::resolve_account(account)?;
+    let pool = runs::parse_pool(account)?;
+    let first = runs::first_account(&pool)?;
     let cwd = match cwd {
         Some(dir) => dir,
         None => std::env::current_dir().map_err(|e| format!("no current directory: {e}"))?,
@@ -31,7 +32,8 @@ pub fn run(
         .canonicalize()
         .map_err(|e| format!("bad --cwd {}: {e}", cwd.display()))?;
     let meta = runs::start(NewRun {
-        account,
+        account: first,
+        pool,
         name,
         cwd: cwd.to_string_lossy().into_owned(),
         claude_args,
@@ -123,7 +125,15 @@ pub fn status(id: &str, as_json: bool) -> Result<i32, String> {
     }
     let row = |k: &str, v: &str| println!("  {k:<8} {v}");
     row("state", &state_line);
-    row("account", &m.account);
+    let failover = match m.pool.as_slice() {
+        [] => "auto failover".to_string(),
+        [_] => "pinned".to_string(),
+        pool => format!("fallback {}", pool.join(" → ")),
+    };
+    row("account", &format!("{} · {failover}", m.account));
+    if let Some(moved) = &m.moved {
+        row("moved", moved);
+    }
     if let Some(a) = &m.activity {
         row("doing", a);
     }
@@ -165,6 +175,8 @@ fn status_json(m: &Meta) -> serde_json::Value {
         "name": m.name,
         "state": runs::effective_state(m).as_str(),
         "account": m.account,
+        "pool": m.pool,
+        "moved": m.moved,
         "turns": m.turns,
         "activity": m.activity,
         "summary": m.summary,
@@ -266,8 +278,10 @@ pub fn result(id: &str) -> Result<i32, String> {
 
 pub fn send(id: &str, message: &str, account: Option<&str>) -> Result<i32, String> {
     let message = read_message(message)?;
-    let account = account.map(crate::cli::resolve_account).transpose()?;
-    runs::send(id, &message, account.as_deref())?;
+    if let Some(spec) = account {
+        runs::parse_pool(spec)?;
+    }
+    runs::send(id, &message, account)?;
     let to = account.map(|a| format!(" on {a}")).unwrap_or_default();
     eprintln!("claude-proxy: queued for run {id}{to} — `claude-proxy watch {id}` to follow");
     Ok(0)

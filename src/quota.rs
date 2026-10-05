@@ -424,6 +424,12 @@ fn email(config_dir: Option<&Path>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Drop an account's cached quota, so the next lookup fetches real figures —
+/// used when a run finds the account at its limit.
+pub fn invalidate(label: &str) {
+    let _ = std::fs::remove_file(cache_path(label));
+}
+
 /// Fold the live usage a running Claude reports in its `rate_limit_event` into
 /// the account's cache, so `auto` sees it without another lookup.
 pub fn record_rate_limit(label: &str, info: &Value) {

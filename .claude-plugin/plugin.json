@@ -1,6 +1,6 @@
 {
   "name": "quota-router",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Lets agents delegate work to background Claude sessions they can follow, message, wait for, and kill by id, spread across your Claude accounts by remaining quota (`claude-proxy run` / `auto`).",
   "author": {
     "name": "ohmaseclaro",

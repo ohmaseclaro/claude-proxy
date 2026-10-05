@@ -56,6 +56,20 @@ fn marker(v: &Value, full: bool) -> Vec<String> {
             v.get("account").and_then(Value::as_str).unwrap_or("?"),
             v.get("turn").and_then(Value::as_u64).unwrap_or(0)
         )],
+        Some("failover") => {
+            let from = v.get("from").and_then(Value::as_str).unwrap_or("?");
+            let reason = v.get("reason").and_then(Value::as_str).unwrap_or("failed");
+            match v.get("to").and_then(Value::as_str) {
+                Some(to) => vec![format!("⇄ {from} {reason} — continuing on {to}")],
+                None => vec![format!(
+                    "⇄ {from} {reason} — no other account to continue on"
+                )],
+            }
+        }
+        Some("note") => vec![format!(
+            "  · {}",
+            v.get("text").and_then(Value::as_str).unwrap_or("")
+        )],
         Some("turn_end") => {
             let killed = v.get("killed").and_then(Value::as_bool).unwrap_or(false);
             match v.get("exit").and_then(Value::as_i64) {
@@ -151,13 +165,15 @@ fn tool_result(b: &Value, full: bool) -> Vec<String> {
 fn result_line(v: &Value) -> String {
     let ok = v.get("subtype").and_then(Value::as_str) == Some("success")
         && !v.get("is_error").and_then(Value::as_bool).unwrap_or(false);
+    // An API error (usage limit, not logged in) arrives as subtype `success`
+    // with `is_error`; its text was already shown as the assistant's message.
+    let subtype = v.get("subtype").and_then(Value::as_str).unwrap_or("error");
     let mut parts = vec![if ok {
         "✓ done".to_string()
+    } else if subtype == "success" {
+        "✗ failed".to_string()
     } else {
-        format!(
-            "✗ {}",
-            v.get("subtype").and_then(Value::as_str).unwrap_or("error")
-        )
+        format!("✗ {subtype}")
     }];
     if let Some(n) = v.get("num_turns").and_then(Value::as_u64) {
         parts.push(format!("{n} steps"));
@@ -169,7 +185,7 @@ fn result_line(v: &Value) -> String {
         parts.push(format!("${cost:.2}"));
     }
     let mut line = parts.join(" · ");
-    if !ok {
+    if !ok && subtype != "success" {
         if let Some(text) = v.get("result").and_then(Value::as_str) {
             line.push_str(&format!("\n  {}", one_line(text)));
         }
@@ -266,6 +282,18 @@ mod tests {
             ["✗ claude exited with code 1"]
         );
         assert!(r(r#"{"type":"claude_proxy","event":"turn_end","exit":0}"#).is_empty());
+        assert_eq!(
+            r(r#"{"type":"result","subtype":"success","is_error":true,
+                "result":"Not logged in · Please run /login"}"#),
+            ["✗ failed"]
+        );
+        assert_eq!(
+            r(
+                r#"{"type":"result","subtype":"error_max_turns","is_error":true,
+                "result":"stopped after 10 turns"}"#
+            ),
+            ["✗ error_max_turns\n  stopped after 10 turns"]
+        );
         assert!(r(r#"{"type":"system","subtype":"hook_started"}"#).is_empty());
         assert_eq!(
             r("Not logged in · Please run /login"),
@@ -280,6 +308,24 @@ mod tests {
         );
         assert!(
             r(r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}"#).is_empty()
+        );
+    }
+
+    #[test]
+    fn failover_markers() {
+        assert_eq!(
+            r(
+                r#"{"type":"claude_proxy","event":"failover","from":"a","to":"b",
+                "reason":"hit its usage limit"}"#
+            ),
+            ["⇄ a hit its usage limit — continuing on b"]
+        );
+        assert_eq!(
+            r(
+                r#"{"type":"claude_proxy","event":"failover","from":"a","to":null,
+                "reason":"could not sign in"}"#
+            ),
+            ["⇄ a could not sign in — no other account to continue on"]
         );
     }
 

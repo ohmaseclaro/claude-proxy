@@ -65,7 +65,9 @@ enum Command {
     Run {
         /// The task. `-` reads it from stdin.
         message: String,
-        /// Account to use: a proxy name, `claude` for the primary, or `auto`.
+        /// `auto` picks the account with the most quota and, if it hits a
+        /// usage limit, continues the session on the next best. A name pins
+        /// one account; `a,b,c` tries them in order. `claude` is the primary.
         #[arg(long, default_value = "auto")]
         account: String,
         /// A label to recognise the run by.
@@ -138,7 +140,7 @@ enum Command {
         id: String,
         /// The message. `-` reads it from stdin.
         message: String,
-        /// Continue on another account (a proxy name, `claude`, or `auto`).
+        /// Continue on other accounts: `auto`, a name, or `a,b,c` (as `run`).
         #[arg(long)]
         account: Option<String>,
     },
@@ -215,23 +217,6 @@ fn dispatch(command: Command) -> Result<i32, String> {
         Command::Kill { id } => crate::agents::kill(&id),
         Command::Rm { id } => crate::agents::rm(&id),
         Command::Drain { id } => crate::runs::drain(&id).map(|()| 0),
-    }
-}
-
-/// Resolve an account choice: `auto`, `claude` (the primary), or a proxy name.
-pub fn resolve_account(choice: &str) -> Result<String, String> {
-    match choice {
-        "auto" => {
-            let reports = quota::reports(&quota::accounts(), false);
-            let pick = quota::choose(&reports, quota::now_secs())
-                .ok_or("no logged-in account to use. Add one with:  claude-proxy add <name>")?;
-            Ok(reports[pick].label.clone())
-        }
-        quota::PRIMARY_LABEL => Ok(quota::PRIMARY_LABEL.into()),
-        label if Registry::load().has(label) => Ok(label.into()),
-        label => Err(format!(
-            "no account named {label:?}. See:  claude-proxy list"
-        )),
     }
 }
 

@@ -123,7 +123,7 @@ $ claude-proxy wait $id                  # blocks, prints the final answer
 
 | | |
 |---|---|
-| `claude-proxy run "<task>" [-- <claude flags>]` | start; `--account`, `--name`, `--cwd`, `--wait`, `--json`; `-` reads the task from stdin |
+| `claude-proxy run "<task>" [-- <claude flags>]` | start; `--account` (`auto`, a name to pin, or `a,b` in order), `--name`, `--cwd`, `--wait`, `--json`; `-` reads the task from stdin |
 | `claude-proxy status <id>` | state, what it is doing right now, Claude's summary of its last turn, cost (`--json`) |
 | `claude-proxy read <id>` | the transcript (`-n N`, `-f` to follow, `--full`, `--json` raw events) |
 | `claude-proxy tail <id>` / `watch <id>` | the last entries / follow live until it stops |
@@ -135,7 +135,18 @@ $ claude-proxy wait $id                  # blocks, prints the final answer
 
 Each run pins one Claude session: every message is one headless turn of it
 (`--session-id`, then `--resume`), so the conversation carries over — even onto
-another account, since transcripts are shared. A short-lived background process
+another account, since transcripts are shared.
+
+**Automatic failover.** When the account a run is on hits a usage limit or
+cannot sign in, the run resumes the *same session* on the next account and picks
+up where it stopped — nothing is copied, because every profile already sees the
+session. If the failed attempt never reached the session (Claude could not even
+start), the message is simply sent again; otherwise the new account is asked to
+carry on rather than given the message twice. `--account auto` (the default)
+moves to the next best account by quota, `--account a,b` tries the list in
+order, and a single name pins the run. The transcript marks each move with `⇄`
+and `status` shows where it moved from. Failures that are not the account's
+fault (an overloaded API, a server error) are not retried elsewhere. A short-lived background process
 works through the run's queued messages and exits when there are none, so an
 idle run costs nothing. A background run cannot answer permission prompts, so
 pass the permission mode or allowed tools the task needs after `--`. Live usage
