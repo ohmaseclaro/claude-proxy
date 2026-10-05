@@ -215,6 +215,12 @@ $ claude plugin install quota-router@quota-router
 Set `CLAUDE_PROXY_POLICY=off` to keep the skill but drop the default. Inside a
 run the hook stays silent, so runs do not start runs of their own.
 
+Agents call `claude-proxy` through their Bash tool, so each call asks for your
+permission unless you allow it — add `"Bash(claude-proxy:*)"` to
+`permissions.allow` in `~/.claude/settings.json`. That also lets an agent answer
+its runs' permission prompts on its own, so allow it only if you would let the
+agent take those actions itself.
+
 Subagents an agent starts with its own Agent tool stay on that session's
 account; only runs and `auto` calls are spread across accounts.
 

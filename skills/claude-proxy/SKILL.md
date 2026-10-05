@@ -48,12 +48,16 @@ finishes. Do this for one-shots (`auto`) too.
 ## Delegate a task
 
 ```bash
-id=$(claude-proxy run "fix the failing test in src/parser.rs" -- --permission-mode acceptEdits)
-claude-proxy wait "$id"        # run this as a background command
+claude-proxy run "fix the failing test in src/parser.rs" -- --permission-mode acceptEdits
+# → prints the id, e.g. a1b2c3
+claude-proxy wait a1b2c3       # as a background command
 ```
 
-`run` starts the session on the best account and prints only the id. Pass a long
-task on stdin: `claude-proxy run - <<'EOF' … EOF`. Flags:
+`run` starts the session on the best account and prints only the id. Run each
+`claude-proxy` command on its own with the id written out — not inside `$(…)`,
+a shell variable, or a chain with other commands — so it matches the user's
+permission rule for `claude-proxy` instead of prompting or being refused. Pass a
+long task on stdin: `claude-proxy run - <<'EOF' … EOF`. Flags:
 
 | Flag | Use |
 |---|---|
@@ -82,8 +86,10 @@ How the Agent tool maps onto it:
 ## Waiting and answering
 
 Start `claude-proxy wait <id>` as a **background command** and keep working; you
-are notified when it exits. Never poll `status` in a loop. Its exit code says
-what happened:
+are notified when it exits. If nothing will wake you later — you run headless
+(`claude -p`) and your answer ends the session — wait in the foreground instead
+(`--timeout` up to your tool's limit, then wait again). Never poll `status` in a
+loop. Its exit code says what happened:
 
 | Exit | Meaning | Do |
 |---|---|---|
