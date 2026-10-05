@@ -42,15 +42,21 @@ const SHARED: &[&str] = &[
 ];
 
 /// Shared entries whose profile-local contents are worth keeping: they are
-/// merged into `~/.claude` before the link replaces them.
-const MERGE: &[&str] = &["projects", "file-history", "todos", "plans"];
+/// merged into `~/.claude` before the link replaces them (a log file is
+/// appended).
+const MERGE: &[&str] = &[
+    "projects",
+    "file-history",
+    "todos",
+    "plans",
+    "history.jsonl",
+];
 
 /// Link every shared entry into `profile`. Idempotent and best-effort: a link
 /// that cannot be made leaves the profile working, just without that entry.
-///
-/// ponytail: a profile-owned *file* (e.g. a `settings.json` Claude rewrote
-/// atomically, replacing the link) is left alone rather than clobbered, so the
-/// profile keeps its own copy from then on.
+/// A profile's own copy of a shared entry (one Claude wrote before the entry
+/// was linked) gives way to the link: merged when it holds history, otherwise
+/// kept as `<name>.pre-shared`, never deleted.
 pub fn link_shared(profile: &Path) {
     link_shared_from(&home().join(".claude"), profile);
 }
@@ -81,7 +87,15 @@ fn link_shared_from(global: &Path, profile: &Path) {
                     let _ = symlink(&src, &dst);
                 }
             }
-            // Already a link, a profile-owned file, or unreadable: leave it.
+            Ok(m) if m.is_file() && src.is_file() => {
+                let merged = MERGE.contains(name) && append_into(&dst, &src).is_ok();
+                let cleared = (merged && std::fs::remove_file(&dst).is_ok())
+                    || std::fs::rename(&dst, backup_path(&dst)).is_ok();
+                if cleared {
+                    let _ = symlink(&src, &dst);
+                }
+            }
+            // Already a link, or unreadable: leave it.
             _ => {}
         }
     }
@@ -106,6 +120,18 @@ fn merge_into(from: &Path, to: &Path) {
             Ok(_) => {}
         }
     }
+}
+
+fn append_into(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut lines = std::fs::read(from)?;
+    if !lines.is_empty() && !lines.ends_with(b"\n") {
+        lines.push(b'\n');
+    }
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(to)?
+        .write_all(&lines)
 }
 
 fn backup_path(dst: &Path) -> std::path::PathBuf {
@@ -197,19 +223,34 @@ mod tests {
     }
 
     #[test]
-    fn a_profile_owned_file_is_left_alone() {
+    fn a_profile_owned_file_gives_way_to_the_shared_one() {
         let t = tempfile::tempdir().unwrap();
         let (global, profile) = (t.path().join("g"), t.path().join("p"));
         std::fs::create_dir_all(&global).unwrap();
         std::fs::create_dir_all(&profile).unwrap();
         std::fs::write(global.join("settings.json"), "global").unwrap();
         std::fs::write(profile.join("settings.json"), "mine").unwrap();
+        std::fs::write(global.join("history.jsonl"), "a\n").unwrap();
+        std::fs::write(profile.join("history.jsonl"), "b").unwrap();
 
         link_shared_from(&global, &profile);
 
         assert_eq!(
             std::fs::read_to_string(profile.join("settings.json")).unwrap(),
+            "global"
+        );
+        assert_eq!(
+            std::fs::read_to_string(profile.join("settings.json.pre-shared")).unwrap(),
             "mine"
         );
+        assert_eq!(
+            std::fs::read_to_string(global.join("history.jsonl")).unwrap(),
+            "a\nb\n"
+        );
+        assert!(!profile.join("history.jsonl.pre-shared").exists());
+        assert!(std::fs::symlink_metadata(profile.join("history.jsonl"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 }

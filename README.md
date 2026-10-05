@@ -232,7 +232,9 @@ account; only runs and `auto` calls are spread across accounts.
   `settings.json`, `CLAUDE.md`, `skills`, `agents`, `commands`, `plugins`,
   `hooks`, `projects`, and similar, plus get-shit-done's install — is linked
   into each profile. Anything not on the list (the login, the account identity
-  in `.claude.json`, org policy, MCP sign-ins, caches) stays per profile.
+  in `.claude.json`, org policy, MCP sign-ins, caches) stays per profile. A
+  copy a profile made before an entry was shared is merged in (transcripts,
+  history) or moved aside as `<name>.pre-shared`, never deleted.
 - **So are your MCP servers.** User- and local-scope MCP servers live in
   `~/.claude.json` next to the login, so they cannot be linked; each launch on
   a profile passes them to Claude with `--mcp-config` instead. Servers that
