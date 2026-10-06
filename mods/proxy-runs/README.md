@@ -21,10 +21,15 @@ A Claude Code mod (function-hooks plugin, Claude Code 2.1.287+) that makes
   killed or asks something, it appends a notice row and submits a prompt with
   the result or the question, which starts a turn once the session is idle,
   like a background subagent's task notification.
-- **Agent calls redirected.** An `agent.spawn` hook refuses Agent calls and
-  points to the tool, unless the description starts with `[direct]`,
-  `CLAUDE_PROXY_POLICY=off`, or `CLAUDE_PROXY_RUN` is set. Inside a run the mod
-  does nothing at all: no tool, no watcher, no redirect.
+- **Agent calls redirected.** A `tool.call` hook on Agent (and Task) refuses
+  the call and points to the tool, unless the description starts with
+  `[direct]`, `CLAUDE_PROXY_POLICY=off`, or `CLAUDE_PROXY_RUN` is set.
+- **Policy.** A short system-prompt section says to delegate with the tool
+  rather than `claude-proxy run` through Bash, and that `claude-proxy`
+  status / answer / allow through Bash still apply.
+
+Inside a run the mod does nothing at all: no tool, no watcher, no redirect, no
+policy section, no marker.
 
 ## Enable
 
@@ -44,7 +49,26 @@ Every session, the desktop app's Code tab included: add the folder to
 Runs inherit that setting (every profile shares `settings.json`), which is why
 the mod checks `CLAUDE_PROXY_RUN` and stays inert inside them.
 
-Needs `claude-proxy` 0.7.0+ on `PATH`.
+Needs `claude-proxy` 0.7.0+ on `PATH`; the quieter quota-router hooks below
+need a build from this branch.
+
+## With the quota-router plugin
+
+The two can be enabled together:
+
+- The mod's Agent refusal runs in `tool.call`, above the `PreToolUse` settings
+  hooks, so its message (pointing to `mcp__proxy-runs__run`) is the one the
+  model gets; quota-router's shell hook never sees the call.
+- At session start (and at each prompt, which covers `/clear`) the mod writes
+  `~/.config/claude-proxy/sessions/<session_id>.mod` with `on`. While that
+  marker reads `on`, `claude-proxy __hook prompt` does not report runs (the mod
+  already does) and `__hook pre-tool-use` does not redirect. `session-start`
+  still lists runs in progress. At session end the mod removes the marker
+  (`rm`), or writes `off` where it cannot start a process, since `$.fs` has no
+  delete.
+- quota-router's SessionStart policy text still tells the model to use
+  `claude-proxy run` through Bash; the mod's policy section, later in the
+  prompt, says to use the tool instead.
 
 ## Limits
 
@@ -63,11 +87,8 @@ Needs `claude-proxy` 0.7.0+ on `PATH`.
 - **Headless.** Under `claude -p` the session ends with its turn, so the
   wake-up prompt only arrives in an interactive session or a long-lived SDK /
   stream-json one.
-- **Two policies.** With the `quota-router` plugin also enabled, its
-  PreToolUse hook turns an Agent call back first (it runs before `agent.spawn`)
-  and suggests `claude-proxy run` through Bash; the tool's description tells the
-  model to prefer the tool. Its prompt hook also reports finished runs at the
-  next prompt, so a run may be mentioned twice.
+- **`/clear`.** The events watcher keeps following the session id it started
+  under; runs started after a `/clear` show up once the session restarts.
 - Notifications cover runs started through the tool. Runs started through Bash
   still show in the pane and status line; wait on those as before.
 
