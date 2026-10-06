@@ -1,0 +1,6 @@
+{
+  "name": "proxy-runs",
+  "version": "0.1.0",
+  "description": "claude-proxy managed runs as live rows, a Runs pane and notifications, in place of local subagents",
+  "types": "./types/index.d.ts"
+}
