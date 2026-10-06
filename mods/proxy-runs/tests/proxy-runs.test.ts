@@ -32,6 +32,7 @@ type World = {
   toasts: string[]
   logs: string[]
   noProcess: boolean
+  files: Record<string, string>
 }
 
 const META = {
@@ -64,10 +65,13 @@ function world(on: On, events: string[] = [], env: Record<string, string> = {}):
     toasts: [],
     logs: [],
     noProcess: false,
+    files: {},
   }
   on('fs.list', () => ({ value: [{ name: 'abc123', kind: 'dir', size: 0, mtimeMs: 0, isLink: false }] }) as never)
   on('fs.read', ($, e) => ({ value: String(e.path).endsWith('meta.json') ? JSON.stringify(META) : EVENTS_JSONL }) as never)
-  mock.env(on, env)
+  mock.env(on, { HOME: '/home/u', ...env })
+  on('fs.write', ($, e) => ((w.files[e.path] = e.text), { value: undefined }))
+  on('fs.exists', ($, e) => ({ value: e.path in w.files }))
   on('session.id', () => ({ value: SESSION }))
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('tool.register', ($, e) => {
@@ -86,6 +90,10 @@ function world(on: On, events: string[] = [], env: Record<string, string> = {}):
     if (w.noProcess) return { deny: 'CLI only' }
     w.argvs.push([...e.argv])
     w.stdins.push(e.init?.stdin)
+    if (e.argv[0] === 'rm') {
+      delete w.files[e.argv[2] ?? '']
+      return ok('')
+    }
     const [, cmd] = e.argv
     if (cmd === 'run' || cmd === 'status') return ok(JSON.stringify(w.status))
     if (cmd === 'runs') return ok(JSON.stringify([]))
@@ -235,37 +243,74 @@ test('without process access the tool refuses with a clear reason', async ($, on
   expect(String(ran.isError ? ran.text : ran.deny)).toContain('cannot be started from this session')
 })
 
+const COMPOSE = {
+  model: 'claude-opus-5-5',
+  promptModel: 'claude-opus-5-5',
+  surfaces: [],
+  tools: [],
+  outputStyle: null,
+  traits: [],
+} as never
+const MARKER = `/home/u/.config/claude-proxy/sessions/${SESSION}.mod`
+const agent = (description: string) => ({
+  tool: 'Agent' as const,
+  tool_use_id: 'ta',
+  prompt: 'look around',
+  description,
+  subagent_type: 'Explore',
+})
+const spawned = (on: On) => on('tool.call', () => ({ result: 'spawned' }) as never)
+
 test('Agent calls are denied toward the tool, except [direct]', async ($, on) => {
   world(on)
-  on('agent.spawn', () => ({ model: 'sonnet', agentId: 'a1' }))
-  const spawn = (description: string) =>
-    $.agent.spawn({
-      tool_use_id: 't', prompt: 'p', description, subagentType: 'general-purpose',
-      provider: { plugin: 'engine', tier: 'core' }, parentModel: 'opus', background: false, fork: false,
-    } as never)
-  const denied = await spawn('look around')
-  expect(denied.deny).toContain(TOOL)
-  expect((await spawn('[direct] look around')).deny).toBeUndefined()
+  spawned(on)
+  await start($)
+  const denied = await $.tool.call(agent('look around'))
+  expect(String(denied.isError ? denied.text : denied.deny)).toContain(`Call ${TOOL}`)
+  expect((await $.tool.call(agent('[direct] look around'))).result).toBe('spawned')
 })
 
 test('inside a run the mod stays silent', async ($, on) => {
   const w = world(on, [], { CLAUDE_PROXY_RUN: 'parent1' })
-  on('agent.spawn', () => ({ model: 'sonnet', agentId: 'a1' }))
+  spawned(on)
+  on('prompt.compose', () => ({ sections: [] }))
   await start($)
-  const spawned = await $.agent.spawn({
-    tool_use_id: 't', prompt: 'p', description: 'look', subagentType: 'Explore',
-    provider: { plugin: 'engine', tier: 'core' }, parentModel: 'opus', background: false, fork: false,
-  } as never)
-  expect(spawned.deny).toBeUndefined()
+  expect((await $.tool.call(agent('look'))).result).toBe('spawned')
   expect(w.tools).not.toContain(TOOL)
+  expect(w.files).toEqual({})
+  const composed = await $.prompt.compose(COMPOSE)
+  expect(composed.sections).toHaveLength(0)
 })
 
 test('CLAUDE_PROXY_POLICY=off lets Agent calls through', async ($, on) => {
   world(on, [], { CLAUDE_PROXY_POLICY: 'off' })
-  on('agent.spawn', () => ({ model: 'sonnet', agentId: 'a1' }))
-  const spawned = await $.agent.spawn({
-    tool_use_id: 't', prompt: 'p', description: 'look', subagentType: 'Explore',
-    provider: { plugin: 'engine', tier: 'core' }, parentModel: 'opus', background: false, fork: false,
-  } as never)
-  expect(spawned.deny).toBeUndefined()
+  spawned(on)
+  expect((await $.tool.call(agent('look'))).result).toBe('spawned')
+})
+
+test('the policy section tells the model to use the tool', async ($, on) => {
+  world(on)
+  on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'hi', scope: 'shared' }] }))
+  const { sections } = await $.prompt.compose(COMPOSE)
+  expect(sections.at(-1)).toMatchObject({ id: 'proxy-runs:policy', scope: 'session' })
+  expect(sections.at(-1)?.text).toContain(`${TOOL} instead of \`claude-proxy run\` through Bash`)
+})
+
+test('the session marker is written at start and removed at end', async ($, on) => {
+  const w = world(on)
+  on('session.end', ($, e) => ({ sessionId: e.sessionId }) as never)
+  await start($)
+  expect(w.files[MARKER]).toBe('on')
+  await $.session.end({ reason: 'other', sessionId: SESSION } as never)
+  expect(MARKER in w.files).toBe(false)
+})
+
+test('without process access the marker is turned off instead', async ($, on) => {
+  const w = world(on)
+  mock.clock(on)
+  on('session.end', ($, e) => ({ sessionId: e.sessionId }) as never)
+  await start($)
+  w.noProcess = true
+  await $.session.end({ reason: 'other', sessionId: SESSION } as never)
+  expect(w.files[MARKER]).toBe('off')
 })

@@ -14,6 +14,11 @@ const BUILT_IN_AGENTS = [
   'statusline-setup',
   'output-style-setup',
 ]
+const POLICY =
+  'claude-proxy runs: to delegate work (anything you would hand to the Agent tool, or a long or big task), ' +
+  'call mcp__proxy-runs__run instead of `claude-proxy run` through Bash. It returns at once and this session ' +
+  'is told when the run finishes, fails or asks something. `claude-proxy status/answer/allow/deny/send` through ' +
+  'Bash still apply when the run rows and the /runs pane are not enough.'
 const ACTIVE = ['queued', 'working', 'waiting']
 const DONE = ['idle', 'failed', 'killed']
 
@@ -57,18 +62,47 @@ function counter(list: ProxyRunsRun[]): string | undefined {
 }
 
 // The one place the mod starts a process; $.process is declared "CLI only".
-async function cli($: Engine, argv: string[], init?: ProcessRunInit): Promise<ProcessRunResult | undefined> {
+async function cli(
+  $: Engine,
+  argv: string[],
+  init?: ProcessRunInit,
+  bin = BIN,
+): Promise<ProcessRunResult | undefined> {
   try {
-    return await $.process.run([BIN, ...argv], init)
+    return await $.process.run([bin, ...argv], init)
   } catch (err) {
     await update($, problem, () => `cannot start ${BIN} from this session (${err}); showing what its files say`)
     return undefined
   }
 }
 
-async function runsDir($: Engine): Promise<string> {
+async function configDir($: Engine): Promise<string> {
   const xdg = await $.env.get('XDG_CONFIG_HOME')
-  return `${xdg || `${await $.env.get('HOME')}/.config`}/claude-proxy/runs`
+  return `${xdg || `${await $.env.get('HOME')}/.config`}/claude-proxy`
+}
+
+const runsDir = async ($: Engine) => `${await configDir($)}/runs`
+
+const validSession = (id: string) => /^[A-Za-z0-9-]{1,64}$/.test(id)
+
+let marked = ''
+
+// quota-router's hook (src/hook.rs) stays quiet in a session whose marker reads "on".
+async function markSession($: Engine): Promise<void> {
+  const id = await $.session.id()
+  if (id === marked || !validSession(id) || (await $.env.get('CLAUDE_PROXY_RUN'))) return
+  await $.fs.write(`${await configDir($)}/sessions/${id}.mod`, 'on')
+  marked = id
+}
+
+// $.fs cannot delete, so the marker is removed with rm, or turned off where no process runs.
+async function unmarkSession($: Engine, id: string): Promise<void> {
+  if (!validSession(id)) return
+  const path = `${await configDir($)}/sessions/${id}.mod`
+  if (!(await $.fs.exists(path))) return
+  const removed = await cli($, ['-f', path], undefined, 'rm')
+  if (removed?.exitCode !== 0) await $.fs.write(path, 'off')
+  if (id === marked) marked = ''
 }
 
 async function metaOf($: Engine, id: string): Promise<ProxyRunsRun | undefined> {
@@ -248,6 +282,7 @@ export const register: Register = on => {
       },
     })
     await $.command.register({ name: 'runs', description: "Show this session's claude-proxy runs" })
+    await markSession($)
     const session = await $.session.id()
     void watch($, session).catch(err => $.ui.log(`proxy-runs: events stopped: ${err}`, { to: 'debug' }))
     return started
@@ -274,19 +309,37 @@ export const register: Register = on => {
     }
   })
 
-  on('agent.spawn', async ($, e, next) => {
+  // Above classic.PreToolUse, so this answer wins over quota-router's shell hook.
+  on('tool.call', { tool: /^(Agent|Task)$/ }, async ($, e, next) => {
+    const description = String((e as { description?: unknown }).description ?? '')
     const exempt =
       (await $.env.get('CLAUDE_PROXY_RUN')) ||
       (await $.env.get('CLAUDE_PROXY_POLICY')) === 'off' ||
-      e.description.trimStart().startsWith('[direct]')
+      description.trimStart().startsWith('[direct]')
     if (exempt) return next(e)
     return {
       deny:
-        `The user's claude-proxy policy sends subagent work to managed runs, so this Agent call was not made. ` +
+        `The user's claude-proxy policy sends subagent work to managed runs, so this ${e.tool} call was not made. ` +
         `Call ${TOOL} with the same prompt, description, subagent_type, model, isolation and cwd instead. ` +
-        `If the user said not to use claude-proxy for this, repeat the Agent call with "[direct]" at the start ` +
+        `If the user said not to use claude-proxy for this, repeat the ${e.tool} call with "[direct]" at the start ` +
         `of its description.`,
     }
+  })
+
+  on('prompt.compose', async ($, e, next) => {
+    const composed = await next(e)
+    if (await $.env.get('CLAUDE_PROXY_RUN')) return composed
+    return { sections: [...composed.sections, { id: 'proxy-runs:policy', text: POLICY, scope: 'session' }] }
+  })
+
+  on('prompt.submit', async ($, e, next) => {
+    await markSession($)
+    return next(e)
+  })
+
+  on('session.end', async ($, e, next) => {
+    await unmarkSession($, e.sessionId)
+    return next(e)
   })
 
   on('ui.render', { component: 'ToolUse', props: { tool: TOOL } }, async ($, e, next) => {
