@@ -8,9 +8,14 @@
 //!   compaction has dropped the waits that were watching them.
 //! - `pre-tool-use` (Agent|Task) turns a subagent call back with the
 //!   equivalent `claude-proxy run`, unless the description starts `[direct]`.
+//!
+//! In a session the proxy-runs mod marks (`sessions/<id>.mod`), the mod reports
+//! runs and turns Agent calls back itself, so `prompt` and `pre-tool-use` stay
+//! quiet there.
 
 use std::fs;
 use std::io::Read;
+use std::path::Path;
 
 use serde_json::Value;
 
@@ -37,10 +42,12 @@ pub fn run(event: &str) -> i32 {
     let Ok(v) = serde_json::from_str::<Value>(&input) else {
         return 0;
     };
+    let sessions = config_dir().join("sessions");
+    let speaks = policy_applies() && !mod_handles(&sessions, &v);
     match event {
         "prompt" => {
             remember_mode(&v);
-            if let (true, Some(session)) = (policy_applies(), v["session_id"].as_str()) {
+            if let (true, Some(session)) = (speaks, v["session_id"].as_str()) {
                 if let Some(news) = news_since_last_prompt(session) {
                     println!("{news}");
                 }
@@ -55,7 +62,7 @@ pub fn run(event: &str) -> i32 {
             }
             0
         }
-        "pre-tool-use" => match redirect(&v, policy_applies()) {
+        "pre-tool-use" => match redirect(&v, speaks) {
             Some(message) => {
                 eprintln!("{message}");
                 2
@@ -190,6 +197,14 @@ fn valid_session_id(s: &str) -> bool {
     !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
+/// Whether the proxy-runs mod marked this hook's session as loaded.
+fn mod_handles(sessions: &Path, v: &Value) -> bool {
+    v["session_id"].as_str().is_some_and(|s| {
+        valid_session_id(s)
+            && fs::read_to_string(sessions.join(format!("{s}.mod"))).is_ok_and(|m| m.trim() == "on")
+    })
+}
+
 /// Not inside a run (runs do not start runs), and not turned off.
 fn policy_applies() -> bool {
     std::env::var_os("CLAUDE_PROXY_RUN").is_none()
@@ -274,6 +289,24 @@ mod tests {
         assert!(redirect(&json!({"tool_name": "Bash", "tool_input": {}}), true).is_none());
         let inside_a_run = json!({"tool_name": "Agent", "tool_input": {"description": "x"}});
         assert!(redirect(&inside_a_run, false).is_none());
+    }
+
+    #[test]
+    fn the_mod_marker_quiets_the_redirect_and_the_news() {
+        let dir = tempfile::tempdir().unwrap();
+        let call = json!({"session_id": "s-1", "tool_name": "Agent",
+                          "tool_input": {"description": "look"}});
+        assert!(!mod_handles(dir.path(), &call));
+        assert!(redirect(&call, !mod_handles(dir.path(), &call)).is_some());
+
+        fs::write(dir.path().join("s-1.mod"), "on").unwrap();
+        assert!(mod_handles(dir.path(), &call));
+        assert!(redirect(&call, !mod_handles(dir.path(), &call)).is_none());
+
+        fs::write(dir.path().join("s-1.mod"), "off").unwrap();
+        assert!(!mod_handles(dir.path(), &call));
+        let escape = json!({"session_id": "../s-1"});
+        assert!(!mod_handles(&dir.path().join("x"), &escape));
     }
 
     #[test]
