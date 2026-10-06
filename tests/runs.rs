@@ -1005,3 +1005,73 @@ fn hooks_tell_a_session_about_its_runs() {
     assert!(!resumed.contains(&done), "{resumed}");
     cp(&env, &["kill", &going]);
 }
+
+/// Make a run look last used `secs` ago.
+fn age(env: &Env, id: &str, secs: i64) {
+    let path = env
+        .home
+        .join(format!(".config/claude-proxy/runs/{id}/meta.json"));
+    let mut meta: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    meta["updated_at"] = (now - secs).into();
+    std::fs::write(&path, serde_json::to_vec(&meta).unwrap()).unwrap();
+}
+
+#[test]
+fn old_runs_leave_the_list_then_go_away() {
+    let env = setup();
+    let exe = Path::new(env!("CARGO_BIN_EXE_claude-proxy"));
+    let stderr = |out: &Output| String::from_utf8_lossy(&out.stderr).to_string();
+    let id = stdout(&cp(&env, &["run", "--account", "claude", "hello"]));
+    cp(&env, &["wait", &id, "--timeout", "30"]);
+    assert!(stdout(&cp(&env, &["runs"])).contains(&id));
+
+    // Finished three hours ago: out of the default list, still in --all.
+    age(&env, &id, 3 * 3600);
+    let listed = stdout(&cp(&env, &["runs"]));
+    assert!(!listed.contains(&id), "{listed}");
+    assert!(listed.contains("1 more"), "{listed}");
+    assert!(stdout(&cp(&env, &["runs", "--all"])).contains(&id));
+
+    // A run in another project is not listed here either.
+    let other = env.home.parent().unwrap().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    let elsewhere = stdout(&cp(
+        &env,
+        &[
+            "run",
+            "--account",
+            "claude",
+            "--cwd",
+            other.to_str().unwrap(),
+            "hi",
+        ],
+    ));
+    cp(&env, &["wait", &elsewhere, "--timeout", "30"]);
+    assert!(!stdout(&cp(&env, &["runs"])).contains(&elsewhere));
+
+    // Unused for a day: removed, unless retention is off.
+    age(&env, &id, 25 * 3600);
+    run_as(&env, exe, &["runs"], &[("CLAUDE_PROXY_KEEP_HOURS", "0")]);
+    assert!(cp(&env, &["status", &id]).status.success(), "kept with 0");
+    cp(&env, &["runs"]);
+    let gone = cp(&env, &["status", &id]);
+    assert!(!gone.status.success());
+    assert!(
+        stderr(&gone).contains("was removed") && stderr(&gone).contains("automatically"),
+        "{}",
+        stderr(&gone)
+    );
+    assert!(
+        stderr(&gone).contains("claude --resume"),
+        "{}",
+        stderr(&gone)
+    );
+
+    // `rm` leaves the same trail.
+    assert!(cp(&env, &["rm", &elsewhere]).status.success());
+    assert!(stderr(&cp(&env, &["watch", &elsewhere])).contains("with `claude-proxy rm`"));
+}

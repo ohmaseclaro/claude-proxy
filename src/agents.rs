@@ -3,7 +3,7 @@
 //! is the presentation on top of it.
 
 use std::io::{Read, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::json;
@@ -30,6 +30,7 @@ pub struct RunOpts {
 
 pub fn run(opts: RunOpts) -> Result<i32, String> {
     let message = read_message(&opts.message)?;
+    runs::prune();
     let pool = runs::parse_pool(&opts.account)?;
     let fork_from = opts.fork.map(fork_source).transpose()?;
     let first = runs::first_account(&pool)?;
@@ -127,8 +128,40 @@ fn fork_source(id: String) -> Result<String, String> {
     Ok(id)
 }
 
-pub fn runs(as_json: bool) -> Result<i32, String> {
-    let all = runs::list();
+/// Runs from this repository that are going or finished within this long are
+/// listed by default.
+const RECENT_SECS: i64 = 2 * 3600;
+
+pub fn runs(as_json: bool, everything: bool) -> Result<i32, String> {
+    runs::prune();
+    let every = runs::list();
+    let total = every.len();
+    let here = project_root();
+    let now = now_secs();
+    let all: Vec<Meta> = if everything {
+        every
+    } else {
+        every
+            .into_iter()
+            .filter(|m| {
+                let live = !matches!(
+                    runs::effective_state(m),
+                    State::Idle | State::Failed | State::Killed
+                );
+                (live || now - m.updated_at < RECENT_SECS)
+                    && here.as_deref().is_none_or(|root| in_project(m, root))
+            })
+            .collect()
+    };
+    let hidden = total - all.len();
+    let footer = || {
+        if hidden > 0 {
+            println!(
+                "\n{hidden} more (finished over {}h ago, or in other projects):  claude-proxy runs --all",
+                RECENT_SECS / 3600
+            );
+        }
+    };
     if as_json {
         let rows: Vec<_> = all.iter().map(status_json).collect();
         println!(
@@ -138,7 +171,12 @@ pub fn runs(as_json: bool) -> Result<i32, String> {
         return Ok(0);
     }
     if all.is_empty() {
-        println!("No runs yet. Start one with:  claude-proxy run \"<task>\"");
+        if hidden > 0 {
+            println!("Nothing going or recently finished here.");
+            footer();
+        } else {
+            println!("No runs yet. Start one with:  claude-proxy run \"<task>\"");
+        }
         return Ok(0);
     }
     let now = now_secs();
@@ -174,7 +212,36 @@ pub fn runs(as_json: bool) -> Result<i32, String> {
             truncate(&what, 70),
         );
     }
+    footer();
     Ok(0)
+}
+
+/// The repository the current directory belongs to (its main checkout, for a
+/// worktree), or the directory itself outside git.
+fn project_root() -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?.canonicalize().ok()?;
+    let common = std::process::Command::new("git")
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .current_dir(&cwd)
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()));
+    match common {
+        Some(git_dir) if git_dir.ends_with(".git") => git_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .and_then(|p| p.canonicalize().ok()),
+        _ => Some(cwd),
+    }
+}
+
+fn in_project(m: &Meta, root: &Path) -> bool {
+    Path::new(&m.cwd).starts_with(root)
+        || m.worktree
+            .as_ref()
+            .is_some_and(|w| Path::new(&w.repo).starts_with(root))
 }
 
 pub fn status(id: &str, as_json: bool) -> Result<i32, String> {

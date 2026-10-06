@@ -146,8 +146,10 @@ pub fn load(id: &str) -> Result<Meta, String> {
     if id.is_empty() || id.contains(['/', '\\', '.']) {
         return Err(format!("no run {id:?}"));
     }
-    let bytes = fs::read(run_dir(id).join("meta.json"))
-        .map_err(|_| format!("no run {id:?}. See:  claude-proxy runs"))?;
+    let bytes = fs::read(run_dir(id).join("meta.json")).map_err(|_| match removed_note(id) {
+        Some(note) => format!("run {id} {note}"),
+        None => format!("no run {id:?}. See:  claude-proxy runs"),
+    })?;
     serde_json::from_slice(&bytes).map_err(|e| format!("run {id:?} is unreadable: {e}"))
 }
 
@@ -641,7 +643,23 @@ pub(crate) fn observe(meta: &mut Meta, v: &Value, signals: &mut Signals) -> bool
             if let Some(error) = text("error") {
                 signals.api_error = Some(error);
             }
-            false
+            // What it is doing right now; a task summary can be long stale
+            // while a tool runs.
+            let tool = v
+                .pointer("/message/content")
+                .and_then(Value::as_array)
+                .and_then(|blocks| blocks.iter().rev().find(|b| b["type"] == "tool_use"));
+            let Some(tool) = tool else {
+                return false;
+            };
+            let name = tool["name"].as_str().unwrap_or("tool");
+            let doing = format!(
+                "{name} {}",
+                crate::render::tool_summary(name, &tool["input"])
+            );
+            let changed = meta.activity.as_deref() != Some(doing.as_str());
+            meta.activity = Some(doing);
+            changed
         }
         Some("result") => {
             meta.last_result = text("result");
@@ -929,7 +947,93 @@ pub fn remove(id: &str) -> Result<Vec<String>, String> {
         }
     }
     fs::remove_dir_all(&dir).map_err(|e| format!("could not remove run {id}: {e}"))?;
+    record_removed(&meta, "with `claude-proxy rm`");
     Ok(kept)
+}
+
+/// Delete finished runs untouched for `CLAUDE_PROXY_KEEP_HOURS` (default 24;
+/// 0 keeps everything). Never one that is going, has messages queued, kept a
+/// worktree, or started a run that is still going. Claude's own transcript of
+/// the session stays, so `claude --resume` still works.
+pub fn prune() {
+    let hours: i64 = std::env::var("CLAUDE_PROXY_KEEP_HOURS")
+        .ok()
+        .and_then(|h| h.trim().parse().ok())
+        .unwrap_or(24);
+    if hours <= 0 {
+        return;
+    }
+    let cutoff = now_secs() - hours * 3600;
+    let all = list();
+    let finished = |m: &Meta| {
+        matches!(
+            effective_state(m),
+            State::Idle | State::Failed | State::Killed
+        )
+    };
+    let live_parents: std::collections::HashSet<&str> = all
+        .iter()
+        .filter(|m| !finished(m))
+        .filter_map(|m| m.parent.as_deref())
+        .collect();
+    for m in &all {
+        let dir = run_dir(&m.id);
+        let keep = m.updated_at >= cutoff
+            || m.worktree.is_some()
+            || live_parents.contains(m.id.as_str())
+            || !finished(m)
+            || alive(&dir)
+            || queued(&dir) > 0;
+        if !keep && fs::remove_dir_all(&dir).is_ok() {
+            record_removed(
+                m,
+                &format!("automatically, {hours}h after it was last used"),
+            );
+        }
+    }
+}
+
+/// Remember a removed run, so a later lookup can say what became of it.
+fn record_removed(meta: &Meta, how: &str) {
+    let path = runs_dir().join(".removed");
+    let line = format!(
+        "{}\t{}\t{how}\t{}\t{}\t{}",
+        meta.id,
+        now_secs(),
+        meta.name.as_deref().unwrap_or(""),
+        meta.session_id,
+        meta.cwd
+    );
+    let mut lines: Vec<String> = fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    lines.push(line);
+    let skip = lines.len().saturating_sub(500);
+    let _ = fs::write(&path, lines[skip..].join("\n") + "\n");
+}
+
+fn removed_note(id: &str) -> Option<String> {
+    let text = fs::read_to_string(runs_dir().join(".removed")).ok()?;
+    let line = text
+        .lines()
+        .rev()
+        .find(|l| l.split('\t').next() == Some(id))?;
+    let f: Vec<&str> = line.split('\t').collect();
+    let [_, at, how, name, session, cwd] = f[..] else {
+        return None;
+    };
+    let ago = quota::short_duration(now_secs() - at.parse::<i64>().unwrap_or(0));
+    let name = if name.is_empty() {
+        String::new()
+    } else {
+        format!(" ({name})")
+    };
+    Some(format!(
+        "{name} was removed {ago} ago, {how}. Its Claude session is still there:  \
+         cd {cwd} && claude --resume {session}"
+    ))
 }
 
 /// A worktree of the repository containing `cwd`, on a new branch from HEAD.
@@ -1152,6 +1256,13 @@ mod tests {
             &mut sig,
         );
         assert_eq!(sig.api_error.as_deref(), Some("rate_limit"));
+        observe(
+            &mut meta,
+            &json!({"type":"assistant","message":{"content":[
+                {"type":"tool_use","name":"Bash","input":{"command":"waitpid.sh gate 540"}}]}}),
+            &mut sig,
+        );
+        assert_eq!(meta.activity.as_deref(), Some("Bash waitpid.sh gate 540"));
         observe(
             &mut meta,
             &json!({"type":"result","subtype":"error_max_turns","is_error":true,

@@ -138,7 +138,7 @@ $ claude-proxy wait $id                  # blocks, prints the final answer
 | `claude-proxy answer <id> "<answer>"…` | answer the question it asked, one answer per question |
 | `claude-proxy attach <id>` | open the session interactively in your terminal |
 | `claude-proxy kill <id>` | stop the current turn (the conversation is kept; `send` resumes it); on an idle run, free its Claude process |
-| `claude-proxy runs` / `rm <id>` | every run, as a tree of who started what / delete one (and its worktree, if clean) |
+| `claude-proxy runs` / `rm <id>` | this repository's runs that are going or finished in the last 2 hours, as a tree of who started what (`--all` for every run) / delete one (and its worktree, if clean) |
 | `claude-proxy events [<id>…] [--mine]` | a line each time a run finishes, fails, asks, or moves account — made for a Monitor tool |
 
 Each run pins one Claude session, so the conversation carries over — across
@@ -192,6 +192,12 @@ moves to the next best account by quota, `--account a,b` tries the list in
 order, and a single name pins the run. The transcript marks each move with `⇄`
 and `status` shows where it moved from. Failures that are not the account's
 fault (an overloaded API, a server error) are not retried elsewhere.
+
+**Old runs clean up after themselves.** A finished run unused for 24 hours is
+deleted (`CLAUDE_PROXY_KEEP_HOURS` changes that; `0` keeps everything). Runs
+that are going, have messages queued, kept a worktree, or started a run that is
+still going are never touched. Looking one up afterwards says when and how it
+went, and gives the command to resume its Claude session, which stays.
 
 **Waiting costs nothing.** In your own session, a background
 `claude-proxy wait` (or a Monitor on `claude-proxy events --mine`) notifies the

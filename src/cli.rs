@@ -104,6 +104,9 @@ enum Command {
     Runs {
         #[arg(long)]
         json: bool,
+        /// Every run, not just this repository's going or recent ones.
+        #[arg(long)]
+        all: bool,
     },
     /// Show a run's state, current activity, and last result.
     Status {
@@ -262,7 +265,7 @@ fn dispatch(command: Command) -> Result<i32, String> {
             agent,
             claude_args,
         }),
-        Command::Runs { json } => crate::agents::runs(json),
+        Command::Runs { json, all } => crate::agents::runs(json, all),
         Command::Status { id, json } => crate::agents::status(&id, json),
         Command::Read {
             id,

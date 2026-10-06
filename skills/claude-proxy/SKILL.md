@@ -163,7 +163,7 @@ would have been asked about. Pass `-- --permission-mode <mode>` or
 | give it more instructions | `claude-proxy send <id> "…"` (`--account` moves it) |
 | stop it | `claude-proxy kill <id>` — the conversation is kept; `send` resumes it |
 | hand it to the user | `claude-proxy attach <id>` opens it interactively in their terminal |
-| see every run | `claude-proxy runs` |
+| see the runs here | `claude-proxy runs` — this repository's runs that are going or finished in the last 2 hours (`--all` for everything) |
 | clean up | `claude-proxy rm <id>` — also removes its worktree and branch if nothing would be lost |
 
 - **States:** `queued` → `working` (`waiting` while it needs an answer) →
@@ -171,7 +171,14 @@ would have been asked about. Pass `-- --permission-mode <mode>` or
   Claude left background tasks running stays `working` until they end and
   Claude has dealt with them.
 - **Runs in runs:** `runs` shows which run started which; `status` shows who a
-  run reports to and what it started.
+  run reports to and what it started. When you hand work to an orchestrator
+  run that will supervise other runs (lanes, executors), start only the
+  orchestrator and let *it* start them: then they report to it, nest under it,
+  and it never has to poll. Starting the lanes yourself and the orchestrator
+  after leaves them unrelated.
+- **Old runs go away.** A finished run unused for 24 hours is deleted
+  (`CLAUDE_PROXY_KEEP_HOURS`; 0 keeps them); asking for it afterwards says so,
+  and its Claude session can still be resumed.
 - **Steer it while it works.** A `send` during a turn reaches Claude at once and
   it folds the message into the work in progress, as when you type into a
   running Claude session. A `send` to an `idle`, `failed`, or `killed` run
