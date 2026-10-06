@@ -197,6 +197,15 @@ enum Command {
     },
     /// Open a run's session interactively in this terminal.
     Attach { id: String },
+    /// Print a line whenever a run changes state (finishes, fails, asks,
+    /// moves account), until interrupted. Made for a Monitor tool.
+    Events {
+        /// Only these runs.
+        ids: Vec<String>,
+        /// Only the runs this Claude session started, and what they started.
+        #[arg(long)]
+        mine: bool,
+    },
     /// Stop a run's current turn. Queued messages are kept; `send` resumes.
     Kill { id: String },
     /// Delete a run that is not working, and its clean worktree.
@@ -298,6 +307,7 @@ fn dispatch(command: Command) -> Result<i32, String> {
         ),
         Command::Answer { id, answers } => crate::agents::reply(&id, Reply::Answer(answers)),
         Command::Attach { id } => crate::agents::attach(&id),
+        Command::Events { ids, mine } => crate::agents::events(&ids, mine),
         Command::Kill { id } => crate::agents::kill(&id),
         Command::Rm { id } => crate::agents::rm(&id),
         Command::Drain { id } => crate::drainer::drain(&id).map(|()| 0),

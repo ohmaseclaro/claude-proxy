@@ -48,6 +48,13 @@ pub fn run(opts: RunOpts) -> Result<i32, String> {
         eprintln!("claude-proxy: inheriting your session's permission mode ({mode})");
         claude_args.extend(["--permission-mode".to_string(), mode]);
     }
+    // Started from inside a run: that run is the parent, and hears back.
+    let parent = std::env::var("CLAUDE_PROXY_RUN")
+        .ok()
+        .filter(|id| runs::load(id).is_ok());
+    let session = std::env::var("CLAUDE_CODE_SESSION_ID")
+        .ok()
+        .filter(|s| !s.is_empty());
     let meta = runs::start(NewRun {
         account: first,
         pool,
@@ -57,11 +64,19 @@ pub fn run(opts: RunOpts) -> Result<i32, String> {
         message,
         fork_from,
         worktree: opts.worktree,
+        parent,
+        session,
     })?;
     eprintln!(
         "claude-proxy: run {} on {} — follow it with:  claude-proxy watch {}",
         meta.id, meta.account, meta.id
     );
+    if let Some(parent) = &meta.parent {
+        eprintln!(
+            "claude-proxy: it reports to run {parent}: when it finishes, fails, or asks \
+             something, that run gets a message — end your turn instead of waiting"
+        );
+    }
     if let Some(w) = &meta.worktree {
         eprintln!("claude-proxy: working in {} (branch {})", w.path, w.branch);
     }
@@ -134,20 +149,25 @@ pub fn runs(as_json: bool) -> Result<i32, String> {
         .unwrap_or(7)
         .max(7);
     println!(
-        "{:<6}  {:<7}  {:<account_w$}  {:>5}  {:>9}  WHAT",
+        "{:<10}  {:<7}  {:<account_w$}  {:>5}  {:>9}  WHAT",
         "ID", "STATE", "ACCOUNT", "TURNS", "ACTIVE"
     );
-    for m in &all {
+    for (depth, m) in runs::tree(all) {
         let what = m
             .activity
             .clone()
             .or_else(|| m.summary.clone())
             .or_else(|| m.name.clone())
             .unwrap_or_default();
+        let id = if depth == 0 {
+            m.id.clone()
+        } else {
+            format!("{}└ {}", "  ".repeat(depth - 1), m.id)
+        };
         println!(
-            "{:<6}  {:<7}  {:<account_w$}  {:>5}  {:>9}  {}",
-            m.id,
-            runs::effective_state(m).as_str(),
+            "{:<10}  {:<7}  {:<account_w$}  {:>5}  {:>9}  {}",
+            id,
+            runs::effective_state(&m).as_str(),
             m.account,
             m.turns,
             format!("{} ago", short_duration(now - m.updated_at)),
@@ -202,6 +222,26 @@ pub fn status(id: &str, as_json: bool) -> Result<i32, String> {
     if let Some(a) = &m.activity {
         row("doing", a);
     }
+    if m.background > 0 {
+        row(
+            "waiting",
+            &format!(
+                "on {} background task(s); Claude resumes when they end",
+                m.background
+            ),
+        );
+    }
+    if let Some(parent) = &m.parent {
+        row("reports", &format!("to run {parent}"));
+    }
+    let children: Vec<String> = runs::list()
+        .into_iter()
+        .filter(|c| c.parent.as_deref() == Some(id))
+        .map(|c| format!("{} {}", c.id, runs::effective_state(&c).as_str()))
+        .collect();
+    if !children.is_empty() {
+        row("started", &children.join(", "));
+    }
     if let Some(s) = &m.summary {
         row("last", s);
     }
@@ -253,6 +293,9 @@ fn status_json(m: &Meta) -> serde_json::Value {
         "cwd": m.cwd,
         "worktree": m.worktree,
         "fork_from": m.fork_from,
+        "parent": m.parent,
+        "session": m.session,
+        "background": m.background,
         "asks": asks::pending(&dir).iter().map(|a| json!({"tool": a.tool, "input": a.input})).collect::<Vec<_>>(),
         "session_id": m.session_id,
         "created_at": m.created_at,
@@ -411,6 +454,85 @@ pub fn reply(id: &str, reply: Reply) -> Result<i32, String> {
 
 pub fn attach(id: &str) -> Result<i32, String> {
     runs::attach(id)
+}
+
+/// One line per change in a run's state, until interrupted — made for a
+/// Monitor tool or `tail`-style watching. `mine` follows the runs the calling
+/// Claude session started (and what they started).
+pub fn events(ids: &[String], mine: bool) -> Result<i32, String> {
+    let session = if mine {
+        Some(
+            std::env::var("CLAUDE_CODE_SESSION_ID")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .ok_or("--mine needs CLAUDE_CODE_SESSION_ID; run it from inside Claude Code")?,
+        )
+    } else {
+        None
+    };
+    let mut seen: std::collections::HashMap<String, String> = Default::default();
+    let mut first = true;
+    loop {
+        let all = runs::list();
+        let wanted = session.as_deref().map(|s| runs::of_session(&all, s));
+        for m in &all {
+            if !ids.is_empty() && !ids.contains(&m.id) {
+                continue;
+            }
+            if wanted.as_ref().is_some_and(|w| !w.contains(&m.id)) {
+                continue;
+            }
+            let line = event_line(m);
+            if seen.get(&m.id) == Some(&line) {
+                continue;
+            }
+            let state = runs::effective_state(m);
+            // Start from what is live; finished runs from before are history.
+            if !(first && matches!(state, State::Idle | State::Failed | State::Killed)) {
+                println!("{line}");
+            }
+            seen.insert(m.id.clone(), line);
+        }
+        first = false;
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn event_line(m: &Meta) -> String {
+    let state = runs::effective_state(m);
+    let name = m
+        .name
+        .as_deref()
+        .map(|n| format!(" {n}"))
+        .unwrap_or_default();
+    let detail = match state {
+        State::Waiting => asks::pending(&runs::run_dir(&m.id))
+            .first()
+            .map(|a| {
+                ask_lines(&m.id, &a.tool, &a.input, false)
+                    .first()
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default(),
+        State::Idle | State::Failed => runs::last_result(&m.id)
+            .map(|(text, _)| truncate(text.lines().next().unwrap_or(""), 120))
+            .unwrap_or_default(),
+        _ => m.activity.clone().unwrap_or_default(),
+    };
+    let moved = m
+        .moved
+        .as_deref()
+        .map(|x| format!(" (moved {x})"))
+        .unwrap_or_default();
+    format!(
+        "{}{name} · {} · turn {} on {}{moved} — {}",
+        m.id,
+        state.as_str(),
+        m.turns,
+        m.account,
+        truncate(&detail, 140)
+    )
 }
 
 pub fn kill(id: &str) -> Result<i32, String> {

@@ -92,11 +92,24 @@ How the Agent tool maps onto it:
 
 ## Waiting and answering
 
-Start `claude-proxy wait <id>` as a **background command** and keep working; you
-are notified when it exits. If nothing will wake you later — you run headless
-(`claude -p`) and your answer ends the session — wait in the foreground instead
-(`--timeout` up to your tool's limit, then wait again). Never poll `status` in a
-loop. Its exit code says what happened:
+Never spend turns polling. How to wait depends on where you are:
+
+- **In your own session:** start `claude-proxy wait <id>` as a **background
+  command** and keep working; you are notified when it exits. Watching several
+  runs? One Monitor on `claude-proxy events --mine` (if you have the Monitor
+  tool) prints a line each time one of your runs finishes, fails, asks, or
+  moves account. After a resume or a compaction, start your waits again —
+  the session-start note lists your runs still going.
+- **Inside a run** (`$CLAUDE_PROXY_RUN` is set): a run you start reports back
+  to you — when it finishes, fails, or asks something, you get a message. So
+  start it, then end your turn; do not wait on it. For any other long command
+  (a test suite, a deploy gate, `gh run watch`, a run someone else started),
+  start it **in the background** and end your turn: claude-proxy keeps you
+  alive while it runs and Claude wakes you when it ends.
+- **In a plain `claude -p`** (no run, nothing to wake you): wait in the
+  foreground (`--timeout` up to your tool's limit, then wait again).
+
+`wait`'s exit code says what happened:
 
 | Exit | Meaning | Do |
 |---|---|---|
@@ -154,7 +167,11 @@ would have been asked about. Pass `-- --permission-mode <mode>` or
 | clean up | `claude-proxy rm <id>` — also removes its worktree and branch if nothing would be lost |
 
 - **States:** `queued` → `working` (`waiting` while it needs an answer) →
-  `idle` (done; it takes more messages), or `failed`, or `killed`.
+  `idle` (done; it takes more messages), or `failed`, or `killed`. A run whose
+  Claude left background tasks running stays `working` until they end and
+  Claude has dealt with them.
+- **Runs in runs:** `runs` shows which run started which; `status` shows who a
+  run reports to and what it started.
 - **Steer it while it works.** A `send` during a turn reaches Claude at once and
   it folds the message into the work in progress, as when you type into a
   running Claude session. A `send` to an `idle`, `failed`, or `killed` run

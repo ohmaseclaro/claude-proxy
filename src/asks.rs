@@ -320,6 +320,10 @@ fn decide(dir: &Path, id: &str, args: &Value) -> Value {
         dir,
         json!({"event": "ask", "run": id, "tool": tool, "input": input}),
     );
+    if let Ok(meta) = runs::load(id) {
+        let lines = crate::render::ask_lines(id, &tool, &input, true).join("\n");
+        runs::notify_parent(&meta, &format!("is waiting for an answer:\n\n{lines}"));
+    }
 
     let parent = parent_id();
     let answer_path = asks.join(format!("{key}.answer"));

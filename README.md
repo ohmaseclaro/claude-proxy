@@ -138,7 +138,8 @@ $ claude-proxy wait $id                  # blocks, prints the final answer
 | `claude-proxy answer <id> "<answer>"…` | answer the question it asked, one answer per question |
 | `claude-proxy attach <id>` | open the session interactively in your terminal |
 | `claude-proxy kill <id>` | stop the current turn (the conversation is kept; `send` resumes it); on an idle run, free its Claude process |
-| `claude-proxy runs` / `rm <id>` | every run / delete one (and its worktree, if clean) |
+| `claude-proxy runs` / `rm <id>` | every run, as a tree of who started what / delete one (and its worktree, if clean) |
+| `claude-proxy events [<id>…] [--mine]` | a line each time a run finishes, fails, asks, or moves account — made for a Monitor tool |
 
 Each run pins one Claude session, so the conversation carries over — across
 Claude processes and onto other accounts, since transcripts are shared. A
@@ -191,6 +192,16 @@ moves to the next best account by quota, `--account a,b` tries the list in
 order, and a single name pins the run. The transcript marks each move with `⇄`
 and `status` shows where it moved from. Failures that are not the account's
 fault (an overloaded API, a server error) are not retried elsewhere.
+
+**Waiting costs nothing.** In your own session, a background
+`claude-proxy wait` (or a Monitor on `claude-proxy events --mine`) notifies the
+agent when something happens. Inside a run, two things wake it instead of
+polling: a run it started sends it a message when that run finishes, fails, or
+asks something; and a long command it started in the background (a test suite,
+a deploy gate) wakes Claude when it ends — claude-proxy keeps the run's Claude
+alive for it and treats the run as working until it is done. The plugin's
+hooks also tell your session which of its runs finished or are asking, at each
+prompt, and which are still going after a resume or compaction.
 
 Live usage that Claude reports during a run updates that account's quota for
 `auto`.

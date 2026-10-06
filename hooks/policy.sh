@@ -1,7 +1,7 @@
 #!/bin/sh
-# Prints the delegation policy into each session's context. Silent inside a
-# managed run (no runs within runs), when claude-proxy is not installed, or
-# when the user opted out with CLAUDE_PROXY_POLICY=off.
+# Prints the delegation policy into each session's context, then the session's
+# runs still going (after a resume or compaction). Silent inside a managed run,
+# when claude-proxy is not installed, or with CLAUDE_PROXY_POLICY=off.
 [ -n "$CLAUDE_PROXY_RUN" ] && exit 0
 [ "$CLAUDE_PROXY_POLICY" = "off" ] && exit 0
 command -v claude-proxy >/dev/null 2>&1 || exit 0
@@ -11,3 +11,5 @@ claude-proxy is installed. Standing instructions from the user, until they say o
 - Whenever claude-proxy is in use, say so plainly: what you started, on which account, the run id, and a ready-to-run `claude-proxy watch <id>` the user can paste.
 - If the user tells you not to use claude-proxy for something, use the Agent tool with "[direct]" at the start of the call's description.
 POLICY
+claude-proxy __hook supported >/dev/null 2>&1 && exec claude-proxy __hook session-start
+exit 0

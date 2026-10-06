@@ -19,7 +19,9 @@ use serde_json::Value;
 /// `nap` takes 2 seconds (a turn to message while it works); `limited` fails
 /// with a usage limit on the account `acct-a`; `ask` puts a permission prompt
 /// to the run's `__permit` server the way Claude does (`ask question`: a
-/// question, `ask plan`: plan approval) and echoes the decision.
+/// question, `ask plan`: plan approval) and echoes the decision; `bgtask`
+/// leaves a background task that ends 2 seconds later, when Claude wakes up
+/// on its own and answers `bg done`.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
 echo "run=${CLAUDE_PROXY_RUN:-} $*" >> "$FAKE_ARGS_LOG"
 sid=""; mode=""; fork=""; cfg=""
@@ -41,10 +43,17 @@ while IFS= read -r line; do
   mkdir -p "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/fake"
   echo "$prompt" >> "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/fake/$sid.jsonl"
   echo '{"type":"system","subtype":"init","session_id":"'"$sid"'"}'
-  echo '{"type":"user","isReplay":true,"message":{"role":"user","content":"'"$prompt"'"}}'
+  printf '%s\n' '{"type":"user","isReplay":true,"message":{"role":"user","content":"'"$prompt"'"}}'
   case "$prompt" in
     sleep*) echo '{"type":"system","subtype":"task_summary","detail":"sleeping"}'; sleep 30 ;;
     nap*) echo '{"type":"system","subtype":"task_summary","detail":"napping"}'; sleep 2 ;;
+    bgtask*)
+      echo '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"t1"}]}'
+      ( sleep 2
+        echo '{"type":"system","subtype":"background_tasks_changed","tasks":[]}'
+        echo '{"type":"system","subtype":"task_notification","task_id":"t1","status":"completed"}'
+        echo '{"type":"assistant","message":{"content":[{"type":"text","text":"bg done"}]}}'
+        echo '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":"bg done"}' ) & ;;
     limited*)
       if [ "$acct" = "acct-a" ]; then
         echo '{"type":"assistant","message":{"content":[{"type":"text","text":"usage limit reached"}]},"error":"rate_limit"}'
@@ -68,9 +77,9 @@ while IFS= read -r line; do
   esac
   echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"echo hi"}}]}}'
   echo '{"type":"user","message":{"content":[{"type":"tool_result","content":"hi","is_error":false}]}}'
-  echo '{"type":"assistant","message":{"content":[{"type":"text","text":"echo: '"$prompt"'"}]}}'
-  echo '{"type":"system","subtype":"post_turn_summary","status_detail":"echoed '"$prompt"'","needs_action":""}'
-  echo '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"duration_ms":5,"total_cost_usd":0.01,"result":"echo: '"$prompt"'"}'
+  printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"echo: '"$prompt"'"}]}}'
+  printf '%s\n' '{"type":"system","subtype":"post_turn_summary","status_detail":"echoed '"$prompt"'","needs_action":""}'
+  printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"duration_ms":5,"total_cost_usd":0.01,"result":"echo: '"$prompt"'"}'
 done
 "#;
 
@@ -829,4 +838,170 @@ fn the_hook_turns_subagent_calls_into_runs() {
             .code(),
         Some(0)
     );
+}
+
+fn hook(env: &Env, event: &str, input: &str) -> Output {
+    use std::io::Write;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_claude-proxy"))
+        .args(["__hook", event])
+        .env_clear()
+        .env("HOME", &env.home)
+        .env("XDG_CONFIG_HOME", env.home.join(".config"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn a_child_run_wakes_the_run_that_started_it() {
+    let env = setup();
+    let exe = Path::new(env!("CARGO_BIN_EXE_claude-proxy"));
+    let parent = stdout(&cp(
+        &env,
+        &["run", "--account", "claude", "--name", "orch", "plan it"],
+    ));
+    cp(&env, &["wait", &parent, "--timeout", "30"]);
+
+    let inside = [("CLAUDE_PROXY_RUN", parent.as_str())];
+    let child = stdout(&run_as(
+        &env,
+        exe,
+        &["run", "--account", "claude", "--name", "lane", "build it"],
+        &inside,
+    ));
+    assert_eq!(status(&env, &child)["parent"], parent.as_str());
+    cp(&env, &["wait", &child, "--timeout", "30"]);
+
+    // The parent got a message and took it as a new turn.
+    let out = stdout(&cp(&env, &["wait", &parent, "--timeout", "30"]));
+    assert!(
+        out.starts_with(&format!(
+            "echo: (claude-proxy) Run {child} (lane) finished:"
+        )),
+        "{out}"
+    );
+    assert!(out.contains("echo: build it"), "{out}");
+
+    let tree = stdout(&cp(&env, &["runs"]));
+    let rows: Vec<&str> = tree.lines().collect();
+    let p = rows.iter().position(|r| r.starts_with(&parent)).unwrap();
+    assert!(rows[p + 1].starts_with(&format!("└ {child}")), "{tree}");
+
+    // A question it cannot settle reaches the parent too.
+    let asking = stdout(&run_as(
+        &env,
+        exe,
+        &["run", "--account", "claude", "ask first"],
+        &inside,
+    ));
+    assert_eq!(
+        cp(&env, &["wait", &asking, "--timeout", "30"])
+            .status
+            .code(),
+        Some(2)
+    );
+    let out = stdout(&cp(&env, &["wait", &parent, "--timeout", "30"]));
+    assert!(
+        out.contains(&format!("Run {asking} is waiting for an answer")),
+        "{out}"
+    );
+    assert!(cp(&env, &["deny", &asking, "no"]).status.success());
+    cp(&env, &["wait", &asking, "--timeout", "30"]);
+}
+
+#[test]
+fn a_run_waits_for_its_background_tasks() {
+    let env = setup();
+    let id = stdout(&cp(&env, &["run", "--account", "claude", "bgtask"]));
+    // Its turn ends first; the run is not done until Claude has woken up on
+    // the finished task, even with an idle timeout of zero.
+    let out = cp(&env, &["wait", &id, "--timeout", "30"]);
+    if stdout(&out) != "bg done" {
+        eprintln!("DEBUG status: {}", status(&env, &id));
+        eprintln!(
+            "DEBUG events:\n{}",
+            stdout(&cp(&env, &["read", &id, "--json"]))
+        );
+    }
+    assert_eq!(stdout(&out), "bg done");
+    let s = status(&env, &id);
+    assert_eq!(s["state"], "idle");
+    assert_eq!(s["background"], 0);
+    assert_eq!(s["turns"], 2);
+    assert!(stdout(&cp(&env, &["read", &id])).contains("· woken by a background task"));
+}
+
+#[test]
+fn events_print_each_change() {
+    let env = setup();
+    let id = stdout(&cp(
+        &env,
+        &["run", "--account", "claude", "--name", "ev", "nap a bit"],
+    ));
+    let mut events = Command::new(env!("CARGO_BIN_EXE_claude-proxy"))
+        .args(["events", &id])
+        .env_clear()
+        .env("HOME", &env.home)
+        .env("XDG_CONFIG_HOME", env.home.join(".config"))
+        .env("PATH", &env.path)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    cp(&env, &["wait", &id, "--timeout", "30"]);
+    std::thread::sleep(Duration::from_millis(1500));
+    events.kill().unwrap();
+    let out = String::from_utf8_lossy(&events.wait_with_output().unwrap().stdout).to_string();
+    assert!(out.contains(&format!("{id} ev · working")), "{out}");
+    assert!(
+        out.contains(&format!(
+            "{id} ev · idle · turn 1 on claude — echo: nap a bit"
+        )),
+        "{out}"
+    );
+}
+
+#[test]
+fn hooks_tell_a_session_about_its_runs() {
+    let env = setup();
+    let exe = Path::new(env!("CARGO_BIN_EXE_claude-proxy"));
+    let session = "22222222-2222-4333-8444-555555555555";
+    let mine = [("CLAUDE_CODE_SESSION_ID", session)];
+    let prompt = format!(r#"{{"session_id":"{session}","permission_mode":"default"}}"#);
+
+    let done = stdout(&run_as(
+        &env,
+        exe,
+        &["run", "--account", "claude", "hello"],
+        &mine,
+    ));
+    cp(&env, &["wait", &done, "--timeout", "30"]);
+    let news = stdout(&hook(&env, "prompt", &prompt));
+    assert!(news.contains(&format!("- {done} is idle")), "{news}");
+    assert!(
+        stdout(&hook(&env, "prompt", &prompt)).is_empty(),
+        "told once"
+    );
+
+    let going = stdout(&run_as(
+        &env,
+        exe,
+        &["run", "--account", "claude", "sleep please"],
+        &mine,
+    ));
+    wait_until("it works", || status(&env, &going)["state"] == "working");
+    let resumed = stdout(&hook(&env, "session-start", &prompt));
+    assert!(
+        resumed.contains(&format!("- {going} is working")),
+        "{resumed}"
+    );
+    assert!(!resumed.contains(&done), "{resumed}");
+    cp(&env, &["kill", &going]);
 }

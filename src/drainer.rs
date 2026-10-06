@@ -28,8 +28,8 @@ use crate::asks;
 use crate::quota::{self, now_secs};
 use crate::runs::{
     classify, enqueue_first, first_account, inbox_names, load, lock_file, marker, next_account,
-    observe, parse_pool, queued, request_drainer, run_dir, save, session_len, signal_group,
-    take_inbox, turn_command, Meta, Reason, Signals, State,
+    notify_parent, observe, parse_pool, queued, request_drainer, run_dir, save, session_len,
+    signal_group, take_inbox, turn_command, Meta, Reason, Signals, State,
 };
 
 const POLL: Duration = Duration::from_millis(300);
@@ -68,6 +68,8 @@ pub fn drain(id: &str) -> Result<(), String> {
         session_at_start: 0,
         idle_since: Instant::now(),
         idle: idle_timeout(),
+        running: 0,
+        wake_due: None,
     };
     loop {
         match d.step() {
@@ -187,6 +189,22 @@ struct Drainer {
     session_at_start: u64,
     idle_since: Instant,
     idle: Duration,
+    /// Background tasks Claude has running.
+    running: u32,
+    /// Since when Claude is due to wake up for a background task that ended
+    /// while it was idle.
+    wake_due: Option<Instant>,
+}
+
+/// How long to keep waiting for Claude to wake up on a finished task.
+const WAKE_GRACE: Duration = Duration::from_secs(120);
+
+fn excerpt(text: &str, max: usize) -> String {
+    let text = text.trim();
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    format!("{}…", text.chars().take(max).collect::<String>())
 }
 
 impl Drainer {
@@ -203,7 +221,13 @@ impl Drainer {
                 return flow;
             }
         }
-        if !self.busy && (self.proc.is_none() || self.idle_since.elapsed() >= self.idle) {
+        if self.wake_due.is_some_and(|t| t.elapsed() > WAKE_GRACE) {
+            self.wake_due = None;
+            self.sync_background();
+        }
+        // Kept while Claude has background tasks: it wakes when they end.
+        let idle_out = self.idle_since.elapsed() >= self.idle && self.meta.background == 0;
+        if !self.busy && (self.proc.is_none() || idle_out) {
             return Flow::Idle;
         }
         let Some(proc) = self.proc.as_mut() else {
@@ -279,7 +303,19 @@ impl Drainer {
         }
     }
 
+    /// Background work the run is still waiting on: tasks running, plus a
+    /// wake-up Claude owes for one that ended.
+    fn sync_background(&mut self) {
+        let background = self.running + u32::from(self.wake_due.is_some());
+        if background != self.meta.background {
+            self.meta.background = background;
+            save(&self.dir, &mut self.meta);
+        }
+    }
+
     fn start_turn(&mut self) {
+        self.wake_due = None;
+        self.meta.background = self.running;
         self.busy = true;
         self.signals = Signals::default();
         self.tried = vec![self.meta.account.clone()];
@@ -331,6 +367,23 @@ impl Drainer {
             self.unechoed.pop_front();
             return Flow::Continue;
         }
+        if v["subtype"] == "background_tasks_changed" {
+            let running = v["tasks"].as_array().map_or(0, |t| t.len() as u32);
+            if running < self.running && !self.busy {
+                // One ended while Claude was idle: it is about to wake up.
+                self.wake_due = Some(Instant::now());
+            }
+            self.running = running;
+            self.sync_background();
+        }
+        if !self.busy && v["type"] == "assistant" {
+            // A background task ended and Claude took it up on its own.
+            marker(
+                &self.dir,
+                json!({"event": "note", "text": "woken by a background task"}),
+            );
+            self.start_turn();
+        }
         if observe(&mut self.meta, &v, &mut self.signals) {
             save(&self.dir, &mut self.meta);
         }
@@ -346,6 +399,19 @@ impl Drainer {
         }
         if self.unechoed.is_empty() {
             self.busy = false;
+            if self.meta.background == 0 {
+                // Before the run reads as done, so whoever waits on the
+                // parent already sees the message queued.
+                let result = self.meta.last_result.clone().unwrap_or_default();
+                notify_parent(
+                    &self.meta,
+                    &format!(
+                        "finished:\n\n{}\n\nWhole answer: `claude-proxy result {}`.",
+                        excerpt(&result, 2000),
+                        self.meta.id
+                    ),
+                );
+            }
             self.meta.state = State::Idle;
             self.meta.activity = None;
             save(&self.dir, &mut self.meta);
@@ -361,6 +427,7 @@ impl Drainer {
     fn on_exit(&mut self) -> Flow {
         let code = self.proc.take().and_then(|p| p.end(false));
         asks::clear(&self.dir);
+        self.forget_background();
         self.meta.turn_pid = None;
         self.meta.last_exit = code;
         if !self.busy {
@@ -388,6 +455,16 @@ impl Drainer {
             }
         }
         self.busy = false;
+        let why = self.meta.last_result.clone().unwrap_or_default();
+        notify_parent(
+            &self.meta,
+            &format!(
+                "failed: {}\n\nSee `claude-proxy status {}`; `claude-proxy send {} \"…\"` resumes it.",
+                excerpt(&why, 500),
+                self.meta.id,
+                self.meta.id
+            ),
+        );
         self.meta.state = State::Failed;
         self.meta.activity = None;
         self.requeue();
@@ -470,6 +547,7 @@ impl Drainer {
             }
         }
         asks::clear(&self.dir);
+        self.forget_background();
         if self.busy {
             self.meta.state = State::Killed;
         }
@@ -479,6 +557,13 @@ impl Drainer {
         self.requeue();
         save(&self.dir, &mut self.meta);
         Flow::Stop
+    }
+
+    /// Claude is gone, and its background tasks with it.
+    fn forget_background(&mut self) {
+        self.running = 0;
+        self.wake_due = None;
+        self.meta.background = 0;
     }
 
     /// Put back what Claude never took in, ahead of anything queued since.
@@ -492,6 +577,7 @@ impl Drainer {
         if let Some(proc) = self.proc.take() {
             proc.end(self.busy);
             asks::clear(&self.dir);
+            self.forget_background();
             self.meta.turn_pid = None;
             save(&self.dir, &mut self.meta);
         }

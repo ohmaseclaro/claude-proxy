@@ -109,6 +109,17 @@ pub struct Meta {
     pub fork_from: Option<String>,
     #[serde(default)]
     pub worktree: Option<Worktree>,
+    /// The run that started this one; it is told when this one finishes,
+    /// fails, or asks something.
+    #[serde(default)]
+    pub parent: Option<String>,
+    /// The Claude session that started it (`CLAUDE_CODE_SESSION_ID`).
+    #[serde(default)]
+    pub session: Option<String>,
+    /// Background tasks Claude has running; the run is not done until they
+    /// end and Claude has looked at them.
+    #[serde(default)]
+    pub background: u32,
 }
 
 /// A git worktree created for the run, on its own branch.
@@ -164,6 +175,8 @@ pub struct NewRun {
     pub message: String,
     pub fork_from: Option<String>,
     pub worktree: bool,
+    pub parent: Option<String>,
+    pub session: Option<String>,
 }
 
 /// Create a run, queue its first message, and start it in the background.
@@ -211,6 +224,9 @@ pub fn start(new: NewRun) -> Result<Meta, String> {
         moved: None,
         fork_from: new.fork_from,
         worktree,
+        parent: new.parent,
+        session: new.session,
+        background: 0,
     };
     save(&dir, &mut meta);
     enqueue(&dir, &new.message)?;
@@ -316,10 +332,11 @@ pub(crate) fn lock_file(dir: &Path) -> std::io::Result<File> {
         .open(dir.join("run.lock"))
 }
 
-/// Whether a drainer is alive for this run.
+/// Whether a drainer is alive for this run: it holds the lock exclusively.
+/// Probed with a shared lock, so two probes never mistake each other for it.
 pub fn alive(dir: &Path) -> bool {
     match lock_file(dir) {
-        Ok(f) => matches!(f.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+        Ok(f) => matches!(f.try_lock_shared(), Err(std::fs::TryLockError::WouldBlock)),
         Err(_) => false,
     }
 }
@@ -335,11 +352,12 @@ pub fn finished(id: &str) -> Result<bool, String> {
         return Ok(false);
     }
     let queued = queued(&dir);
-    let state = load(id)?.state;
+    let meta = load(id)?;
+    let state = meta.state;
     // Messages left queued behind a failure or a kill wait for the next send.
     let stopped = matches!(state, State::Failed | State::Killed);
     Ok(if alive(&dir) {
-        queued == 0 && (stopped || state == State::Idle)
+        queued == 0 && (stopped || (state == State::Idle && meta.background == 0))
     } else {
         queued == 0 || stopped
     })
@@ -360,6 +378,8 @@ pub fn effective_state(meta: &Meta) -> State {
         return State::Waiting;
     }
     match meta.state {
+        // Its turn ended, but Claude will be back when its tasks finish.
+        State::Idle if alive && meta.background > 0 => State::Working,
         State::Working if !alive => State::Failed,
         State::Idle if queued(&dir) > 0 => State::Queued,
         s => s,
@@ -718,7 +738,72 @@ pub(crate) fn signal_group(pid: u32, _force: bool) {
 }
 
 fn is_idle(meta: &Meta) -> bool {
-    !matches!(meta.state, State::Working | State::Queued)
+    !matches!(meta.state, State::Working | State::Queued) && meta.background == 0
+}
+
+/// Tell the run that started this one what happened; the message wakes it.
+pub(crate) fn notify_parent(meta: &Meta, news: &str) {
+    let Some(parent) = &meta.parent else {
+        return;
+    };
+    // A killed parent stays stopped: a message would resume it.
+    if load(parent).map_or(true, |p| p.state == State::Killed) {
+        return;
+    }
+    let name = meta
+        .name
+        .as_deref()
+        .map(|n| format!(" ({n})"))
+        .unwrap_or_default();
+    let _ = send(
+        parent,
+        &format!("(claude-proxy) Run {}{name} {news}", meta.id),
+        None,
+    );
+}
+
+/// Every run, each followed by the runs it started, as (depth, run).
+pub fn tree(all: Vec<Meta>) -> Vec<(usize, Meta)> {
+    let ids: std::collections::HashSet<String> = all.iter().map(|m| m.id.clone()).collect();
+    let (roots, mut children): (Vec<Meta>, Vec<Meta>) = all
+        .into_iter()
+        .partition(|m| m.parent.as_ref().is_none_or(|p| !ids.contains(p)));
+    let mut out = Vec::new();
+    fn walk(m: Meta, depth: usize, children: &mut Vec<Meta>, out: &mut Vec<(usize, Meta)>) {
+        let id = m.id.clone();
+        out.push((depth, m));
+        let (mine, rest): (Vec<Meta>, Vec<Meta>) = std::mem::take(children)
+            .into_iter()
+            .partition(|c| c.parent.as_deref() == Some(id.as_str()));
+        *children = rest;
+        for c in mine {
+            walk(c, depth + 1, children, out);
+        }
+    }
+    for root in roots {
+        walk(root, 0, &mut children, &mut out);
+    }
+    out
+}
+
+/// The runs a Claude session started, and everything they started in turn.
+pub fn of_session(all: &[Meta], session: &str) -> Vec<String> {
+    let mut ids: Vec<String> = all
+        .iter()
+        .filter(|m| m.session.as_deref() == Some(session) && m.parent.is_none())
+        .map(|m| m.id.clone())
+        .collect();
+    loop {
+        let more: Vec<String> = all
+            .iter()
+            .filter(|m| !ids.contains(&m.id) && m.parent.as_ref().is_some_and(|p| ids.contains(p)))
+            .map(|m| m.id.clone())
+            .collect();
+        if more.is_empty() {
+            return ids;
+        }
+        ids.extend(more);
+    }
 }
 
 /// Ask an idle drainer to exit and wait until it has.
@@ -1006,7 +1091,41 @@ mod tests {
             moved: None,
             fork_from: None,
             worktree: None,
+            parent: None,
+            session: None,
+            background: 0,
         }
+    }
+
+    #[test]
+    fn runs_list_as_a_tree_and_by_session() {
+        let run = |id: &str, parent: Option<&str>, session: Option<&str>| {
+            let mut m = meta();
+            m.id = id.into();
+            m.parent = parent.map(String::from);
+            m.session = session.map(String::from);
+            m
+        };
+        let all = vec![
+            run("lane", Some("orch"), Some("orch-session")),
+            run("other", None, Some("elsewhere")),
+            run("orch", None, Some("mine")),
+            run("sub", Some("lane"), Some("lane-session")),
+        ];
+        let tree: Vec<(usize, String)> = tree(all.clone())
+            .into_iter()
+            .map(|(d, m)| (d, m.id))
+            .collect();
+        assert_eq!(
+            tree,
+            [
+                (0, "other".to_string()),
+                (0, "orch".to_string()),
+                (1, "lane".to_string()),
+                (2, "sub".to_string())
+            ]
+        );
+        assert_eq!(of_session(&all, "mine"), ["orch", "lane", "sub"]);
     }
 
     #[test]

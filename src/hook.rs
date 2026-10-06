@@ -2,7 +2,10 @@
 //! hook's JSON on stdin).
 //!
 //! - `prompt` (UserPromptSubmit) remembers the session's permission mode, so a
-//!   run it starts inherits it the way a subagent would.
+//!   run it starts inherits it the way a subagent would, and tells the session
+//!   which of its runs finished or are asking since its last prompt.
+//! - `session-start` lists the session's runs still going, after a resume or a
+//!   compaction has dropped the waits that were watching them.
 //! - `pre-tool-use` (Agent|Task) turns a subagent call back with the
 //!   equivalent `claude-proxy run`, unless the description starts `[direct]`.
 
@@ -12,6 +15,7 @@ use std::io::Read;
 use serde_json::Value;
 
 use crate::paths::config_dir;
+use crate::runs::{self, Meta, State};
 
 /// Subagent types Claude defines itself; `--agent` only knows the user's own.
 const BUILT_IN_AGENTS: &[&str] = &[
@@ -36,6 +40,19 @@ pub fn run(event: &str) -> i32 {
     match event {
         "prompt" => {
             remember_mode(&v);
+            if let (true, Some(session)) = (policy_applies(), v["session_id"].as_str()) {
+                if let Some(news) = news_since_last_prompt(session) {
+                    println!("{news}");
+                }
+            }
+            0
+        }
+        "session-start" => {
+            if let (true, Some(session)) = (policy_applies(), v["session_id"].as_str()) {
+                if let Some(going) = runs_still_going(session) {
+                    println!("{going}");
+                }
+            }
             0
         }
         "pre-tool-use" => match redirect(&v, policy_applies()) {
@@ -70,6 +87,103 @@ pub fn session_mode(session: &str) -> Option<String> {
         .ok()
         .map(|m| m.trim().to_string())
         .filter(|m| !m.is_empty())
+}
+
+fn label(m: &Meta) -> String {
+    match &m.name {
+        Some(name) => format!("{} ({name})", m.id),
+        None => m.id.clone(),
+    }
+}
+
+fn first_ask(m: &Meta) -> String {
+    crate::asks::pending(&runs::run_dir(&m.id))
+        .first()
+        .and_then(|a| {
+            crate::render::ask_lines(&m.id, &a.tool, &a.input, false)
+                .into_iter()
+                .next()
+        })
+        .unwrap_or_default()
+}
+
+/// The session's runs that finished since its last prompt, and those asking.
+fn news_since_last_prompt(session: &str) -> Option<String> {
+    if !valid_session_id(session) {
+        return None;
+    }
+    let all = runs::list();
+    let mine = runs::of_session(&all, session);
+    if mine.is_empty() {
+        return None;
+    }
+    // Each finished turn is told once: remember what was told.
+    let told_file = config_dir()
+        .join("sessions")
+        .join(format!("{session}.told"));
+    let told = fs::read_to_string(&told_file).unwrap_or_default();
+    let mut now_told = Vec::new();
+    let lines: Vec<String> = all
+        .iter()
+        .filter(|m| mine.contains(&m.id))
+        .filter_map(|m| match runs::effective_state(m) {
+            State::Waiting => Some(format!(
+                "- {} is waiting for an answer: {}",
+                label(m),
+                first_ask(m)
+            )),
+            s @ (State::Idle | State::Failed | State::Killed) => {
+                let mark = format!("{} {} {}", m.id, s.as_str(), m.turns);
+                let new = !told.lines().any(|l| l == mark);
+                now_told.push(mark);
+                new.then(|| {
+                    format!(
+                        "- {} is {} — `claude-proxy result {}`",
+                        label(m),
+                        s.as_str(),
+                        m.id
+                    )
+                })
+            }
+            _ => None,
+        })
+        .collect();
+    let _ = fs::write(&told_file, now_told.join("\n"));
+    (!lines.is_empty()).then(|| {
+        format!(
+            "claude-proxy: runs this session started, since your last message:\n{}",
+            lines.join("\n")
+        )
+    })
+}
+
+/// The session's runs not yet done, for a session that lost track of them.
+fn runs_still_going(session: &str) -> Option<String> {
+    let all = runs::list();
+    let mine = runs::of_session(&all, session);
+    let lines: Vec<String> = all
+        .iter()
+        .filter(|m| mine.contains(&m.id))
+        .filter_map(|m| match runs::effective_state(m) {
+            State::Waiting => Some(format!(
+                "- {} is waiting for an answer: {}",
+                label(m),
+                first_ask(m)
+            )),
+            s @ (State::Working | State::Queued) => {
+                Some(format!("- {} is {}", label(m), s.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    (!lines.is_empty()).then(|| {
+        format!(
+            "claude-proxy runs this session started are still going. Waits you had on them \
+             ended with your previous context: start `claude-proxy wait <id>` again in the \
+             background for each one you still need.\n{}",
+            lines.join("\n")
+        )
+    })
 }
 
 fn valid_session_id(s: &str) -> bool {
