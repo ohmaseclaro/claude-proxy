@@ -52,6 +52,11 @@ give a ready-to-run watch command, e.g.:
 Mention it again when a run moves to another account, asks something, or
 finishes. Do this for one-shots (`auto`) too.
 
+When the `mcp__proxy-runs__watch` tool is available (the proxy-runs mod), use it
+whenever the user asks to see, show, watch or follow runs: it draws them live in
+the conversation, one id or none for every run going here. Answer with it
+rather than a table of `claude-proxy runs` output.
+
 ## Delegate a task
 
 ```bash

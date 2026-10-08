@@ -30,8 +30,10 @@ const POLICY =
   'claude-proxy runs: to delegate work (anything you would hand to the Agent tool, or a long or big task), ' +
   'call mcp__proxy-runs__run instead of `claude-proxy run` through Bash. It returns at once and this session ' +
   'is told when the run finishes, fails or asks something. `claude-proxy status/answer/allow/deny/send` through ' +
-  'Bash still apply when the run rows and the /runs pane are not enough. When the user asks to watch, see, ' +
-  'show or follow a run, call mcp__proxy-runs__watch with its id: the run is then drawn live in this conversation.'
+  'Bash still apply when the run rows and the /runs pane are not enough. Whenever the user asks to see, show, ' +
+  'watch or follow runs, or what is running, call mcp__proxy-runs__watch (an id for one run, none for every ' +
+  'run going here): it draws them live in this conversation, so answer with it rather than a table or a ' +
+  '`claude-proxy watch` command.'
 const ACTIVE = ['queued', 'working', 'waiting']
 const DONE = ['idle', 'failed', 'killed']
 /** Blocks a collapsed run shows. */
@@ -493,13 +495,14 @@ export const register: Register = on => {
     await $.tool.register({
       name: 'watch',
       description:
-        'Show an existing claude-proxy run live in this conversation: its messages, tool calls and asks, ' +
-        'updating as it works. Use it when the user asks to watch, see, show or follow a run, including ' +
-        "another session's. Returns at once.",
+        'Show claude-proxy runs live in this conversation: their messages, tool calls and asks, updating as ' +
+        'they work. Use it whenever the user asks to see, show, watch or follow runs or what is running, ' +
+        "another session's included. Without an id it shows every run going in this repository. Returns at once.",
       inputSchema: {
         type: 'object',
-        properties: { id: { type: 'string', description: 'The run id, as `claude-proxy runs` lists it' } },
-        required: ['id'],
+        properties: {
+          id: { type: 'string', description: 'One run id, as `claude-proxy runs` lists it; leave out for all going runs' },
+        },
       },
     })
     await $.command.register({ name: 'runs', description: "Show this session's claude-proxy runs" })
@@ -532,15 +535,29 @@ export const register: Register = on => {
 
   on('tool.call', { tool: WATCH }, async ($, e) => {
     const id = str((e as { id?: unknown }).id).trim()
-    if (!/^[A-Za-z0-9]{1,32}$/.test(id)) {
-      return { deny: 'Give a run id, as `claude-proxy runs --all` lists it.' }
+    if (id && !/^[A-Za-z0-9]{1,32}$/.test(id)) {
+      return { deny: 'Give a run id, as `claude-proxy runs --all` lists it, or none for every run going here.' }
     }
-    const run = await refresh($, id)
-    if (!run) return { deny: `There is no claude-proxy run ${id}; \`claude-proxy runs --all\` lists them.` }
-    await update($, calls, all => ({ ...all, [e.tool_use_id]: id }))
-    if (ACTIVE.includes(run.state) && run.session !== (await $.session.id())) void follow($, id)
+    const listed = id ? undefined : await cli($, ['runs', '--json'])
+    const ids = id
+      ? [id]
+      : listed?.exitCode === 0
+        ? (JSON.parse(listed.stdout) as ProxyRunsRun[]).filter(r => ACTIVE.includes(r.state)).map(r => r.id)
+        : (await read($, runs)).filter(r => ACTIVE.includes(r.state)).map(r => r.id)
+    if (ids.length === 0) return { result: 'No claude-proxy runs are going here; `claude-proxy runs --all` lists older ones.' }
+    const shown: ProxyRunsRun[] = []
+    for (const one of ids) {
+      const run = await refresh($, one)
+      if (run) shown.push(run)
+    }
+    if (shown.length === 0) return { deny: `There is no claude-proxy run ${id}; \`claude-proxy runs --all\` lists them.` }
+    await update($, calls, all => ({ ...all, [e.tool_use_id]: shown.map(r => r.id).join(',') }))
+    const session = await $.session.id()
+    for (const run of shown) if (ACTIVE.includes(run.state) && run.session !== session) void follow($, run.id)
     return {
-      result: `Run ${label(run)} is ${run.state} on ${run.account}; its row in this conversation now shows it live.`,
+      result:
+        shown.map(r => `run ${label(r)} is ${r.state} on ${r.account}`).join('; ') +
+        '. Their rows in this conversation now show them live; no need to list them again.',
     }
   })
 
@@ -585,7 +602,10 @@ export const register: Register = on => {
         (tool === WATCH && !e.props.isErrored ? str((e.props.input as { id?: unknown } | null)?.id) : undefined)
       if (!id) return next(e)
       const els = $.ui.resolve(e)
-      return card($, els, id, nativeRow($, e, next, els, id))
+      const { Box } = els
+      const cards: RenderElement[] = []
+      for (const one of id.split(',')) cards.push(await card($, els, one, nativeRow($, e, next, els, one)))
+      return cards.length === 1 && cards[0] ? cards[0] : <Box flexDirection="column" gap={1}>{cards}</Box>
     })
 
     // The card above says all the call's answer did.

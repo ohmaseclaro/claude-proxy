@@ -28,6 +28,7 @@ type World = {
   argvs: string[][]
   stdins: (string | undefined)[]
   status: object
+  list: object[]
   events: string[]
   tools: string[]
   statuses: (string | undefined)[]
@@ -76,6 +77,7 @@ function world(on: On, events: string[] = [], env: Record<string, string> = {}):
     argvs: [],
     stdins: [],
     status: RUN,
+    list: [],
     events,
     tools: [],
     statuses: [],
@@ -116,7 +118,7 @@ function world(on: On, events: string[] = [], env: Record<string, string> = {}):
       return { value: { exitCode: 1, stdout: '', stderr: 'no such run', isStdoutTruncated: false, isStderrTruncated: false } }
     }
     if (cmd === 'run' || cmd === 'status') return ok(JSON.stringify(w.status))
-    if (cmd === 'runs') return ok(JSON.stringify([]))
+    if (cmd === 'runs') return ok(JSON.stringify(w.list))
     if (cmd === 'read') return ok(EVENTS_JSONL)
     return ok(`${cmd} done`)
   })
@@ -251,6 +253,21 @@ test('watch shows any run in the conversation and refuses an unknown id', async 
   const unknown = await $.tool.call({ tool: WATCH, tool_use_id: 'tx', id: 'nope99' })
   expect(String(unknown.isError ? unknown.text : unknown.deny)).toContain('no claude-proxy run nope99')
   expect(w.argvs.some(a => a[1] === 'status' && a[2] === 'nope99')).toBe(true)
+})
+
+test('watch without an id shows every run going here', async ($, on) => {
+  const w = world(on)
+  await start($)
+  const none = await $.tool.call({ tool: WATCH, tool_use_id: 'tn' })
+  expect(String(none.result)).toContain('No claude-proxy runs are going here')
+  w.list = [RUN, { ...RUN, id: 'old111', state: 'idle' }]
+  const all = await $.tool.call({ tool: WATCH, tool_use_id: 'ta' })
+  expect(String(all.result)).toContain('run abc123 (say ok) is working')
+  expect(String(all.result)).not.toContain('old111')
+  expect(w.argvs.find(a => a[1] === 'runs' && a.length === 3)).toEqual(['claude-proxy', 'runs', '--json'])
+  const ui = await $.ui.mount({ plugin: 'proxy-runs', surface: 'desktop', component: 'ToolUse', requestId: 'ta', props: toolUse('ta', { tool: WATCH, input: {} }) })
+  expect(await ui.find({ key: 'group:abc123:t1' })).toBeDefined()
+  await ui.unmount()
 })
 
 test('the notice a finished run sends reads as one line and its answer', async ($, on) => {

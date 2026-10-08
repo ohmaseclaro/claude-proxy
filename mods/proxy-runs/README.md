@@ -18,9 +18,10 @@ A Claude Code mod (function-hooks plugin, Claude Code 2.1.287+) that makes
   and an answer field on the row. Collapsed, the row shows the last three
   blocks; `Show N earlier` opens the rest (last 400 events).
 - **Any run, on request.** `mcp__proxy-runs__watch` takes a run id and draws
-  that run's row in the conversation, another session's included; the policy
-  section tells the model to call it when you ask to watch, see or follow a
-  run. `/runs <id>` opens the pane on that run.
+  that run's row in the conversation, another session's included; with no id
+  it draws every run going in the repository. The policy section (and
+  quota-router's) tells the model to call it whenever you ask to see, show,
+  watch or follow runs. `/runs <id>` opens the pane on that run.
 - **Runs started through Bash.** A `claude-proxy run` Bash row gets the run's
   row under the command's own, from the id the command printed.
 - **The notice reads as one line.** The prompt the mod submits when a run
@@ -59,8 +60,19 @@ Every session, the desktop app's Code tab included: add the folder to
 `CLAUDE_CODE_PLUGIN_DIRS` in the `env` block of `~/.claude/settings.json`:
 
 ```json
-{ "env": { "CLAUDE_CODE_PLUGIN_DIRS": "/path/to/claude-proxy/mods/proxy-runs" } }
+{
+  "env": {
+    "CLAUDE_CODE_PLUGIN_DIRS": "/path/to/claude-proxy/mods/proxy-runs",
+    "CLAUDE_CODE_PLUGIN_DIR_WATCH": "1"
+  }
+}
 ```
+
+A terminal session reloads the mod when its files change. A desktop session is
+a long-lived headless one and reloads only with `CLAUDE_CODE_PLUGIN_DIR_WATCH=1`.
+Both variables are read when a session's process starts, so a session open
+before they were set needs one restart (quit and reopen the app; conversations
+resume) to load the mod or start watching it.
 
 Runs inherit that setting (every profile shares `settings.json`), which is why
 the mod checks `CLAUDE_PROXY_RUN` and stays inert inside them.
