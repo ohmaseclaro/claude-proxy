@@ -8,13 +8,29 @@ A Claude Code mod (function-hooks plugin, Claude Code 2.1.287+) that makes
   `cwd`, `name`), starts `claude-proxy run - --json …` with the task on stdin
   (`--agent` only for non-built-in types, `-- --model` for the model) and
   returns at once with the run id, its account and `claude-proxy watch <id>`.
-- **A live row.** The tool's transcript row draws the run: id, name, state,
-  account, turn, cost, what it is doing, and its last transcript lines. The
-  `more` / `less` button on the row shows the whole transcript (last 200
-  entries).
+- **A live row, drawn like Claude's own.** The tool's transcript row draws the
+  run the way Claude draws a session: its name and `id · state on account ·
+  turn · $`, the run's replies as Markdown, your messages to it, and its tool
+  calls as Claude's own tool rows (the engine draws each one, Bash, Read, Edit
+  and the rest, with the call's input and result). Consecutive calls fold into
+  one line, "Ran 3 commands, read 2 files", that opens into the rows; the live
+  group keeps its running call in view. Asks show Allow / Always allow / Deny
+  and an answer field on the row. Collapsed, the row shows the last three
+  blocks; `Show N earlier` opens the rest (last 400 events).
+- **Any run, on request.** `mcp__proxy-runs__watch` takes a run id and draws
+  that run's row in the conversation, another session's included; the policy
+  section tells the model to call it when you ask to watch, see or follow a
+  run. `/runs <id>` opens the pane on that run.
+- **Runs started through Bash.** A `claude-proxy run` Bash row gets the run's
+  row under the command's own, from the id the command printed.
+- **The notice reads as one line.** The prompt the mod submits when a run
+  finishes is drawn as `✓ <name> finished · <id> on <account>` and the run's
+  answer as Markdown, not the raw `<run-result>` text the model reads.
 - **A Runs pane.** `/runs` opens it: this session's runs, the selected run's
   transcript, and allow / allow always / deny / answer / send / kill, plus the
-  `claude-proxy attach <id>` line to take one over.
+  `claude-proxy attach <id>` line to take one over. The pane cannot borrow
+  Claude's tool rows, so its calls are the mod's own: a title that opens to
+  the command and its output, or the edit as a diff.
 - **A status line.** `2 runs · 1 waiting` while any run is active.
 - **Notifications without polling.** At session start the mod follows
   `claude-proxy events --mine`. When a run it started finishes, fails, is
@@ -76,8 +92,13 @@ The two can be enabled together:
   background-tasks dialog; the Runs pane stands in for it.
 - **No ctrl+o expansion on the row.** `ToolUse` props carry no `isExpanded` on
   2.1.288 (only `UserMessage` and `ToolGroup` do), so the row has its own
-  `more` / `less` button. Whether a click reaches a button in a transcript row
-  on each surface is not verified yet.
+  `Show N earlier` button.
+- **Group lines are Buttons.** A mod cannot draw Claude's `ToolGroup`, so the
+  "Ran 3 commands" line is a plain, dim Button; the desktop draws it as its
+  own button.
+- **One row id.** The engine rows inside a run's row all carry that row's
+  `tool_use_id` (it is read-only), so a surface that keys row state on it may
+  open or close them together.
 - **Process access.** `$.process` is declared "CLI only". The desktop Code tab
   runs the CLI, so it should work there, but that is not confirmed. If the
   engine refuses it, the tool refuses with a clear reason, the pane and row
@@ -89,8 +110,12 @@ The two can be enabled together:
   stream-json one.
 - **`/clear`.** The events watcher keeps following the session id it started
   under; runs started after a `/clear` show up once the session restarts.
-- Notifications cover runs started through the tool. Runs started through Bash
-  still show in the pane and status line; wait on those as before.
+- Notifications cover runs started through the tool, and runs this session
+  watches. Runs started through Bash still show in the pane and status line;
+  wait on those as before.
+- A row whose run this session never loaded (a resumed session, an older
+  conversation) loads it once when drawn; a run already pruned shows its id
+  only.
 
 ## Develop
 

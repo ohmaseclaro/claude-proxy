@@ -1,9 +1,21 @@
 import { atom, memberOf, read, update } from 'claude-code'
-import type { EngineInterface, ProcessRunInit, ProcessRunResult, Register } from 'claude-code'
+import type {
+  ElementTable,
+  EngineInterface,
+  ProcessRunInit,
+  ProcessRunResult,
+  Register,
+  RenderElement,
+  RenderInput,
+  RenderNode,
+} from 'claude-code'
 
-import type { ProxyRunsRun } from '../types'
+import type { ProxyRunsRun, RunTool } from '../types'
+import { blocks, editDiff, groupLabel, head, parse, summary } from './transcript'
+import type { Block } from './transcript'
 
 const TOOL = 'mcp__proxy-runs__run'
+const WATCH = 'mcp__proxy-runs__watch'
 const PANE = 'runs'
 const BIN = 'claude-proxy'
 const BUILT_IN_AGENTS = [
@@ -18,17 +30,25 @@ const POLICY =
   'claude-proxy runs: to delegate work (anything you would hand to the Agent tool, or a long or big task), ' +
   'call mcp__proxy-runs__run instead of `claude-proxy run` through Bash. It returns at once and this session ' +
   'is told when the run finishes, fails or asks something. `claude-proxy status/answer/allow/deny/send` through ' +
-  'Bash still apply when the run rows and the /runs pane are not enough.'
+  'Bash still apply when the run rows and the /runs pane are not enough. When the user asks to watch, see, ' +
+  'show or follow a run, call mcp__proxy-runs__watch with its id: the run is then drawn live in this conversation.'
 const ACTIVE = ['queued', 'working', 'waiting']
 const DONE = ['idle', 'failed', 'killed']
+/** Blocks a collapsed run shows. */
+const SHOWN = 3
+const READ_LINES = '400'
+/** The id in `run`'s answer ("Started claude-proxy run <id> on") and stderr ("claude-proxy: run <id> on"). */
+const STARTED = /claude-proxy:? run ([A-Za-z0-9]+) on /
+const RUN_COMMAND = /(^|[\s;&|(])claude-proxy\s+run\b/
 
 const runs = atom({ plugin: 'proxy-runs', key: 'runs' } as const, [])
 const calls = atom({ plugin: 'proxy-runs', key: 'calls' } as const, {})
 const told = atom({ plugin: 'proxy-runs', key: 'told' } as const, {})
 const selected = atom({ plugin: 'proxy-runs', key: 'selected' } as const, '')
 const problem = atom({ plugin: 'proxy-runs', key: 'problem' } as const, '')
-const transcriptOf = atom({ plugin: 'proxy-runs', key: 'lines' } as const, [])
+const itemsOf = atom({ plugin: 'proxy-runs', key: 'items' } as const, [])
 const expandedOf = atom({ plugin: 'proxy-runs', key: 'expanded' } as const, false)
+const openOf = atom({ plugin: 'proxy-runs', key: 'group' } as const, false)
 
 type Engine = EngineInterface
 type Input = {
@@ -40,6 +60,7 @@ type Input = {
   cwd?: string
   name?: string
 }
+type Row = (t: RunTool, active: boolean) => Promise<RenderNode>
 
 function runArgv(input: Input): string[] {
   const argv = ['run', '-', '--json', '--name', input.name ?? input.description]
@@ -53,6 +74,17 @@ function runArgv(input: Input): string[] {
 }
 
 const label = (r: ProxyRunsRun) => (r.name ? `${r.id} (${r.name})` : r.id)
+const str = (v: unknown) => (typeof v === 'string' ? v : '')
+
+function idIn(output: unknown): string | undefined {
+  return STARTED.exec(typeof output === 'string' ? output : JSON.stringify(output ?? ''))?.[1]
+}
+
+/** Code and Markdown take tab and newline as their only control characters. */
+function clean(text: string, max = 9000): string {
+  const plain = text.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '')
+  return plain.length > max ? `${plain.slice(0, max)}…` : plain
+}
 
 function counter(list: ProxyRunsRun[]): string | undefined {
   const active = list.filter(r => ACTIVE.includes(r.state)).length
@@ -125,26 +157,6 @@ async function metaOf($: Engine, id: string): Promise<ProxyRunsRun | undefined> 
   }
 }
 
-function renderEvents(jsonl: string): string[] {
-  const out: string[] = []
-  for (const line of jsonl.split('\n')) {
-    let v
-    try {
-      v = JSON.parse(line)
-    } catch {
-      continue
-    }
-    if (v.event === 'turn_start') out.push(`● ${v.account} · turn ${v.turn}`)
-    if (v.type === 'result') out.push(v.is_error ? '✗ failed' : '✓ done')
-    if (v.type !== 'assistant') continue
-    for (const b of v.message?.content ?? []) {
-      if (b.type === 'text' && b.text.trim()) out.push(`  ${b.text.trim().split('\n')[0]}`)
-      if (b.type === 'tool_use') out.push(`  ⚙ ${b.name}  ${JSON.stringify(b.input).slice(0, 100)}`)
-    }
-  }
-  return out
-}
-
 // ponytail: the fallback reads the whole events.jsonl ($.fs caps it at 4 MiB) and knows no asks.
 async function refresh($: Engine, id: string): Promise<ProxyRunsRun | undefined> {
   const status = await cli($, ['status', id, '--json'])
@@ -157,17 +169,45 @@ async function refresh($: Engine, id: string): Promise<ProxyRunsRun | undefined>
   if (!run) return undefined
   const list = await update($, runs, all => [...all.filter(r => r.id !== id), run])
   $.ui.status(counter(list))
-  const transcript = await cli($, ['read', id, '-n', '200'])
+  const events = await cli($, ['read', id, '--json', '-n', READ_LINES])
   const lines =
-    transcript === undefined
+    events === undefined
       ? await $.fs
           .read(`${await runsDir($)}/${id}/events.jsonl`)
-          .then(text => renderEvents(text).slice(-200), () => undefined)
-      : transcript.exitCode === 0
-        ? transcript.stdout.split('\n').filter(Boolean)
+          .then(text => text.split('\n').slice(-Number(READ_LINES)), () => undefined)
+      : events.exitCode === 0
+        ? events.stdout.split('\n')
         : undefined
-  if (lines) await update($, memberOf(transcriptOf, { requestId: id }), () => lines)
+  if (lines) await update($, memberOf(itemsOf, { requestId: id }), () => parse(lines))
   return run
+}
+
+const asked = new Set<string>()
+
+// A row for a run this session has not loaded (a resumed session, one started through Bash).
+function ensure($: Engine, id: string): void {
+  if (asked.has(id)) return
+  asked.add(id)
+  void refresh($, id).catch(err => $.ui.log(`proxy-runs: ${id}: ${err}`, { to: 'debug' }))
+}
+
+const following = new Set<string>()
+
+// Another session's run, watched from here: `events --mine` does not carry it.
+async function follow($: Engine, id: string): Promise<void> {
+  if (following.has(id)) return
+  following.add(id)
+  try {
+    for await (const { stream } of $.process.spawn({ argv: [BIN, 'events', id] })) {
+      if (stream !== 'stdout') continue
+      const run = await refresh($, id)
+      if (!run || DONE.includes(run.state)) break
+    }
+  } catch (err) {
+    $.ui.log(`proxy-runs: following ${id} stopped: ${err}`, { to: 'debug' })
+  } finally {
+    following.delete(id)
+  }
 }
 
 function askText(run: ProxyRunsRun): string {
@@ -231,9 +271,11 @@ async function watch($: Engine, session: string): Promise<void> {
   const all = await cli($, ['runs', '--json', '--all'])
   if (all === undefined) return poll($, session)
   if (all.exitCode === 0) {
-    const list = (JSON.parse(all.stdout) as ProxyRunsRun[]).filter(r => r.session === session)
+    const shown = new Set(Object.values(await read($, calls)))
+    const list = (JSON.parse(all.stdout) as ProxyRunsRun[]).filter(r => r.session === session || shown.has(r.id))
     await update($, runs, () => list)
     $.ui.status(counter(list))
+    for (const r of list) if (r.session !== session && ACTIVE.includes(r.state)) void follow($, r.id)
   }
   let rest = ''
   const events = $.process.spawn({
@@ -253,6 +295,173 @@ async function act($: Engine, argv: string[], id: string): Promise<void> {
   const said = ran && (ran.exitCode === 0 ? ran.stdout : ran.stderr).trim().split('\n')[0]
   $.ui.toast(said || `cannot start ${BIN} from here; in a terminal: ${BIN} ${argv.join(' ')}`)
   await refresh($, id)
+}
+
+function title(t: RunTool): string {
+  const description = t.tool === 'Bash' ? str((t.input as { description?: unknown } | null)?.description) : ''
+  return description || `${t.tool} ${summary(t.tool, t.input)}`
+}
+
+function detail(els: ElementTable, t: RunTool): RenderNode {
+  const { Code, Text } = els
+  const i = (t.input ?? {}) as Record<string, unknown>
+  const diff = ['Edit', 'MultiEdit'].includes(t.tool) ? editDiff(t.input) : undefined
+  if (diff) return <Code source={clean(diff)} format="diff" path={str(i.file_path)} />
+  if (t.tool === 'Write') return <Code source={clean(head(str(i.content), 60)[0])} path={str(i.file_path)} />
+  const [shown, more] = head(t.text ?? '', 40)
+  const source = `${t.tool === 'Bash' ? `$ ${str(i.command)}\n` : ''}${shown}${more ? `\n… +${more} lines` : ''}`
+  return source.trim() ? <Code source={clean(source)} /> : <Text dimColor>No output</Text>
+}
+
+/** A run's tool call drawn by the mod, where the engine's own row cannot be had (the pane). */
+async function plainRow($: Engine, els: ElementTable, runId: string, t: RunTool, active: boolean): Promise<RenderNode> {
+  const { Box, Button } = els
+  const which = memberOf(openOf, { requestId: `${runId}:t:${t.id}` })
+  const isOpen = await read($, which)
+  const state = t.isRunning ? (active ? ' …' : ' · interrupted') : t.isErrored ? ' · failed' : ''
+  return (
+    <Box flexDirection="column">
+      <Button
+        key={`tool:${runId}:${t.id}`}
+        plain
+        dimColor
+        label={`${title(t)}${state} ${isOpen ? '⌄' : '›'}`}
+        onPress={() => update($, which, x => !x)}
+      />
+      {isOpen && detail(els, t)}
+    </Box>
+  )
+}
+
+async function block($: Engine, els: ElementTable, run: ProxyRunsRun, b: Block, isLast: boolean, row: Row): Promise<RenderNode> {
+  const { Box, Text, Button, Markdown } = els
+  const active = ACTIVE.includes(run.state)
+  if (b.kind === 'text') return <Markdown text={clean(b.text)} />
+  if (b.kind === 'you') return <Text dimColor>› {b.duringTurn ? '(while it works) ' : ''}{b.text}</Text>
+  if (b.kind === 'ask') return <Text color="yellow">? {b.text}</Text>
+  if (b.kind === 'answer') return <Text dimColor>  ↳ {b.text}</Text>
+  if (b.kind === 'note') {
+    return b.tone === 'info' ? <Text dimColor>{b.text}</Text> : <Text color={b.tone === 'warn' ? 'yellow' : 'red'}>{b.text}</Text>
+  }
+  if (b.kind === 'done') {
+    const text = `${b.ok ? '✓ Done' : '✗ Failed'}${b.text ? ` · ${b.text}` : ''}`
+    return b.ok ? <Text dimColor>{text}</Text> : <Text color="red">{text}</Text>
+  }
+  const [only] = b.tools
+  if (b.tools.length === 1 && only) return row(only, active)
+  const which = memberOf(openOf, { requestId: `${run.id}:${b.id}` })
+  const isOpen = await read($, which)
+  const live = isLast && active ? b.tools.at(-1) : undefined
+  const rows: RenderNode[] = []
+  for (const t of isOpen ? b.tools : live ? [live] : []) rows.push(await row(t, active))
+  return (
+    <Box flexDirection="column">
+      <Button
+        key={`group:${run.id}:${b.id}`}
+        plain
+        dimColor
+        label={`${groupLabel(b.tools)} ${isOpen ? '⌄' : '›'}`}
+        onPress={() => update($, which, x => !x)}
+      />
+      {rows.length > 0 && (
+        <Box flexDirection="column" borderStyle="round" borderDimColor paddingX={1}>
+          {rows}
+        </Box>
+      )}
+    </Box>
+  )
+}
+
+function askControls($: Engine, els: ElementTable, run: ProxyRunsRun, suffix: string): RenderElement[] {
+  const { Box, Button } = els
+  const Field = 'Input' in els ? els.Input : undefined
+  return [
+    <Box gap={1}>
+      <Button key={`allow${suffix}`} variant="primary" onPress={() => act($, ['allow', run.id], run.id)}>
+        Allow
+      </Button>
+      <Button key={`always${suffix}`} onPress={() => act($, ['allow', run.id, '--always'], run.id)}>
+        Always allow
+      </Button>
+      <Button key={`deny${suffix}`} onPress={() => act($, ['deny', run.id], run.id)}>
+        Deny
+      </Button>
+    </Box>,
+    ...(Field
+      ? [
+          <Field
+            key={`answer${suffix}`}
+            label="answer: "
+            placeholder="one answer per question, separated by |"
+            onSubmit={text => act($, ['answer', run.id, ...text.split('|').map(s => s.trim())], run.id)}
+          />,
+        ]
+      : []),
+  ]
+}
+
+/** The engine's own row for a run's call: the ToolUse being drawn, with the call's props. */
+function nativeRow($: Engine, e: RenderInput<'ToolUse'>, next: (e: RenderInput<'ToolUse'>) => Promise<RenderElement>, els: ElementTable, id: string): Row {
+  return (t, active) =>
+    next({
+      ...e,
+      props: {
+        ...e.props,
+        tool: t.tool,
+        input: t.input,
+        output: t.isRunning ? undefined : (t.output ?? t.text),
+        isRunning: t.isRunning && active,
+        isErrored: t.isErrored,
+        isInterrupted: t.isRunning && !active,
+      },
+    }).catch(() => plainRow($, els, id, t, active))
+}
+
+type CardOpts = { inPane?: boolean; room?: number }
+
+/** A run as the transcript draws it: header, then its blocks, newest last. */
+async function card($: Engine, els: ElementTable, id: string, row: Row, opts: CardOpts = {}): Promise<RenderElement> {
+  const { Box, Text, Button } = els
+  const run = (await read($, runs)).find(r => r.id === id)
+  if (!run) {
+    ensure($, id)
+    return <Text dimColor>Run {id}</Text>
+  }
+  const active = ACTIVE.includes(run.state)
+  const all = blocks(await read($, memberOf(itemsOf, { requestId: id })))
+  const more = memberOf(expandedOf, { requestId: id })
+  const isExpanded = await read($, more)
+  const limit = opts.room ?? SHOWN
+  const shown = isExpanded ? all : all.slice(-limit)
+  const body: RenderNode[] = []
+  for (const b of shown) body.push(await block($, els, run, b, b === all.at(-1), row))
+  const issue = await read($, problem)
+  const meta = `${run.id} · ${run.state} on ${run.account} · turn ${run.turns} · $${run.cost_usd.toFixed(2)}`
+  return (
+    <Box flexDirection="column">
+      {opts.inPane ? (
+        <Text dimColor>{meta}</Text>
+      ) : (
+        <Box gap={1}>
+          <Text bold>{run.name ?? `Run ${run.id}`}</Text>
+          <Text dimColor>{meta}</Text>
+        </Box>
+      )}
+      {issue && <Text color="yellow">{issue}</Text>}
+      {all.length > limit && (
+        <Button
+          key={`more:${id}`}
+          plain
+          dimColor
+          label={isExpanded ? 'Show less' : `Show ${all.length - shown.length} earlier`}
+          onPress={() => update($, more, x => !x)}
+        />
+      )}
+      {body}
+      {all.length === 0 && <Text dimColor>{active ? `Starting on ${run.account}…` : 'Nothing recorded.'}</Text>}
+      {run.state === 'waiting' && askControls($, els, run, opts.inPane ? '' : `:${id}`)}
+    </Box>
+  )
 }
 
 export const register: Register = on => {
@@ -281,6 +490,18 @@ export const register: Register = on => {
         required: ['prompt', 'description'],
       },
     })
+    await $.tool.register({
+      name: 'watch',
+      description:
+        'Show an existing claude-proxy run live in this conversation: its messages, tool calls and asks, ' +
+        'updating as it works. Use it when the user asks to watch, see, show or follow a run, including ' +
+        "another session's. Returns at once.",
+      inputSchema: {
+        type: 'object',
+        properties: { id: { type: 'string', description: 'The run id, as `claude-proxy runs` lists it' } },
+        required: ['id'],
+      },
+    })
     await $.command.register({ name: 'runs', description: "Show this session's claude-proxy runs" })
     await markSession($)
     const session = await $.session.id()
@@ -306,6 +527,20 @@ export const register: Register = on => {
         `Started claude-proxy run ${run.id} on ${run.account}. Watch it: \`claude-proxy watch ${run.id}\`. ` +
         `You will get a message here when it finishes, fails or asks something; end your turn or keep working, ` +
         `do not wait on it.`,
+    }
+  })
+
+  on('tool.call', { tool: WATCH }, async ($, e) => {
+    const id = str((e as { id?: unknown }).id).trim()
+    if (!/^[A-Za-z0-9]{1,32}$/.test(id)) {
+      return { deny: 'Give a run id, as `claude-proxy runs --all` lists it.' }
+    }
+    const run = await refresh($, id)
+    if (!run) return { deny: `There is no claude-proxy run ${id}; \`claude-proxy runs --all\` lists them.` }
+    await update($, calls, all => ({ ...all, [e.tool_use_id]: id }))
+    if (ACTIVE.includes(run.state) && run.session !== (await $.session.id())) void follow($, id)
+    return {
+      result: `Run ${label(run)} is ${run.state} on ${run.account}; its row in this conversation now shows it live.`,
     }
   })
 
@@ -342,39 +577,75 @@ export const register: Register = on => {
     return next(e)
   })
 
-  on('ui.render', { component: 'ToolUse', props: { tool: TOOL } }, async ($, e, next) => {
-    const id = (await read($, calls))[e.props.tool_use_id]
-    const run = (await read($, runs)).find(r => r.id === id)
-    if (!id || !run) return next(e)
-    const { Box, Text, Button } = $.ui.resolve(e)
-    const isExpanded = await read($, memberOf(expandedOf, { requestId: id }))
-    const lines = await read($, memberOf(transcriptOf, { requestId: id }))
-    const issue = await read($, problem)
-    const shown = isExpanded ? lines : lines.slice(-6)
+  for (const tool of [TOOL, WATCH]) {
+    on('ui.render', { component: 'ToolUse', props: { tool } }, async ($, e, next) => {
+      const id =
+        (await read($, calls))[e.props.tool_use_id] ??
+        idIn(e.props.output) ??
+        (tool === WATCH && !e.props.isErrored ? str((e.props.input as { id?: unknown } | null)?.id) : undefined)
+      if (!id) return next(e)
+      const els = $.ui.resolve(e)
+      return card($, els, id, nativeRow($, e, next, els, id))
+    })
+
+    // The card above says all the call's answer did.
+    on('ui.render', { component: 'ToolResult', props: { tool } }, async ($, e, next) => {
+      if (e.props.isErrored) return next(e)
+      const { Box } = $.ui.resolve(e)
+      return <Box />
+    })
+  }
+
+  // A run started through Bash gets the same card under the command's own row.
+  on('ui.render', { component: 'ToolUse', props: { tool: 'Bash' } }, async ($, e, next) => {
+    const command = str((e.props.input as { command?: unknown } | null)?.command)
+    const id = RUN_COMMAND.test(command) ? idIn(e.props.output) : undefined
+    if (!id) return next(e)
+    const els = $.ui.resolve(e)
+    const { Box } = els
+    const own = await next(e)
+    const run = await card($, els, id, nativeRow($, e, next, els, id))
     return (
       <Box flexDirection="column">
-        <Box>
-          <Text bold>● run {label(run)}</Text>
-          <Text dimColor>
-            {' '}· {run.state} · {run.account} · turn {run.turns} · ${run.cost_usd.toFixed(2)}{' '}
-          </Text>
-          <Button
-            key={`more:${id}`}
-            label={isExpanded ? 'less' : 'more'}
-            dimColor
-            onPress={() => update($, memberOf(expandedOf, { requestId: id }), x => !x)}
-          />
+        {own}
+        <Box flexDirection="column" marginTop={1}>
+          {run}
         </Box>
-        {issue && <Text color="yellow">{issue}</Text>}
-        {run.activity && run.state === 'working' && <Text dimColor>  {run.activity}</Text>}
-        {shown.map(line => (
-          <Text dimColor wrap="truncate-end">{line}</Text>
-        ))}
       </Box>
     )
   })
 
-  on('command.run', { command: 'runs' }, async $ => {
+  // The finished/asking notice this mod submits, as one line and the run's answer.
+  on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
+    const { origin, text, isExpanded } = e.props
+    if (origin.kind !== 'plugin' || origin.name !== 'proxy-runs') return next(e)
+    if (e.surface === 'terminal' && isExpanded) return next(e)
+    const id = /^claude-proxy run (\S+)/.exec(text)?.[1]
+    if (!id) return next(e)
+    const { Box, Text, Markdown } = $.ui.resolve(e)
+    const run = (await read($, runs)).find(r => r.id === id)
+    const name = run?.name ?? `Run ${id}`
+    if (/ is waiting for an answer/.test(text)) {
+      const ask = /\n- (.+)/.exec(text)?.[1] ?? ''
+      return <Text color="yellow">? {name} needs an answer{ask ? ` · ${ask.slice(0, 200)}` : ''}</Text>
+    }
+    const [, state = '', account = ''] = / is (idle|failed|killed) on (\S+)/.exec(text) ?? []
+    const result = /<run-result>\n([\s\S]*?)\n<\/run-result>/.exec(text)?.[1] ?? ''
+    const line = `${name} ${state === 'idle' ? 'finished' : state || 'stopped'} · ${id}${account ? ` on ${account}` : ''}`
+    return (
+      <Box flexDirection="column">
+        {state === 'idle' ? <Text dimColor>✓ {line}</Text> : <Text color="red">✗ {line}</Text>}
+        {result && result !== '(no result)' && <Markdown text={clean(result)} />}
+      </Box>
+    )
+  })
+
+  on('command.run', { command: 'runs' }, async ($, e) => {
+    const id = str(e.args).trim()
+    if (id) {
+      await refresh($, id)
+      await update($, selected, () => id)
+    }
     await $.ui.open({ id: PANE, title: 'Runs' })
     return { text: 'Runs pane opened.' }
   })
@@ -385,13 +656,13 @@ export const register: Register = on => {
     const list = await read($, runs)
     const pick = (await read($, selected)) || list.at(-1)?.id || ''
     const run = list.find(r => r.id === pick)
-    const lines = run ? await read($, memberOf(transcriptOf, { requestId: run.id })) : []
-    const issue = await read($, problem)
-    const room = Math.max(3, (e.viewport?.rows ?? 24) - list.length - 10)
+    const room = Math.max(3, Math.floor(((e.viewport?.rows ?? 24) - list.length - 10) / 2))
     const Field = 'Input' in els ? els.Input : undefined
+    const body = run
+      ? await card($, els, run.id, (t, active) => plainRow($, els, run.id, t, active), { inPane: true, room })
+      : null
     return (
       <Box flexDirection="column">
-        {issue && <Text color="yellow">{issue}</Text>}
         {list.length === 0 && <Text dimColor>No runs this session.</Text>}
         {list.map(r => (
           <Button
@@ -404,32 +675,7 @@ export const register: Register = on => {
         ))}
         {run && (
           <Box flexDirection="column" marginTop={1}>
-            {lines.slice(-room).map(line => (
-              <Text wrap="truncate-end">{line}</Text>
-            ))}
-            {run.state === 'waiting' && (
-              <Box>
-                <Button key="allow" variant="primary" onPress={() => act($, ['allow', run.id], run.id)}>
-                  allow
-                </Button>
-                <Button key="always" onPress={() => act($, ['allow', run.id, '--always'], run.id)}>
-                  allow always
-                </Button>
-                <Button key="deny" onPress={() => act($, ['deny', run.id], run.id)}>
-                  deny
-                </Button>
-              </Box>
-            )}
-            {run.state === 'waiting' && Field && (
-              <Field
-                key="answer"
-                label="answer: "
-                placeholder="one answer per question, separated by |"
-                onSubmit={text =>
-                  act($, ['answer', run.id, ...text.split('|').map(s => s.trim())], run.id)
-                }
-              />
-            )}
+            {body}
             {Field && (
               <Field
                 key="send"

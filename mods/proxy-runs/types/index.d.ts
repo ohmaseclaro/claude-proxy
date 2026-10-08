@@ -11,6 +11,30 @@ export type ProxyRunsRun = {
   session: string | null
 }
 
+/** One tool call a run made, with its result once it has one. */
+export type RunTool = {
+  kind: 'tool'
+  id: string
+  tool: string
+  input: unknown
+  /** The structured result Claude stored (`tool_use_result`), else its text. */
+  output?: unknown
+  /** The text the model read back. */
+  text?: string
+  isRunning: boolean
+  isErrored: boolean
+}
+
+/** One thing a run's transcript shows, parsed from its stream-json events. */
+export type RunItem =
+  | { kind: 'you'; text: string; duringTurn: boolean }
+  | { kind: 'text'; text: string }
+  | RunTool
+  | { kind: 'ask'; text: string }
+  | { kind: 'answer'; text: string }
+  | { kind: 'note'; text: string; tone: 'info' | 'warn' | 'error' }
+  | { kind: 'done'; ok: boolean; text: string }
+
 declare module 'claude-code' {
   interface PluginState {
     'proxy-runs': {
@@ -19,8 +43,9 @@ declare module 'claude-code' {
       told: Record<string, string>
       selected: string
       problem: string
-      lines: StateFamily<string[]>
+      items: StateFamily<RunItem[]>
       expanded: StateFamily<boolean>
+      group: StateFamily<boolean>
     }
   }
 }
