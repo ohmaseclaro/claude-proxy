@@ -46,6 +46,7 @@ declare module 'claude-code' {
       items: StateFamily<RunItem[]>
       expanded: StateFamily<boolean>
       group: StateFamily<boolean>
+      talking: string
     }
   }
 }

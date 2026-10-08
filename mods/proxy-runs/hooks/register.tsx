@@ -51,6 +51,9 @@ const problem = atom({ plugin: 'proxy-runs', key: 'problem' } as const, '')
 const itemsOf = atom({ plugin: 'proxy-runs', key: 'items' } as const, [])
 const expandedOf = atom({ plugin: 'proxy-runs', key: 'expanded' } as const, false)
 const openOf = atom({ plugin: 'proxy-runs', key: 'group' } as const, false)
+const talking = atom({ plugin: 'proxy-runs', key: 'talking' } as const, '')
+/** Where a prompt the person typed comes from; a desktop session's arrive through the SDK. */
+const TYPED = ['composer', 'sdk', 'bridge']
 
 type Engine = EngineInterface
 type Input = {
@@ -376,7 +379,6 @@ async function block($: Engine, els: ElementTable, run: ProxyRunsRun, b: Block, 
 
 function askControls($: Engine, els: ElementTable, run: ProxyRunsRun, suffix: string): RenderElement[] {
   const { Box, Button } = els
-  const Field = 'Input' in els ? els.Input : undefined
   return [
     <Box gap={1}>
       <Button key={`allow${suffix}`} variant="primary" onPress={() => act($, ['allow', run.id], run.id)}>
@@ -388,18 +390,26 @@ function askControls($: Engine, els: ElementTable, run: ProxyRunsRun, suffix: st
       <Button key={`deny${suffix}`} onPress={() => act($, ['deny', run.id], run.id)}>
         Deny
       </Button>
+      <Button key={`answer${suffix}`} onPress={() => talkTo($, run.id)}>
+        Answer
+      </Button>
     </Box>,
-    ...(Field
-      ? [
-          <Field
-            key={`answer${suffix}`}
-            label="answer: "
-            placeholder="one answer per question, separated by |"
-            onSubmit={text => act($, ['answer', run.id, ...text.split('|').map(s => s.trim())], run.id)}
-          />,
-        ]
-      : []),
   ]
+}
+
+/** Points the prompt box at a run: what the person types next goes to it. */
+async function talkTo($: Engine, id: string): Promise<void> {
+  await update($, talking, () => id)
+  await update($, selected, () => id)
+  await $.ui.open({ id: PANE, title: 'Runs' })
+}
+
+async function deliver($: Engine, id: string, argv: string[], what: string): Promise<string> {
+  const ran = await cli($, argv)
+  void refresh($, id).catch(() => undefined)
+  if (ran?.exitCode === 0) return `${what} → run ${id}`
+  const why = ran ? ran.stderr.trim().split('\n')[0] : `cannot start ${BIN} from this session`
+  return `Not sent to run ${id}: ${why}`
 }
 
 /** The engine's own row for a run's call: the ToolUse being drawn, with the call's props. */
@@ -447,6 +457,7 @@ async function card($: Engine, els: ElementTable, id: string, row: Row, opts: Ca
         <Box gap={1}>
           <Text bold>{run.name ?? `Run ${run.id}`}</Text>
           <Text dimColor>{meta}</Text>
+          <Button key={`reply:${id}`} plain dimColor label="Reply" onPress={() => talkTo($, id)} />
         </Box>
       )}
       {issue && <Text color="yellow">{issue}</Text>}
@@ -586,7 +597,55 @@ export const register: Register = on => {
 
   on('prompt.submit', async ($, e, next) => {
     await markSession($)
-    return next(e)
+    const id = await read($, talking)
+    if (!id || !TYPED.includes(e.origin.kind)) return next(e)
+    const run = (await read($, runs)).find(r => r.id === id)
+    const question = run?.state === 'waiting' && run.asks.some(a => a.tool === 'AskUserQuestion')
+    const argv = question ? ['answer', id, ...e.text.split('|').map(s => s.trim())] : ['send', id, e.text]
+    const said = await deliver($, id, argv, question ? 'Answered' : 'Sent')
+    return { drop: e.attachments?.length ? `${said} (text only; attachments are not sent to runs)` : said }
+  })
+
+  // Skills and custom commands typed while talking to a run run in that run.
+  on('command.run', async ($, e, next) => {
+    const id = await read($, talking)
+    if (!id || e.command === 'runs' || !TYPED.includes(e.origin.kind)) return next(e)
+    const info = (await $.command.list()).find(c => c.name === e.command)
+    if (!info || info.source === 'builtin' || info.plugin === 'proxy-runs') return next(e)
+    const text = `/${e.command}${e.args ? ` ${e.args}` : ''}`
+    return { text: await deliver($, id, ['send', id, text], text) }
+  })
+
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    const id = await read($, talking)
+    const run = id ? (await read($, runs)).find(r => r.id === id) : undefined
+    if (!run || e.props.hasSurvey) return next(e)
+    const els = $.ui.resolve(e)
+    const { Box, Text, Button } = els
+    const ask = run.asks[0]
+    return (
+      <Box flexDirection="column">
+        <Box gap={1}>
+          <Text color="cyan">↳</Text>
+          <Text>Talking to</Text>
+          <Text bold>{run.name ?? run.id}</Text>
+          <Text dimColor>
+            {run.id} · {run.state} on {run.account}
+          </Text>
+          <Button key="back" plain dimColor label="Back to this chat" onPress={() => update($, talking, () => '')} />
+        </Box>
+        {ask ? (
+          <Text color="yellow" wrap="truncate-end">
+            ? asks to use {ask.tool}: {summary(ask.tool, ask.input)}
+          </Text>
+        ) : run.activity && ACTIVE.includes(run.state) ? (
+          <Text dimColor wrap="truncate-end">
+            {run.activity}
+          </Text>
+        ) : null}
+        {run.state === 'waiting' && askControls($, els, run, ':band')}
+      </Box>
+    )
   })
 
   on('session.end', async ($, e, next) => {
@@ -673,46 +732,58 @@ export const register: Register = on => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const els = $.ui.resolve(e)
     const { Box, Text, Button } = els
-    const list = await read($, runs)
-    const pick = (await read($, selected)) || list.at(-1)?.id || ''
+    const all = await read($, runs)
+    const list = [...all.filter(r => ACTIVE.includes(r.state)), ...all.filter(r => !ACTIVE.includes(r.state))]
+    const pick = (await read($, selected)) || list[0]?.id || ''
     const run = list.find(r => r.id === pick)
-    const room = Math.max(3, Math.floor(((e.viewport?.rows ?? 24) - list.length - 10) / 2))
-    const Field = 'Input' in els ? els.Input : undefined
+    const now = await read($, talking)
+    const room = Math.max(3, Math.floor(((e.viewport?.rows ?? 24) - 8) / 3))
+    const name = (r: ProxyRunsRun) => `${r.name ?? r.id} · ${r.state}`
     const body = run
       ? await card($, els, run.id, (t, active) => plainRow($, els, run.id, t, active), { inPane: true, room })
       : null
     return (
       <Box flexDirection="column">
-        {list.length === 0 && <Text dimColor>No runs this session.</Text>}
-        {list.map(r => (
-          <Button
-            key={`pick:${r.id}`}
-            plain
-            dimColor={r.id !== pick}
-            label={`${r.id} ${r.state.padEnd(7)} ${r.account}  ${r.name ?? r.activity ?? ''}`}
-            onPress={() => update($, selected, () => r.id)}
-          />
-        ))}
+        {list.length === 0 && <Text dimColor>No runs in this session. Ask Claude to delegate something.</Text>}
+        {list.length > 0 &&
+          ('Select' in els ? (
+            <els.Select
+              key="pick"
+              options={list.map(r => ({ value: r.id, label: name(r) }))}
+              value={pick}
+              onSelect={id => update($, selected, () => id)}
+            />
+          ) : (
+            list.map(r => (
+              <Button
+                key={`pick:${r.id}`}
+                plain
+                dimColor={r.id !== pick}
+                label={name(r)}
+                onPress={() => update($, selected, () => r.id)}
+              />
+            ))
+          ))}
+        {run && (
+          <Box gap={1} marginTop={1}>
+            <Button
+              key="reply"
+              variant={now === run.id ? 'primary' : undefined}
+              onPress={() => (now === run.id ? update($, talking, () => '') : talkTo($, run.id))}
+            >
+              {now === run.id ? 'Talking to it' : 'Talk to it'}
+            </Button>
+            {ACTIVE.includes(run.state) && (
+              <Button key="kill" onPress={() => act($, ['kill', run.id], run.id)}>
+                Stop
+              </Button>
+            )}
+          </Box>
+        )}
         {run && (
           <Box flexDirection="column" marginTop={1}>
             {body}
-            {Field && (
-              <Field
-                key="send"
-                label="send: "
-                placeholder="message the run"
-                submitLabel="send"
-                onSubmit={text => act($, ['send', run.id, text], run.id)}
-              />
-            )}
-            <Box>
-              {ACTIVE.includes(run.state) && (
-                <Button key="kill" onPress={() => act($, ['kill', run.id], run.id)}>
-                  kill
-                </Button>
-              )}
-              <Text dimColor> take over: claude-proxy attach {run.id}</Text>
-            </Box>
+            <Text dimColor>take over in a terminal: claude-proxy attach {run.id}</Text>
           </Box>
         )}
       </Box>

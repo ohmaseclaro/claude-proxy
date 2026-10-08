@@ -168,6 +168,59 @@ test('built-in agent types are not passed as --agent', async ($, on) => {
   expect(w.argvs.find(a => a[1] === 'run')).toEqual(['claude-proxy', 'run', '-', '--json', '--name', 'look'])
 })
 
+const picked = (select: { props: Record<string, unknown> } | undefined) =>
+  (select?.props.options as { label: string }[] | undefined)?.map(o => o.label)
+
+const BAND = { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 80, scroll: { offset: 0, bodyRows: 10 }, view: {} } as never
+const typed = (text: string) => ({ text, origin: { kind: 'composer' as const }, wait: false }) as never
+const command = (name: string, args = '') => ({ command: name, args, origin: { kind: 'composer' } }) as never
+
+test('talking to a run: the prompt box sends to it and its skills run there', async ($, on) => {
+  const w = world(on)
+  on('command.list', () => ({
+    value: [
+      { name: 'gsd-progress', description: '', source: 'user' },
+      { name: 'compact', description: '', source: 'builtin' },
+    ],
+  }) as never)
+  on('command.run', ($, e) => ({ text: `ran ${e.command} here` }) as never)
+  on('prompt.submit', ($, e) => ({ text: e.text }) as never)
+  await start($)
+  await $.tool.call({ tool: TOOL, tool_use_id: 'tu1', prompt: 'p', description: 'say ok' })
+  const pane = await $.ui.mount({ plugin: 'proxy-runs', surface: 'desktop', component: 'Pane', requestId: 'runs', props: { title: 'Runs', isFocused: true, bodyColumns: 80, placement: 'dock' } as never })
+  await pane.press({ key: 'reply' })
+  expect((await pane.find({ key: 'reply' }))?.text).toBe('Talking to it')
+  const band = await $.ui.mount({ plugin: 'proxy-runs', surface: 'desktop', component: 'AbovePrompt', requestId: 'band', props: BAND })
+  expect(await band.find({ type: 'Text', text: 'say ok' })).toBeDefined()
+  w.argvs = []
+  expect((await $.prompt.submit(typed('also check b'))).drop).toBe('Sent → run abc123')
+  expect(w.argvs.find(a => a[1] === 'send')).toEqual(['claude-proxy', 'send', 'abc123', 'also check b'])
+  w.argvs = []
+  expect((await $.command.run(command('gsd-progress', '--brief'))).text).toBe('/gsd-progress --brief → run abc123')
+  expect(w.argvs.find(a => a[1] === 'send')).toEqual(['claude-proxy', 'send', 'abc123', '/gsd-progress --brief'])
+  expect((await $.command.run(command('compact'))).text).toBe('ran compact here')
+  const own = await $.prompt.submit({ text: 'x', origin: { kind: 'plugin', name: 'proxy-runs' }, wait: false } as never)
+  expect(own.text).toBe('x')
+  await band.press({ key: 'back' })
+  expect((await $.prompt.submit(typed('hi'))).text).toBe('hi')
+  await band.unmount()
+  await pane.unmount()
+})
+
+test('talking to a run that asks a question answers it', async ($, on) => {
+  const w = world(on)
+  on('prompt.submit', ($, e) => ({ text: e.text }) as never)
+  w.status = { ...RUN, state: 'waiting', asks: [{ tool: 'AskUserQuestion', input: { questions: [{ question: 'Color?' }] } }] }
+  await start($)
+  await $.tool.call({ tool: TOOL, tool_use_id: 'tu1', prompt: 'p', description: 'say ok' })
+  const row = await $.ui.mount({ plugin: 'proxy-runs', surface: 'desktop', component: 'ToolUse', requestId: 'tu1', props: toolUse('tu1') })
+  await row.press({ key: 'answer:abc123' })
+  w.argvs = []
+  expect((await $.prompt.submit(typed('Blue | Small'))).drop).toBe('Answered → run abc123')
+  expect(w.argvs.find(a => a[1] === 'answer')).toEqual(['claude-proxy', 'answer', 'abc123', 'Blue', 'Small'])
+  await row.unmount()
+})
+
 const toolUse = (tool_use_id: string, extra: object = {}) => ({
   tool_use_id,
   tool: TOOL,
@@ -319,7 +372,7 @@ test('the Runs pane lists runs and its buttons call the right command', async ($
       requestId: 'runs',
       props: { title: 'Runs', isFocused: true, bodyColumns: 80, placement: 'dock' } as never,
     })
-    expect((await ui.find({ key: 'pick:abc123' }))?.text).toContain('waiting')
+    expect(picked(await ui.find({ key: 'pick' }))).toEqual(['say ok · waiting'])
     await ui.press({ key: 'group:abc123:t1' })
     await ui.press({ key: 'tool:abc123:t1' })
     expect((await ui.find({ type: 'Code' }))?.text).toBe('$ ls\na\nb')
@@ -331,9 +384,6 @@ test('the Runs pane lists runs and its buttons call the right command', async ($
     w.argvs = []
     await ui.press({ key: 'kill' })
     expect(w.argvs[0]).toEqual(['claude-proxy', 'kill', 'abc123'])
-    w.argvs = []
-    await ui.input({ key: 'answer', text: 'Blue | Small' })
-    expect(w.argvs[0]).toEqual(['claude-proxy', 'answer', 'abc123', 'Blue', 'Small'])
     await ui.unmount()
   }
 })
@@ -370,7 +420,7 @@ test('without process access the pane reads the run files and says why', async (
       requestId: 'runs',
       props: { title: 'Runs', isFocused: true, bodyColumns: 80, placement: 'dock' } as never,
     })
-    expect((await ui.find({ key: 'pick:abc123' }))?.text).toContain('working')
+    expect(picked(await ui.find({ key: 'pick' }))).toEqual(['say ok · working'])
     expect(await ui.find({ type: 'Text', text: /cannot start claude-proxy/ })).toBeDefined()
     expect((await ui.find({ key: 'group:abc123:t1' }))?.text).toContain('Ran 2 commands')
     await ui.press({ key: 'kill' })

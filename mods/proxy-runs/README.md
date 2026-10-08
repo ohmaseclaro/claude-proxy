@@ -27,11 +27,18 @@ A Claude Code mod (function-hooks plugin, Claude Code 2.1.287+) that makes
 - **The notice reads as one line.** The prompt the mod submits when a run
   finishes is drawn as `✓ <name> finished · <id> on <account>` and the run's
   answer as Markdown, not the raw `<run-result>` text the model reads.
-- **A Runs pane.** `/runs` opens it: this session's runs, the selected run's
-  transcript, and allow / allow always / deny / answer / send / kill, plus the
-  `claude-proxy attach <id>` line to take one over. The pane cannot borrow
-  Claude's tool rows, so its calls are the mod's own: a title that opens to
-  the command and its output, or the edit as a diff.
+- **A Runs pane.** `/runs` opens it. A run picker (a native dropdown where the
+  surface has one) stays at the top; under it, Talk to it / Stop, then the run's
+  transcript with its asks (Allow / Always allow / Deny / Answer). The pane cannot
+  borrow Claude's tool rows, so its calls are the mod's own: a title that opens
+  to the command and its output, or the edit as a diff.
+- **Talk to a run from the prompt box.** Talk to it (pane), Reply (a run's row)
+  or Answer (an ask) points Claude's own prompt box at that run, and a band above
+  the prompt says which run, with Back to this chat. While it does, what you
+  type is sent to the run (`claude-proxy send`), or answers its question
+  (`claude-proxy answer`, `|` between answers); your skills and custom commands
+  (`/name args`) are sent to the run as typed, so they run there. Built-in
+  commands stay in this session. Attachments are not sent.
 - **A status line.** `2 runs · 1 waiting` while any run is active.
 - **Notifications without polling.** At session start the mod follows
   `claude-proxy events --mine`. When a run it started finishes, fails, is
