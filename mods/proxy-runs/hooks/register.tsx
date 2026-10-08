@@ -228,7 +228,7 @@ async function poll($: Engine, session: string): Promise<void> {
 }
 
 async function watch($: Engine, session: string): Promise<void> {
-  const all = await cli($, ['runs', '--json'])
+  const all = await cli($, ['runs', '--json', '--all'])
   if (all === undefined) return poll($, session)
   if (all.exitCode === 0) {
     const list = (JSON.parse(all.stdout) as ProxyRunsRun[]).filter(r => r.session === session)
