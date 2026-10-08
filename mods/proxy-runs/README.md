@@ -32,10 +32,10 @@ A Claude Code mod (function-hooks plugin, Claude Code 2.1.287+) that makes
   transcript with its asks (Allow / Always allow / Deny / Answer). The pane cannot
   borrow Claude's tool rows, so its calls are the mod's own: a title that opens
   to the command and its output, or the edit as a diff.
-- **Talk to a run from the prompt box.** Talk to it (pane), Reply (a run's row)
-  or Answer (an ask) points Claude's own prompt box at that run, and a band above
-  the prompt says which run, with Back to this chat. While it does, what you
-  type is sent to the run (`claude-proxy send`), or answers its question
+- **Talk to a run from the prompt box.** Message it (pane), Reply (a run's row)
+  or Answer (an ask) points Claude's own prompt box at that run for one message,
+  and a band above the prompt says which run, with Back to this chat. That
+  message is sent to the run (`claude-proxy send`), or answers its question
   (`claude-proxy answer`, `|` between answers); your skills and custom commands
   (`/name args`) are sent to the run as typed, so they run there. Built-in
   commands stay in this session. Attachments are not sent.

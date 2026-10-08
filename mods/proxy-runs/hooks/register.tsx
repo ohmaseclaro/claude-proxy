@@ -407,6 +407,7 @@ async function talkTo($: Engine, id: string): Promise<void> {
 async function deliver($: Engine, id: string, argv: string[], what: string): Promise<string> {
   const ran = await cli($, argv)
   void refresh($, id).catch(() => undefined)
+  await update($, talking, () => '')
   if (ran?.exitCode === 0) return `${what} → run ${id}`
   const why = ran ? ran.stderr.trim().split('\n')[0] : `cannot start ${BIN} from this session`
   return `Not sent to run ${id}: ${why}`
@@ -446,7 +447,14 @@ async function card($: Engine, els: ElementTable, id: string, row: Row, opts: Ca
   const limit = opts.room ?? SHOWN
   const shown = isExpanded ? all : all.slice(-limit)
   const body: RenderNode[] = []
-  for (const b of shown) body.push(await block($, els, run, b, b === all.at(-1), row))
+  for (const b of shown) {
+    const drawn = await block($, els, run, b, b === all.at(-1), row)
+    body.push(
+      <Box flexDirection="column" marginTop={body.length ? 1 : 0}>
+        {drawn}
+      </Box>,
+    )
+  }
   const issue = await read($, problem)
   const meta = `${run.id} · ${run.state} on ${run.account} · turn ${run.turns} · $${run.cost_usd.toFixed(2)}`
   return (
@@ -627,7 +635,7 @@ export const register: Register = on => {
       <Box flexDirection="column">
         <Box gap={1}>
           <Text color="cyan">↳</Text>
-          <Text>Talking to</Text>
+          <Text>Your next message goes to</Text>
           <Text bold>{run.name ?? run.id}</Text>
           <Text dimColor>
             {run.id} · {run.state} on {run.account}
@@ -771,7 +779,7 @@ export const register: Register = on => {
               variant={now === run.id ? 'primary' : undefined}
               onPress={() => (now === run.id ? update($, talking, () => '') : talkTo($, run.id))}
             >
-              {now === run.id ? 'Talking to it' : 'Talk to it'}
+              {now === run.id ? 'Next message goes here' : 'Message it'}
             </Button>
             {ACTIVE.includes(run.state) && (
               <Button key="kill" onPress={() => act($, ['kill', run.id], run.id)}>
