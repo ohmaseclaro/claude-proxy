@@ -48,9 +48,9 @@ blobs are far smaller.
 denies when it cannot record the ask, when the run is stopped, or when Claude
 exits. `allow --always` grants the exact Bash command, the WebFetch host (parsed
 without userinfo or port), or the tool, and refuses Bash commands containing
-`*`; use `--rule` to choose a pattern deliberately. Grants last for the run, in
-its `allowed` and `mode` files, until the run is removed; delete those files to
-revoke them.
+`*`, `(` or `)`, which a permission rule reads as syntax; use `--rule` to choose
+a pattern deliberately. Grants last for the run, in its `allowed` and `mode`
+files, until the run is removed; delete those files to revoke them.
 
 **Prompt injection.** Runs read untrusted content. A child run's output reaches
 whoever started it: as a message to a parent run (capped at 4000 characters)

@@ -144,7 +144,8 @@ enum Command {
     },
     /// Print the final answer of a run's last turn.
     Result { id: String },
-    /// Send a follow-up message; delivered when the current turn ends.
+    /// Send a follow-up message; sent while it works, Claude folds it into the
+    /// turn in progress.
     Send {
         id: String,
         /// The message. `-` reads it from stdin.
