@@ -418,7 +418,6 @@ fn a_permission_prompt_waits_for_allow_or_deny() {
         stdout(&out),
         r#"echo: {"behavior":"allow","updatedInput":{"command":"rm -rf build"}}"#
     );
-    // Nothing left to answer.
     assert!(!cp(&env, &["allow", &id]).status.success());
 
     assert!(cp(&env, &["send", &id, "ask again"]).status.success());
@@ -460,7 +459,6 @@ fn a_question_is_answered_with_answer() {
     let out = cp(&env, &["wait", &id, "--timeout", "30"]);
     assert_eq!(out.status.code(), Some(2));
     assert!(stdout(&out).contains("? Which colour?  [Red | Blue]"));
-    // One answer per question.
     assert!(!cp(&env, &["answer", &id, "a", "b"]).status.success());
     assert!(cp(&env, &["answer", &id, "blue"]).status.success());
     let out = cp(&env, &["wait", &id, "--timeout", "30"]);

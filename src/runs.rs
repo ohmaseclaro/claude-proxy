@@ -402,6 +402,7 @@ pub(crate) fn classify(s: &Signals) -> Option<Reason> {
         ) => Some(Reason::Auth),
         _ if s.rejected => Some(Reason::Limit),
         _ if s.not_logged_in => Some(Reason::Auth),
+        // Overloaded and server errors are not the account's fault: no failover.
         _ => None,
     }
 }
