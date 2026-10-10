@@ -27,13 +27,16 @@ pub fn install(source: &Path, bin_dir: &Path, label: &str) -> io::Result<PathBuf
     let dest = bin_dir.join(label);
     // Build under a temp name then rename, so an existing command (possibly
     // running) is replaced atomically.
-    let tmp = bin_dir.join(format!(".{label}.tmp"));
+    let tmp = bin_dir.join(format!(".{label}.{}.tmp", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
     let source = source
         .canonicalize()
         .unwrap_or_else(|_| source.to_path_buf());
     place(&source, &tmp)?;
-    std::fs::rename(&tmp, &dest)?;
+    if let Err(e) = std::fs::rename(&tmp, &dest) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     Ok(dest)
 }
 
@@ -102,5 +105,6 @@ mod tests {
         install(&v1, &bin, "p").unwrap();
         install(&v2, &bin, "p").unwrap();
         assert_eq!(std::fs::read(bin.join("p")).unwrap(), b"two");
+        assert_eq!(std::fs::read_dir(&bin).unwrap().count(), 1, "no temp left");
     }
 }

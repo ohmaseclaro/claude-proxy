@@ -228,10 +228,10 @@ fn rule_for(tool: &str, input: &Value) -> Result<String, String> {
     match tool {
         "Bash" => {
             let command = input["command"].as_str().unwrap_or("");
-            if command.contains('*') {
+            if command.contains(['*', '(', ')']) {
                 return Err(
-                    "a permission rule reads `*` as a wildcard, so --always would allow more \
-                     than this command"
+                    "a permission rule reads `*`, `(` and `)` as rule syntax, so --always could \
+                     allow more than this command"
                         .into(),
                 );
             }
@@ -424,7 +424,12 @@ mod tests {
             rule_for("Bash", &json!({"command": "cargo test -p x"})),
             Ok("Bash(cargo test -p x)".into())
         );
-        assert!(rule_for("Bash", &json!({"command": "rm -rf build/*"})).is_err());
+        for command in ["rm -rf build/*", "echo $(date)", "(cd x && make)"] {
+            assert!(
+                rule_for("Bash", &json!({ "command": command })).is_err(),
+                "{command}"
+            );
+        }
         for (url, host) in [
             ("https://docs.rs/serde/latest?x=1", "docs.rs"),
             ("https://user:pw@Docs.rs:443/x", "docs.rs"),

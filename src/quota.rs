@@ -121,14 +121,30 @@ fn weekly_used(r: &Report, now: i64) -> f64 {
 
 /// Reports for every account, fetched in parallel.
 pub fn reports(accounts: &[Account], force: bool) -> Vec<Report> {
+    reports_with(accounts, |a| report(a, force))
+}
+
+fn reports_with(accounts: &[Account], lookup: impl Fn(&Account) -> Report + Sync) -> Vec<Report> {
+    let lookup = &lookup;
     std::thread::scope(|s| {
         let handles: Vec<_> = accounts
             .iter()
-            .map(|a| s.spawn(move || report(a, force)))
+            .map(|a| s.spawn(move || lookup(a)))
             .collect();
         handles
             .into_iter()
-            .map(|h| h.join().expect("quota lookup thread panicked"))
+            .zip(accounts)
+            .map(|(h, a)| {
+                h.join().unwrap_or_else(|_| Report {
+                    label: a.label.clone(),
+                    primary: a.config_dir.is_none(),
+                    email: None,
+                    logged_in: true,
+                    windows: Vec::new(),
+                    fetched_at: None,
+                    error: Some("quota lookup failed".into()),
+                })
+            })
             .collect()
     })
 }
@@ -244,9 +260,9 @@ fn needs_refresh(doc: &Value, now: i64) -> bool {
 fn refresh_locked(account: &Account, source: &creds::Source, now: i64) -> Result<Value, String> {
     let lock_path = cache_path(&account.label).with_extension("lock");
     if let Some(parent) = lock_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        let _ = crate::paths::private_dir(parent);
     }
-    let lock = std::fs::File::create(&lock_path)
+    let lock = crate::paths::append(&lock_path)
         .map_err(|e| format!("could not create the refresh lock: {e}"))?;
     lock.lock()
         .map_err(|e| format!("could not take the refresh lock: {e}"))?;
@@ -477,7 +493,7 @@ fn write_cache(path: &Path, fetched_at: i64, usage: &Value) {
     let Some(parent) = path.parent() else {
         return;
     };
-    let _ = std::fs::create_dir_all(parent);
+    let _ = crate::paths::private_dir(parent);
     let body = json!({ "fetched_at": fetched_at, "usage": usage }).to_string();
     let _ = crate::paths::write_atomic(path, body.as_bytes(), 0o600);
 }
@@ -573,6 +589,25 @@ mod tests {
             fetched_at: None,
             error: None,
         }
+    }
+
+    #[test]
+    fn one_failed_lookup_does_not_sink_the_others() {
+        let accounts: Vec<Account> = ["a", "boom", "c"]
+            .into_iter()
+            .map(|label| Account {
+                label: label.into(),
+                config_dir: Some(PathBuf::from(label)),
+            })
+            .collect();
+        let got = reports_with(&accounts, |a| {
+            assert!(a.label != "boom", "lookup blew up");
+            report(&a.label, true, vec![])
+        });
+        let labels: Vec<&str> = got.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(labels, ["a", "boom", "c"]);
+        assert!(got[1].error.is_some() && got[1].logged_in);
+        assert!(got[0].error.is_none() && got[2].error.is_none());
     }
 
     #[test]

@@ -38,11 +38,11 @@ impl Registry {
 
     pub fn save_to(&self, path: &Path) -> io::Result<()> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            crate::paths::private_dir(parent)?;
         }
         let mut bytes = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
         bytes.push(b'\n');
-        std::fs::write(path, bytes)
+        crate::paths::write_atomic(path, &bytes, 0o600)
     }
 
     pub fn has(&self, label: &str) -> bool {
@@ -147,5 +147,12 @@ mod tests {
         r.add("work");
         r.save_to(&path).unwrap();
         assert_eq!(Registry::load_from(&path), r);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }
