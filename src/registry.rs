@@ -86,7 +86,7 @@ mod tests {
 
     #[test]
     fn valid_labels_are_safe_command_names() {
-        for ok in ["claude-gmail", "work", "acct.2", "a_b-c", "x"] {
+        for ok in ["claude-personal", "work", "acct.2", "a_b-c", "x"] {
             assert!(valid_label(ok), "{ok} should be valid");
         }
         for bad in [
@@ -108,18 +108,22 @@ mod tests {
     fn add_is_sorted_and_idempotent() {
         let mut r = Registry::default();
         r.add("work");
-        r.add("gmail");
-        assert_eq!(r.labels, vec!["gmail", "work"], "kept sorted");
-        r.add("gmail");
-        assert_eq!(r.labels, vec!["gmail", "work"], "adding twice is a no-op");
+        r.add("personal");
+        assert_eq!(r.labels, vec!["personal", "work"], "kept sorted");
+        r.add("personal");
+        assert_eq!(
+            r.labels,
+            vec!["personal", "work"],
+            "adding twice is a no-op"
+        );
     }
 
     #[test]
     fn remove_drops_the_label() {
         let mut r = Registry::default();
-        r.add("gmail");
+        r.add("personal");
         r.add("work");
-        r.remove("gmail");
+        r.remove("personal");
         assert_eq!(r.labels, vec!["work"]);
         r.remove("work");
         assert!(r.labels.is_empty());
@@ -139,7 +143,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("registry.json");
         let mut r = Registry::default();
-        r.add("gmail");
+        r.add("personal");
         r.add("work");
         r.save_to(&path).unwrap();
         assert_eq!(Registry::load_from(&path), r);

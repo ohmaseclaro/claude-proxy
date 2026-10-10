@@ -169,11 +169,11 @@ mod tests {
     #[test]
     fn proxy_env_sets_the_config_dir_and_clears_inherited_credentials() {
         let (set, unset) = split(proxy_env(Some(
-            "/home/me/.config/claude-proxy/accounts/gmail",
+            "/home/me/.config/claude-proxy/accounts/personal",
         )));
         assert_eq!(
             set.get("CLAUDE_CONFIG_DIR").map(String::as_str),
-            Some("/home/me/.config/claude-proxy/accounts/gmail")
+            Some("/home/me/.config/claude-proxy/accounts/personal")
         );
         // No credential is injected; any inherited one is cleared so the
         // account's own stored login is what claude uses.

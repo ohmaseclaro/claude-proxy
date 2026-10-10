@@ -5,7 +5,7 @@
 //!
 //! - invoked as **`claude-proxy`**: the manager (`add`, `list`, `auto`, `run`,
 //!   …);
-//! - invoked as **any other name** (e.g. `claude-gmail`, installed by `add`):
+//! - invoked as **any other name** (e.g. `claude-personal`, installed by `add`):
 //!   the proxy — become `claude` on that account's own profile.
 
 mod add;
@@ -66,7 +66,7 @@ fn main() {
 }
 
 /// The file name a path was invoked under, lossily, without extension noise
-/// (`claude-gmail.exe` → `claude-gmail`).
+/// (`claude-personal.exe` → `claude-personal`).
 fn basename(arg: &OsString) -> String {
     let path = PathBuf::from(arg);
     path.file_stem()
@@ -89,8 +89,11 @@ mod tests {
         assert_eq!(name_of("claude-proxy"), MANAGER_NAME);
         assert_eq!(name_of("./target/release/claude-proxy"), MANAGER_NAME);
         // An installed proxy routes to the proxy role.
-        assert_eq!(name_of("/home/me/.local/bin/claude-gmail"), "claude-gmail");
+        assert_eq!(
+            name_of("/home/me/.local/bin/claude-personal"),
+            "claude-personal"
+        );
         // The `.exe` suffix is dropped so a Windows label still matches.
-        assert_eq!(name_of("claude-gmail.exe"), "claude-gmail");
+        assert_eq!(name_of("claude-personal.exe"), "claude-personal");
     }
 }

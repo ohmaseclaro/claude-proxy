@@ -6,8 +6,8 @@ its own Claude profile — and let `claude-proxy auto` send work to whichever
 account has the most quota left.
 
 ```console
-$ claude-proxy add claude-gmail     # creates a profile, logs it in, installs a `claude-gmail` command
-$ claude-gmail                       # a full Claude Code session on that account
+$ claude-proxy add claude-personal  # creates a profile, logs it in, installs a `claude-personal` command
+$ claude-personal                   # a full Claude Code session on that account
 $ claude-proxy list                  # every account and its remaining quota
 $ claude-proxy auto -p "fix the test"  # runs on the account with the most room
 $ claude                             # your original login is untouched
@@ -15,7 +15,7 @@ $ claude                             # your original login is untouched
 
 One binary. The name you invoke it under decides what it does: run it as
 `claude-proxy` and it is the manager; run it as any command it installed
-(`claude-gmail`, `work`, …) and it becomes `claude` for that account.
+(`claude-personal`, `work`, …) and it becomes `claude` for that account.
 
 ## Why
 
@@ -54,32 +54,32 @@ export PATH="$HOME/.local/bin:$PATH"
 ### Add an account
 
 ```console
-$ claude-proxy add claude-gmail
+$ claude-proxy add claude-personal
 ```
 
 This creates an isolated profile and opens **Claude's own login** inside it. Log
 in with the account you want this command to use, then type `/exit`.
-`claude-proxy` confirms the login landed and installs the `claude-gmail`
+`claude-proxy` confirms the login landed and installs the `claude-personal`
 command. Each `add` is a separate account — log in as a different one each time.
 
 ### Use one account
 
-`claude-gmail` is a transparent proxy — everything after the name goes to
+`claude-personal` is a transparent proxy — everything after the name goes to
 `claude` verbatim:
 
 ```console
-$ claude-gmail                       # interactive session
-$ claude-gmail -p "fix the failing test"
-$ claude-gmail /status               # shows this account
+$ claude-personal                       # interactive session
+$ claude-personal -p "fix the failing test"
+$ claude-personal /status               # shows this account
 ```
 
 ### See every account's quota
 
 ```console
 $ claude-proxy list
-  claude (primary)  you@example.com  5h 40% (2h10m) · 7d 61% (3d4h)
-→ claude-gmail      you@gmail.com    5h 17% (3h34m) · 7d 22% (3d13h)
-  claude-work       me@work.com      5h 0% · 7d 95% (4d8h)
+  claude (primary)  you@example.com       5h 40% (2h10m) · 7d 61% (3d4h)
+→ claude-personal   personal@example.com  5h 17% (3h34m) · 7d 22% (3d13h)
+  claude-work       work@example.com      5h 0% · 7d 95% (4d8h)
 
 → = what `claude-proxy auto` would use · (…) = time to reset · cached 15 min (--refresh to update)
 ```
@@ -91,7 +91,7 @@ primary `~/.claude` login is listed and used too, whenever it is logged in.
 
 ```console
 $ claude-proxy auto -p "summarize the failing tests"
-claude-proxy: auto → claude-gmail (5h 17% (3h34m) · 7d 22% (3d13h))
+claude-proxy: auto → claude-personal (5h 17% (3h34m) · 7d 22% (3d13h))
 …
 ```
 
@@ -115,7 +115,7 @@ $ id=$(claude-proxy run "fix the failing test in src/parser.rs" -- --permission-
 $ claude-proxy watch $id                 # follow it live until it stops working
 ▶ you
   fix the failing test in src/parser.rs
-● claude-gmail · turn 1
+● claude-personal · turn 1
   ⚙ Bash  cargo test parser
     ↳ test result: FAILED. 11 passed; 1 failed  (+38 lines)
   ⚙ Edit  src/parser.rs
@@ -215,7 +215,7 @@ Live usage that Claude reports during a run updates that account's quota for
 ### Remove an account
 
 ```console
-$ claude-proxy remove claude-gmail
+$ claude-proxy remove claude-personal
 ```
 
 This removes the command. The account's profile (and its login) is kept;

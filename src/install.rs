@@ -1,7 +1,7 @@
 //! Making a proxy a command you can type anywhere.
 //!
 //! `add` links this very binary into the user's bin directory under the proxy
-//! name, which makes `claude-gmail` a first-class command on `$PATH` in every
+//! name, which makes `claude-personal` a first-class command on `$PATH` in every
 //! shell. When invoked under that name, `main` sees it in `argv[0]` and runs as
 //! the proxy. A symlink, not a copy, so upgrading `claude-proxy` upgrades every
 //! proxy command with it (a copy would keep running the version it was added
@@ -74,8 +74,8 @@ mod tests {
         std::fs::write(&src, b"#!/bin/sh\necho hi\n").unwrap();
         let bin = dir.path().join("bin");
 
-        let dest = install(&src, &bin, "claude-gmail").unwrap();
-        assert_eq!(dest, bin.join("claude-gmail"));
+        let dest = install(&src, &bin, "claude-personal").unwrap();
+        assert_eq!(dest, bin.join("claude-personal"));
         assert_eq!(std::fs::read(&dest).unwrap(), b"#!/bin/sh\necho hi\n");
 
         // A link to the manager, so upgrading it upgrades the command.
@@ -85,10 +85,10 @@ mod tests {
             src.canonicalize().unwrap()
         );
 
-        uninstall(&bin, "claude-gmail").unwrap();
+        uninstall(&bin, "claude-personal").unwrap();
         assert!(std::fs::symlink_metadata(&dest).is_err());
         assert!(src.exists(), "uninstall removes the link, not the manager");
-        uninstall(&bin, "claude-gmail").unwrap(); // absent is fine
+        uninstall(&bin, "claude-personal").unwrap(); // absent is fine
     }
 
     #[test]

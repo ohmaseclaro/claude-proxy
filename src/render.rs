@@ -353,8 +353,10 @@ mod tests {
             ["▶ you", "  fix the tests"]
         );
         assert_eq!(
-            r(r#"{"type":"claude_proxy","event":"turn_start","turn":2,"account":"claude-gmail"}"#),
-            ["● claude-gmail · turn 2"]
+            r(
+                r#"{"type":"claude_proxy","event":"turn_start","turn":2,"account":"claude-personal"}"#
+            ),
+            ["● claude-personal · turn 2"]
         );
         assert_eq!(
             r(r#"{"type":"assistant","message":{"content":[

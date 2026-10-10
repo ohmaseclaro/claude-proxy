@@ -33,7 +33,7 @@ struct Cli {
 enum Command {
     /// Create an isolated profile, sign it in, and install it as a command.
     Add {
-        /// The command name to create (e.g. `claude-gmail`).
+        /// The command name to create (e.g. `claude-personal`).
         label: String,
     },
     /// List every account with its remaining quota (cached for 15 minutes).

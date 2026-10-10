@@ -46,10 +46,10 @@ mod tests {
 
     #[test]
     fn account_dir_is_under_the_config_dir_and_label_scoped() {
-        let a = account_config_dir("gmail");
+        let a = account_config_dir("personal");
         let b = account_config_dir("work");
         assert!(a.starts_with(config_dir()));
-        assert!(a.ends_with("accounts/gmail"));
+        assert!(a.ends_with("accounts/personal"));
         assert_ne!(a, b);
     }
 }
