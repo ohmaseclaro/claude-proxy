@@ -1,15 +1,8 @@
-//! Where claude-proxy keeps its files, cross-platform.
-//!
-//! The registry lives directly under the config dir; each proxy's isolated
-//! Claude profile lives under `accounts/<label>`, and run transcripts, asks and
-//! answers under `runs/`. Everything written here is owner-only and atomic.
-
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// `~/.config/claude-proxy` (or `$XDG_CONFIG_HOME/claude-proxy`).
 pub fn config_dir() -> PathBuf {
     if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
         if !xdg.is_empty() {
@@ -19,16 +12,10 @@ pub fn config_dir() -> PathBuf {
     home().join(".config").join("claude-proxy")
 }
 
-/// The isolated Claude config directory for one proxy.
-///
-/// Each proxy gets its own, so its login, identity, settings, and transcripts
-/// never share state with the primary `~/.claude` login or with another proxy.
-/// `claude` is pointed here via `CLAUDE_CONFIG_DIR`.
 pub fn account_config_dir(label: &str) -> PathBuf {
     config_dir().join("accounts").join(label)
 }
 
-/// The user's home directory, cross-platform.
 pub fn home() -> PathBuf {
     if let Ok(h) = std::env::var("HOME") {
         if !h.is_empty() {
@@ -48,7 +35,6 @@ pub fn valid_id(s: &str) -> bool {
     !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
-/// Replace `path` through a temp created with `mode`, unique per process and call.
 pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
     static WRITES: AtomicUsize = AtomicUsize::new(0);
     let name = path.file_name().unwrap_or_default().to_string_lossy();
@@ -76,7 +62,6 @@ pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()>
     result
 }
 
-/// Open `path` for appending, creating it owner-only.
 pub fn append(path: &Path) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
     options.create(true).append(true);
@@ -88,9 +73,8 @@ pub fn append(path: &Path) -> std::io::Result<File> {
     options.open(path)
 }
 
-/// Create `dir` owner-only, along with any missing claude-proxy dirs above it,
-/// and tighten those that already exist. Nothing above the config dir is
-/// touched.
+/// Also creates or tightens the claude-proxy dirs above `dir`; nothing above the
+/// config dir is touched.
 pub fn private_dir(dir: &Path) -> std::io::Result<()> {
     let root = config_dir();
     let mut chain: Vec<&Path> = dir.ancestors().filter(|p| p.starts_with(&root)).collect();

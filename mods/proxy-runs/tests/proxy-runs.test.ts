@@ -246,7 +246,6 @@ test('the tool row draws the run like Claude: text, native rows, folded groups',
     expect(await ui.find({ type: 'Markdown', text: 'Looking **around**.' })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: '› (while it works) show b too' })).toBeDefined()
     expect((await ui.find({ key: 'group:abc123:t1' }))?.text).toContain('Ran 2 commands, read 1 file')
-    // The live group shows its running call; opened, all three, each the engine's own row.
     const rows = () => ui.findAll({ type: 'Text', text: /^row:ToolUse:/ })
     expect((await rows()).map(r => r.text)).toEqual(['row:ToolUse:Bash:running'])
     await ui.press({ key: 'group:abc123:t1' })

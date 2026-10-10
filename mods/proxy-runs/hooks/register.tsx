@@ -404,7 +404,6 @@ function askControls($: Engine, els: ElementTable, run: ProxyRunsRun, suffix: st
   ]
 }
 
-/** Points the prompt box at a run: what the person types next goes to it. */
 async function talkTo($: Engine, id: string): Promise<void> {
   await update($, talking, () => id)
   await update($, selected, () => id)
@@ -420,7 +419,6 @@ async function deliver($: Engine, id: string, argv: string[], what: string): Pro
   return `Not sent to run ${id}: ${why}`
 }
 
-/** The engine's own row for a run's call: the ToolUse being drawn, with the call's props. */
 function nativeRow($: Engine, e: RenderInput<'ToolUse'>, next: (e: RenderInput<'ToolUse'>) => Promise<RenderElement>, els: ElementTable, id: string): Row {
   return (t, active) =>
     next({
@@ -439,7 +437,6 @@ function nativeRow($: Engine, e: RenderInput<'ToolUse'>, next: (e: RenderInput<'
 
 type CardOpts = { inPane?: boolean; room?: number }
 
-/** A run as the transcript draws it: header, then its blocks, newest last. */
 async function card($: Engine, els: ElementTable, id: string, row: Row, opts: CardOpts = {}): Promise<RenderElement> {
   const { Box, Text, Button } = els
   const run = (await read($, runs)).find(r => r.id === id)
@@ -690,7 +687,6 @@ export const register: Register = on => {
     })
   }
 
-  // A run started through Bash gets the same card under the command's own row.
   on('ui.render', { component: 'ToolUse', props: { tool: 'Bash' } }, async ($, e, next) => {
     const command = str((e.props.input as { command?: unknown } | null)?.command)
     const id = RUN_COMMAND.test(command) ? idIn(e.props.output) : undefined
@@ -709,7 +705,6 @@ export const register: Register = on => {
     )
   })
 
-  // The finished/asking notice this mod submits, as one line and the run's answer.
   on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
     const { origin, text, isExpanded } = e.props
     if (origin.kind !== 'plugin' || origin.name !== 'proxy-runs') return next(e)

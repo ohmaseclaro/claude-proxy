@@ -1,11 +1,3 @@
-//! The manager: `claude-proxy <subcommand>`.
-//!
-//! This is the role the binary takes when invoked under its own name. `add`
-//! creates an account's isolated profile and signs it in, `list` shows every
-//! account with its remaining quota, `auto` runs Claude on whichever account has
-//! the most room, `remove` uninstalls a command. Running one specific account is
-//! the *other* role (`proxy`), reached by invoking its installed command.
-
 use std::ffi::OsString;
 use std::io::IsTerminal;
 
@@ -221,10 +213,7 @@ enum Command {
     Hook { event: String },
 }
 
-/// Entry point for the manager role. Returns a process exit code.
 pub fn main() -> i32 {
-    // `parse` exits the process itself on `--help`, `--version`, or a usage
-    // error, so anything past here is a real subcommand.
     let cli = Cli::parse();
     match dispatch(cli.command) {
         Ok(code) => code,

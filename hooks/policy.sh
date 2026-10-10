@@ -1,7 +1,5 @@
 #!/bin/sh
-# Prints the delegation policy into each session's context, then the session's
-# runs still going (after a resume or compaction). Silent inside a managed run,
-# when claude-proxy is not installed, or with CLAUDE_PROXY_POLICY=off.
+# The delegation policy, then the session's runs still going (after a resume or compaction).
 [ -n "$CLAUDE_PROXY_RUN" ] && exit 0
 [ "$CLAUDE_PROXY_POLICY" = "off" ] && exit 0
 command -v claude-proxy >/dev/null 2>&1 || exit 0

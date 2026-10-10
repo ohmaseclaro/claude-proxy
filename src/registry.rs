@@ -1,8 +1,3 @@
-//! The list of configured proxies and which one is the default.
-//!
-//! A small JSON file beside the config dir. It holds no secrets — only the list
-//! of proxy labels.
-
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -49,7 +44,6 @@ impl Registry {
         self.labels.iter().any(|l| l == label)
     }
 
-    /// Add a label (idempotent), keeping the list sorted.
     pub fn add(&mut self, label: &str) {
         if !self.has(label) {
             self.labels.push(label.to_string());
@@ -57,17 +51,14 @@ impl Registry {
         }
     }
 
-    /// Remove a label.
     pub fn remove(&mut self, label: &str) {
         self.labels.retain(|l| l != label);
     }
 }
 
-/// A proxy label must be a safe command name: it becomes a file in the user's
-/// bin and a Keychain service, so no slashes, spaces, or leading dash.
+/// A label becomes a file in the user's bin and a Keychain service. `claude` would
+/// shadow the real binary (the proxy would exec itself) and names the primary profile.
 pub fn valid_label(label: &str) -> bool {
-    // `claude` would shadow the real binary (the proxy would exec itself) and
-    // names the primary profile in `list`/`auto`.
     !matches!(label, "claude" | "claude-proxy")
         && !label.is_empty()
         && label.len() <= 64
@@ -127,7 +118,6 @@ mod tests {
         assert_eq!(r.labels, vec!["work"]);
         r.remove("work");
         assert!(r.labels.is_empty());
-        // Removing an absent label is a no-op.
         r.remove("nope");
     }
 

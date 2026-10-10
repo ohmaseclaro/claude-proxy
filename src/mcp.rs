@@ -1,7 +1,5 @@
-//! MCP servers for profiles. Claude keeps user- and local-scope MCP servers in
-//! `~/.claude.json`, which holds the login too and so cannot be shared; a
-//! profile would start with none. Each launch passes the primary's servers to
-//! Claude with `--mcp-config` instead.
+//! `~/.claude.json` holds the login, so it cannot be shared with a profile; the primary's
+//! MCP servers are passed with `--mcp-config` instead.
 
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -11,7 +9,6 @@ use serde_json::{json, Map, Value};
 
 use crate::paths::{config_dir, home};
 
-/// The primary profile's user-scope servers plus the local-scope ones of `cwd`.
 pub fn user_servers(cwd: &Path) -> Map<String, Value> {
     servers_in(&home().join(".claude.json"), &cwd.to_string_lossy())
 }
@@ -30,13 +27,12 @@ fn servers_in(claude_json: &Path, cwd: &str) -> Map<String, Value> {
     servers
 }
 
-/// `--mcp-config=<file>` for these servers, written owner-only (server entries
-/// can carry API keys). The `=` form matters: Claude's flag is variadic and
-/// would swallow a following subcommand or argument.
+/// The `=` form matters: Claude's flag is variadic and would swallow the next argument.
 pub fn flag(file: &Path) -> String {
     format!("--mcp-config={}", file.display())
 }
 
+/// Owner-only: server entries can carry API keys.
 pub fn write(file: &Path, servers: Map<String, Value>) -> std::io::Result<()> {
     let bytes = serde_json::to_vec(&json!({"mcpServers": servers}))?;
     if fs::read(file).is_ok_and(|current| current == bytes) {
@@ -48,8 +44,7 @@ pub fn write(file: &Path, servers: Map<String, Value>) -> std::io::Result<()> {
     crate::paths::write_atomic(file, &bytes, 0o600)
 }
 
-/// A config file for an interactive launch, named by its contents so launches
-/// from different directories never overwrite each other's.
+/// Named by its contents so launches from different directories never overwrite each other's.
 pub fn shared_file(servers: &Map<String, Value>) -> PathBuf {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     Value::Object(servers.clone()).to_string().hash(&mut h);
