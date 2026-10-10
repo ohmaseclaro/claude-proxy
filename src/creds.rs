@@ -70,20 +70,8 @@ pub fn write(source: &Source, blob: &str) -> Result<(), String> {
 
 #[cfg(not(target_os = "macos"))]
 fn write_file_private(path: &Path, blob: &str) -> Result<(), String> {
-    use std::io::Write;
-    let tmp = path.with_extension("json.claude-proxy-tmp");
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let result = opts
-        .open(&tmp)
-        .and_then(|mut f| f.write_all(blob.as_bytes()))
-        .and_then(|()| std::fs::rename(&tmp, path));
-    result.map_err(|e| format!("could not write {}: {e}", path.display()))
+    crate::paths::write_atomic(path, blob.as_bytes(), 0o600)
+        .map_err(|e| format!("could not write {}: {e}", path.display()))
 }
 
 #[cfg(target_os = "macos")]

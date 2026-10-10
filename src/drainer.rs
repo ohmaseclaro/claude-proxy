@@ -15,7 +15,7 @@
 //! messages queued by then wait for the next `send`.
 
 use std::collections::{HashSet, VecDeque};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin};
@@ -27,9 +27,9 @@ use serde_json::{json, Value};
 use crate::asks;
 use crate::quota::{self, now_secs};
 use crate::runs::{
-    classify, enqueue_first, first_account, inbox_names, load, lock_file, marker, next_account,
-    notify_parent, observe, parse_pool, queued, request_drainer, run_dir, save, session_len,
-    signal_group, take_inbox, turn_command, Meta, Reason, Signals, State,
+    classify, enqueue_first, excerpt, first_account, inbox_names, load, lock_file, marker,
+    next_account, notify_parent, observe, parse_pool, queued, request_drainer, run_dir,
+    session_len, signal_group, take_inbox, turn_command, Meta, Reason, Signals, State,
 };
 
 const POLL: Duration = Duration::from_millis(300);
@@ -51,10 +51,7 @@ pub fn drain(id: &str) -> Result<(), String> {
     lock.lock().map_err(|e| e.to_string())?;
     let _ = fs::remove_file(dir.join("pending"));
     let _ = fs::remove_file(dir.join("release"));
-    let events = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("events.jsonl"))
+    let events = crate::paths::append(&dir.join("events.jsonl"))
         .map_err(|e| format!("could not open the transcript: {e}"))?;
     let mut d = Drainer {
         meta: load(id)?,
@@ -199,15 +196,15 @@ struct Drainer {
 /// How long to keep waiting for Claude to wake up on a finished task.
 const WAKE_GRACE: Duration = Duration::from_secs(120);
 
-fn excerpt(text: &str, max: usize) -> String {
-    let text = text.trim();
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    format!("{}…", text.chars().take(max).collect::<String>())
-}
-
 impl Drainer {
+    /// The drainer's stderr is the run's stderr.log, so a failed save is
+    /// recorded there.
+    fn save(&mut self) {
+        if let Err(e) = crate::runs::save(&self.dir, &mut self.meta) {
+            eprintln!("claude-proxy: {e}");
+        }
+    }
+
     fn step(&mut self) -> Flow {
         if self.dir.join("stop").exists() {
             return self.stop();
@@ -257,14 +254,14 @@ impl Drainer {
             // Marked working before the inbox is emptied, so a waiter always
             // sees the message in one place or the other.
             self.meta.state = State::Working;
-            save(&self.dir, &mut self.meta);
+            self.save();
         }
         let _ = fs::remove_file(self.dir.join("pending"));
         let messages = take_inbox(&self.dir);
         if messages.is_empty() {
             if !during_turn {
                 self.meta.state = before;
-                save(&self.dir, &mut self.meta);
+                self.save();
             }
             return None;
         }
@@ -309,7 +306,7 @@ impl Drainer {
         let background = self.running + u32::from(self.wake_due.is_some());
         if background != self.meta.background {
             self.meta.background = background;
-            save(&self.dir, &mut self.meta);
+            self.save();
         }
     }
 
@@ -331,7 +328,7 @@ impl Drainer {
         self.meta.activity = None;
         self.meta.summary = None;
         self.meta.needs_action = None;
-        save(&self.dir, &mut self.meta);
+        self.save();
         marker(
             &self.dir,
             json!({"event": "turn_start", "turn": self.meta.turns, "account": self.meta.account}),
@@ -344,7 +341,7 @@ impl Drainer {
         if self.proc.is_none() {
             let proc = Proc::spawn(&self.dir, &self.meta)?;
             self.meta.turn_pid = Some(proc.child.id());
-            save(&self.dir, &mut self.meta);
+            self.save();
             self.proc = Some(proc);
         }
         if let Some(proc) = self.proc.as_mut() {
@@ -385,7 +382,7 @@ impl Drainer {
             self.start_turn();
         }
         if observe(&mut self.meta, &v, &mut self.signals) {
-            save(&self.dir, &mut self.meta);
+            self.save();
         }
         if v["type"] == "result" {
             return self.on_result();
@@ -414,7 +411,7 @@ impl Drainer {
             }
             self.meta.state = State::Idle;
             self.meta.activity = None;
-            save(&self.dir, &mut self.meta);
+            self.save();
             self.idle_since = Instant::now();
         } else {
             // A message that arrived as the turn ended starts the next one.
@@ -431,7 +428,7 @@ impl Drainer {
         self.meta.turn_pid = None;
         self.meta.last_exit = code;
         if !self.busy {
-            save(&self.dir, &mut self.meta);
+            self.save();
             return Flow::Continue;
         }
         let killed = self.dir.join("stop").exists();
@@ -468,7 +465,7 @@ impl Drainer {
         self.meta.state = State::Failed;
         self.meta.activity = None;
         self.requeue();
-        save(&self.dir, &mut self.meta);
+        self.save();
         Flow::Stop
     }
 
@@ -524,7 +521,7 @@ impl Drainer {
         self.busy = false;
         self.meta.state = State::Failed;
         self.requeue();
-        save(&self.dir, &mut self.meta);
+        self.save();
         Flow::Stop
     }
 
@@ -555,7 +552,7 @@ impl Drainer {
         self.meta.activity = None;
         self.meta.turn_pid = None;
         self.requeue();
-        save(&self.dir, &mut self.meta);
+        self.save();
         Flow::Stop
     }
 
@@ -579,7 +576,7 @@ impl Drainer {
             asks::clear(&self.dir);
             self.forget_background();
             self.meta.turn_pid = None;
-            save(&self.dir, &mut self.meta);
+            self.save();
         }
     }
 }

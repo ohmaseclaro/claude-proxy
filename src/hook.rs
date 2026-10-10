@@ -81,7 +81,8 @@ fn remember_mode(v: &Value) {
     if valid_session_id(session) {
         let dir = config_dir().join("sessions");
         // ponytail: one small file per session, never pruned; prune by age if it ever matters.
-        let _ = fs::create_dir_all(&dir).and_then(|()| fs::write(dir.join(session), mode));
+        let _ = crate::paths::private_dir(&dir)
+            .and_then(|()| crate::paths::write_atomic(&dir.join(session), mode.as_bytes(), 0o600));
     }
 }
 
@@ -155,7 +156,7 @@ fn news_since_last_prompt(session: &str) -> Option<String> {
             _ => None,
         })
         .collect();
-    let _ = fs::write(&told_file, now_told.join("\n"));
+    let _ = crate::paths::write_atomic(&told_file, now_told.join("\n").as_bytes(), 0o600);
     (!lines.is_empty()).then(|| {
         format!(
             "claude-proxy: runs this session started, since your last message:\n{}",

@@ -3,11 +3,9 @@
 //! profile would start with none. Each launch passes the primary's servers to
 //! Claude with `--mcp-config` instead.
 
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::{json, Map, Value};
 
@@ -45,26 +43,9 @@ pub fn write(file: &Path, servers: Map<String, Value>) -> std::io::Result<()> {
         return Ok(());
     }
     if let Some(parent) = file.parent() {
-        fs::create_dir_all(parent)?;
+        crate::paths::private_dir(parent)?;
     }
-    // Its own temp file: parallel launches write the same config at once.
-    static WRITES: AtomicUsize = AtomicUsize::new(0);
-    let mut tmp = file.as_os_str().to_owned();
-    tmp.push(format!(
-        ".{}-{}.tmp",
-        std::process::id(),
-        WRITES.fetch_add(1, Ordering::Relaxed)
-    ));
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut f = options.open(&tmp)?;
-    f.write_all(&bytes)?;
-    fs::rename(tmp, file)
+    crate::paths::write_atomic(file, &bytes, 0o600)
 }
 
 /// A config file for an interactive launch, named by its contents so launches

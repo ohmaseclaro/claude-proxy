@@ -478,11 +478,8 @@ fn write_cache(path: &Path, fetched_at: i64, usage: &Value) {
         return;
     };
     let _ = std::fs::create_dir_all(parent);
-    let tmp = path.with_extension("json.tmp");
     let body = json!({ "fetched_at": fetched_at, "usage": usage }).to_string();
-    if std::fs::write(&tmp, body).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
-    }
+    let _ = crate::paths::write_atomic(path, body.as_bytes(), 0o600);
 }
 
 pub fn now_secs() -> i64 {

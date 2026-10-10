@@ -19,7 +19,8 @@ use serde_json::Value;
 /// `nap` takes 2 seconds (a turn to message while it works); `limited` fails
 /// with a usage limit on the account `acct-a`; `ask` puts a permission prompt
 /// to the run's `__permit` server the way Claude does (`ask question`: a
-/// question, `ask plan`: plan approval) and echoes the decision; `bgtask`
+/// question, `ask plan`: plan approval, `ask star`: a command with a `*`) and
+/// echoes the decision; `bgtask`
 /// leaves a background task that ends 2 seconds later, when Claude wakes up
 /// on its own and answers `bg done`.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
@@ -68,6 +69,7 @@ while IFS= read -r line; do
         *question*) tool=AskUserQuestion
           input='{"questions":[{"question":"Which colour?","options":[{"label":"Red"},{"label":"Blue"}]}]}' ;;
         *plan*) tool=ExitPlanMode; input='{"plan":"do it"}' ;;
+        *star*) input='{"command":"rm -rf build/*"}' ;;
       esac
       prompt=$(printf '%s\n' \
         '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
@@ -1006,8 +1008,20 @@ fn hooks_tell_a_session_about_its_runs() {
     cp(&env, &["kill", &going]);
 }
 
+/// Wait until no drainer holds the run, so nothing rewrites its meta.json.
+fn settled(env: &Env, id: &str) {
+    let lock = env
+        .home
+        .join(format!(".config/claude-proxy/runs/{id}/run.lock"));
+    let lock = std::fs::File::open(lock).unwrap();
+    wait_until("the drainer let go", || {
+        lock.try_lock().is_ok() && lock.unlock().is_ok()
+    });
+}
+
 /// Make a run look last used `secs` ago.
 fn age(env: &Env, id: &str, secs: i64) {
+    settled(env, id);
     let path = env
         .home
         .join(format!(".config/claude-proxy/runs/{id}/meta.json"));
@@ -1074,4 +1088,113 @@ fn old_runs_leave_the_list_then_go_away() {
     // `rm` leaves the same trail.
     assert!(cp(&env, &["rm", &elsewhere]).status.success());
     assert!(stderr(&cp(&env, &["watch", &elsewhere])).contains("with `claude-proxy rm`"));
+}
+
+fn mode(p: &Path) -> u32 {
+    std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+}
+
+#[test]
+fn run_state_is_private_to_the_user() {
+    let env = setup();
+    let root = env.home.join(".config/claude-proxy");
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let id = stdout(&cp(&env, &["run", "--account", "claude", "ask first"]));
+    assert_eq!(
+        cp(&env, &["wait", &id, "--timeout", "30"]).status.code(),
+        Some(2)
+    );
+    let run = root.join("runs").join(&id);
+    for dir in [&root, &root.join("runs"), &run, &run.join("inbox")] {
+        assert_eq!(mode(dir), 0o700, "{}", dir.display());
+    }
+    assert_eq!(mode(&run.join("meta.json")), 0o600);
+    assert_eq!(mode(&run.join("asks")), 0o700);
+    let ask = std::fs::read_dir(run.join("asks"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "json"))
+        .unwrap();
+    assert_eq!(mode(&ask), 0o600);
+    for file in ["events.jsonl", "stderr.log", "mcp.json"] {
+        assert_eq!(mode(&run.join(file)), 0o600, "{file}");
+    }
+
+    assert!(cp(&env, &["allow", &id, "--always", "--accept-edits"])
+        .status
+        .success());
+    assert_eq!(
+        cp(&env, &["wait", &id, "--timeout", "30"]).status.code(),
+        Some(0)
+    );
+    for file in ["allowed", "mode"] {
+        assert_eq!(mode(&run.join(file)), 0o600, "{file}");
+    }
+
+    let session = "33333333-3333-4333-8444-555555555555";
+    hook(
+        &env,
+        "prompt",
+        &format!(r#"{{"session_id":"{session}","permission_mode":"default"}}"#),
+    );
+    assert_eq!(mode(&root.join("sessions")), 0o700);
+    assert_eq!(mode(&root.join("sessions").join(session)), 0o600);
+}
+
+#[test]
+fn always_refuses_a_wildcard_command() {
+    let env = setup();
+    let id = stdout(&cp(&env, &["run", "--account", "claude", "ask star"]));
+    assert_eq!(
+        cp(&env, &["wait", &id, "--timeout", "30"]).status.code(),
+        Some(2)
+    );
+    let out = cp(&env, &["allow", &id, "--always"]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--rule"), "{err}");
+    let run = env.home.join(".config/claude-proxy/runs").join(&id);
+    assert!(!run.join("allowed").exists());
+    assert!(!run.join("mode").exists());
+    assert_eq!(status(&env, &id)["state"], "waiting");
+
+    assert!(cp(&env, &["allow", &id]).status.success());
+    assert_eq!(
+        cp(&env, &["wait", &id, "--timeout", "30"]).status.code(),
+        Some(0)
+    );
+}
+
+#[test]
+fn kill_never_signals_a_pid_a_dead_drainer_left() {
+    use std::os::unix::process::CommandExt;
+    let env = setup();
+    let id = stdout(&cp(&env, &["run", "--account", "claude", "hello"]));
+    cp(&env, &["wait", &id, "--timeout", "30"]);
+    settled(&env, &id);
+
+    let mut bystander = Command::new("sleep")
+        .arg("30")
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let run = env.home.join(".config/claude-proxy/runs").join(&id);
+    let path = run.join("meta.json");
+    let mut meta: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    meta["turn_pid"] = bystander.id().into();
+    std::fs::write(&path, serde_json::to_vec(&meta).unwrap()).unwrap();
+    std::fs::write(run.join("pending"), "").unwrap();
+
+    let alive = std::thread::scope(|s| {
+        let killing = s.spawn(|| cp(&env, &["kill", &id]));
+        std::thread::sleep(Duration::from_secs(1));
+        let alive = bystander.try_wait().unwrap().is_none();
+        std::fs::remove_file(run.join("pending")).unwrap();
+        killing.join().unwrap();
+        alive
+    });
+    let _ = bystander.kill();
+    let _ = bystander.wait();
+    assert!(alive, "kill signalled a pid no drainer held");
 }
