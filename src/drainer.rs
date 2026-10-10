@@ -1,18 +1,5 @@
-//! The background process behind a run (`claude-proxy __drain <id>`).
-//!
-//! It keeps one `claude` process warm for the run in stream-json mode:
-//! messages go in on its stdin, events come out on its stdout, and a turn ends
-//! at Claude's `result`. A message that arrives while a turn is working is
-//! written straight in, and Claude takes it into that turn. Claude echoes each
-//! message as it takes it (`--replay-user-messages`), which tells a message
-//! that missed the turn — it starts the next one — from one the turn absorbed.
-//! Follow-ups reuse the process until it has been idle for
-//! `CLAUDE_PROXY_IDLE_SECS` (default 300), then both exit.
-//!
-//! The drainer holds `run.lock` while alive, which is how every other command
-//! knows it is there. It exits without looking at the inbox again after a
-//! failure, a kill, or a `release` (attach and rm asking for the session): the
-//! messages queued by then wait for the next `send`.
+//! The process behind a run (`claude-proxy __drain <id>`): keeps one stream-json
+//! `claude` warm for the run and exits once idle for `CLAUDE_PROXY_IDLE_SECS`.
 
 use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File};
@@ -45,9 +32,8 @@ fn idle_timeout() -> Duration {
 pub fn drain(id: &str) -> Result<(), String> {
     let dir = run_dir(id);
     let lock = lock_file(&dir).map_err(|e| e.to_string())?;
-    // Blocking, never `try_lock`: `alive()` probes this lock by briefly taking
-    // it, and a drainer that gave up on contention could leave its message
-    // queued forever. Behind another drainer, it simply runs after it.
+    // Blocking, never `try_lock`: `alive()` probes take this lock briefly, and a
+    // drainer giving up on contention could leave its message queued forever.
     lock.lock().map_err(|e| e.to_string())?;
     let _ = fs::remove_file(dir.join("pending"));
     let _ = fs::remove_file(dir.join("release"));
@@ -73,8 +59,8 @@ pub fn drain(id: &str) -> Result<(), String> {
             Flow::Continue => {}
             Flow::Idle => {
                 d.close();
-                // Re-check after letting go of the lock: a message queued while
-                // we were finishing would otherwise wait for the next `send`.
+                // Re-check after unlocking: a message queued while finishing
+                // would otherwise wait for the next `send`.
                 let _ = lock.unlock();
                 if queued(&d.dir) == 0 || lock.lock().is_err() {
                     return Ok(());
@@ -86,8 +72,8 @@ pub fn drain(id: &str) -> Result<(), String> {
                 let waiting: HashSet<String> = inbox_names(&d.dir).into_iter().collect();
                 d.close();
                 let _ = lock.unlock();
-                // A message sent while this one was stopping found it still
-                // alive and started nothing; start the drainer it expected.
+                // A message sent while stopping found this drainer alive and
+                // started nothing; start the drainer it expected.
                 if inbox_names(&d.dir).iter().any(|n| !waiting.contains(n))
                     && !d.dir.join("stop").exists()
                 {
@@ -101,13 +87,11 @@ pub fn drain(id: &str) -> Result<(), String> {
 
 enum Flow {
     Continue,
-    /// Nothing to do: exit, unless a message slipped in.
     Idle,
-    /// Failed, killed, or released: exit; queued messages wait for `send`.
+    /// Failed, killed, or released; queued messages wait for `send`.
     Stop,
 }
 
-/// A warm `claude`: user messages in on stdin, stream-json events out.
 struct Proc {
     child: Child,
     stdin: ChildStdin,
@@ -146,8 +130,6 @@ impl Proc {
         self.stdin.flush()
     }
 
-    /// End it and return its exit code: by closing stdin when it is idle,
-    /// by signal when `force` (and when it does not go quietly).
     fn end(self, force: bool) -> Option<i32> {
         let Proc {
             mut child, stdin, ..
@@ -175,30 +157,25 @@ struct Drainer {
     meta: Meta,
     events: File,
     proc: Option<Proc>,
-    /// Messages written to Claude that it has not taken in yet.
+    /// Written to Claude but not yet echoed back (`--replay-user-messages`):
+    /// not taken into a turn.
     unechoed: VecDeque<String>,
-    /// A turn is in progress.
     busy: bool,
     signals: Signals,
-    /// Accounts this turn has run on.
     tried: Vec<String>,
-    /// The session's size when the current attempt started.
     session_at_start: u64,
     idle_since: Instant,
     idle: Duration,
-    /// Background tasks Claude has running.
     running: u32,
-    /// Since when Claude is due to wake up for a background task that ended
-    /// while it was idle.
+    /// Since a background task ended while Claude was idle; it should wake up.
     wake_due: Option<Instant>,
 }
 
-/// How long to keep waiting for Claude to wake up on a finished task.
+/// How long to wait for Claude to wake up on a finished task.
 const WAKE_GRACE: Duration = Duration::from_secs(120);
 
 impl Drainer {
-    /// The drainer's stderr is the run's stderr.log, so a failed save is
-    /// recorded there.
+    /// The drainer's stderr is the run's stderr.log.
     fn save(&mut self) {
         if let Err(e) = crate::runs::save(&self.dir, &mut self.meta) {
             eprintln!("claude-proxy: {e}");
@@ -238,8 +215,6 @@ impl Drainer {
         }
     }
 
-    /// Hand queued messages to Claude: a new turn when idle, or into the
-    /// working turn. An account switch waits for the turn to end.
     fn intake(&mut self) -> Option<Flow> {
         let switching = self.dir.join("account").exists();
         if self.busy && (switching || self.proc.is_none()) {
@@ -251,8 +226,8 @@ impl Drainer {
         let during_turn = self.busy;
         let before = self.meta.state;
         if !during_turn {
-            // Marked working before the inbox is emptied, so a waiter always
-            // sees the message in one place or the other.
+            // Marked working before the inbox is emptied, so a waiter sees the
+            // message in one place or the other.
             self.meta.state = State::Working;
             self.save();
         }
@@ -300,8 +275,7 @@ impl Drainer {
         }
     }
 
-    /// Background work the run is still waiting on: tasks running, plus a
-    /// wake-up Claude owes for one that ended.
+    /// A wake-up Claude owes for an ended task counts as background work.
     fn sync_background(&mut self) {
         let background = self.running + u32::from(self.wake_due.is_some());
         if background != self.meta.background {
@@ -335,7 +309,6 @@ impl Drainer {
         );
     }
 
-    /// Send a message, starting Claude first if needed.
     fn write(&mut self, text: &str) -> Result<(), String> {
         self.unechoed.push_back(text.to_string());
         if self.proc.is_none() {
@@ -345,7 +318,7 @@ impl Drainer {
             self.proc = Some(proc);
         }
         if let Some(proc) = self.proc.as_mut() {
-            // A failed write means Claude exited; its end of stdout says why.
+            // A failed write means Claude exited; stdout's end says why.
             let _ = proc.write(text);
         }
         Ok(())
@@ -367,7 +340,6 @@ impl Drainer {
         if v["subtype"] == "background_tasks_changed" {
             let running = v["tasks"].as_array().map_or(0, |t| t.len() as u32);
             if running < self.running && !self.busy {
-                // One ended while Claude was idle: it is about to wake up.
                 self.wake_due = Some(Instant::now());
             }
             self.running = running;
@@ -397,8 +369,8 @@ impl Drainer {
         if self.unechoed.is_empty() {
             self.busy = false;
             if self.meta.background == 0 {
-                // Before the run reads as done, so whoever waits on the
-                // parent already sees the message queued.
+                // Before the run reads as done, so a waiter on the parent
+                // already sees the message queued.
                 let result = self.meta.last_result.clone().unwrap_or_default();
                 notify_parent(
                     &self.meta,
@@ -420,7 +392,6 @@ impl Drainer {
         Flow::Continue
     }
 
-    /// Claude's output ended: it exited.
     fn on_exit(&mut self) -> Flow {
         let code = self.proc.take().and_then(|p| p.end(false));
         asks::clear(&self.dir);
@@ -442,8 +413,6 @@ impl Drainer {
         self.on_failure()
     }
 
-    /// The turn failed: continue it on another account when the failure was
-    /// the account's, otherwise stop.
     fn on_failure(&mut self) -> Flow {
         self.close();
         if let Some(reason) = classify(&self.signals) {
@@ -469,8 +438,8 @@ impl Drainer {
         Flow::Stop
     }
 
-    /// Continue the same session on the next account. Every profile shares
-    /// the transcripts, so nothing is copied. Returns whether it moved.
+    /// Every profile shares the transcripts, so nothing is copied. Returns
+    /// whether it moved.
     fn failover(&mut self, reason: Reason) -> bool {
         let from = self.meta.account.clone();
         if reason == Reason::Limit {
@@ -496,8 +465,7 @@ impl Drainer {
         self.signals = Signals::default();
         let mut parts = Vec::new();
         if reached || self.unechoed.is_empty() {
-            // What it already took in is in the session: ask for the rest of
-            // the work instead of repeating it.
+            // The session already has it: ask for the rest, not a repeat.
             parts.push(format!(
                 "(claude-proxy) Your previous turn stopped because the Claude account \
                  {from} {}. This conversation now continues on another account — pick up \
@@ -556,14 +524,13 @@ impl Drainer {
         Flow::Stop
     }
 
-    /// Claude is gone, and its background tasks with it.
     fn forget_background(&mut self) {
         self.running = 0;
         self.wake_due = None;
         self.meta.background = 0;
     }
 
-    /// Put back what Claude never took in, ahead of anything queued since.
+    /// Ahead of anything queued since.
     fn requeue(&mut self) {
         for (i, text) in self.unechoed.drain(..).enumerate() {
             let _ = enqueue_first(&self.dir, &text, i);

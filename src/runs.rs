@@ -1,23 +1,5 @@
-//! Managed runs: a proxied Claude session that another agent drives by id —
-//! start it in the background, read or follow its transcript, check its status,
-//! send follow-up messages, wait for it, or kill it.
-//!
-//! Each run pins one Claude session id, so the conversation carries over —
-//! across Claude processes and across accounts. Messages go through the run's
-//! inbox to a detached drainer (`claude-proxy __drain <id>`, see `drainer`),
-//! which keeps a `claude` process warm for the run and exits once it has been
-//! idle a while. It holds `run.lock` while alive — that lock, not a pid, is how
-//! every other command knows it is there.
-//!
-//! `~/.config/claude-proxy/runs/<id>/`: `meta.json` (written only under
-//! run.lock), `events.jsonl` (the transcript: Claude's
-//! stream-json plus our message/turn markers), `inbox/` (queued messages),
-//! `account` (a pending account switch), `stop` (a kill in progress),
-//! `pending` (a drainer was requested and has not taken the lock yet),
-//! `release` (attach or rm asking an idle drainer to let go), `asks/`
-//! (decisions Claude is waiting for, see `asks`), `allowed` and `mode` (rules
-//! and a permission mode granted through `allow`), `mcp.json` (the MCP servers
-//! Claude starts with), `stderr.log`, `run.lock`.
+//! Managed runs: a Claude session pinned by id that another agent drives. Its inbox
+//! is delivered by a detached drainer (`drainer`), which holds `run.lock` while alive.
 
 use std::fs::{self, File};
 use std::io::Write;
@@ -36,18 +18,12 @@ use crate::registry::Registry;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum State {
-    /// Created or messaged; the drainer has not started the turn yet.
     Queued,
-    /// A turn is running.
     Working,
-    /// A turn is blocked on a question or permission prompt (`allow`, `deny`,
-    /// `answer`). Never stored: derived from the run's pending asks.
+    /// Never stored: derived from the run's pending asks.
     Waiting,
-    /// The last turn finished cleanly; `send` continues the conversation.
     Idle,
-    /// The last turn failed; queued messages wait for the next `send`.
     Failed,
-    /// Stopped by `kill`; `send` resumes it.
     Killed,
 }
 
@@ -85,10 +61,10 @@ pub struct Meta {
     pub turn_pid: Option<u32>,
     #[serde(default)]
     pub last_exit: Option<i32>,
-    /// What the current turn is doing, from Claude's `task_summary`.
+    /// From Claude's `task_summary`, or the tool running now.
     #[serde(default)]
     pub activity: Option<String>,
-    /// What the last turn did, from Claude's `post_turn_summary`.
+    /// From Claude's `post_turn_summary`.
     #[serde(default)]
     pub summary: Option<String>,
     #[serde(default)]
@@ -97,32 +73,28 @@ pub struct Meta {
     pub last_result: Option<String>,
     #[serde(default)]
     pub cost_usd: f64,
-    /// Accounts the run may use, in preference order; empty is `auto` (every
-    /// logged-in account, best quota first).
+    /// In preference order; empty is `auto` (best quota first).
     #[serde(default)]
     pub pool: Vec<String>,
-    /// Why the run last moved to another account.
     #[serde(default)]
     pub moved: Option<String>,
-    /// The session the first turn forks (`--fork-session`).
+    /// Only the first turn forks it (`--fork-session`).
     #[serde(default)]
     pub fork_from: Option<String>,
     #[serde(default)]
     pub worktree: Option<Worktree>,
-    /// The run that started this one; it is told when this one finishes,
-    /// fails, or asks something.
+    /// Told when this run finishes, fails, or asks something.
     #[serde(default)]
     pub parent: Option<String>,
-    /// The Claude session that started it (`CLAUDE_CODE_SESSION_ID`).
+    /// The starting Claude session's `CLAUDE_CODE_SESSION_ID`.
     #[serde(default)]
     pub session: Option<String>,
-    /// Background tasks Claude has running; the run is not done until they
-    /// end and Claude has looked at them.
+    /// Claude's running background tasks; the run is not done until they end
+    /// and Claude has looked at them.
     #[serde(default)]
     pub background: u32,
 }
 
-/// A git worktree created for the run, on its own branch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Worktree {
     pub path: String,
@@ -162,7 +134,7 @@ pub(crate) fn save(dir: &Path, meta: &mut Meta) -> Result<(), String> {
         .map_err(|e| format!("could not save run {}: {e}", meta.id))
 }
 
-/// The config dir `claude` runs with for this account (`None` is the primary).
+/// `None` is the primary account, which uses Claude's default config dir.
 fn account_dir(account: &str) -> Option<PathBuf> {
     (account != PRIMARY_LABEL).then(|| account_config_dir(account))
 }
@@ -180,7 +152,6 @@ pub struct NewRun {
     pub session: Option<String>,
 }
 
-/// Create a run, queue its first message, and start it in the background.
 pub fn start(new: NewRun) -> Result<Meta, String> {
     let (id, dir) = loop {
         let id = format!("{:06x}", random_u64() & 0xff_ffff);
@@ -236,8 +207,7 @@ pub fn start(new: NewRun) -> Result<Meta, String> {
     Ok(meta)
 }
 
-/// Queue a follow-up message — optionally moving the run to another account
-/// spec (see [`parse_pool`]) — and make sure a drainer is there to deliver it.
+/// `account` is a spec, see [`parse_pool`].
 pub fn send(id: &str, message: &str, account: Option<&str>) -> Result<(), String> {
     load(id)?;
     let dir = run_dir(id);
@@ -248,9 +218,8 @@ pub fn send(id: &str, message: &str, account: Option<&str>) -> Result<(), String
     // A new message is how a killed run is resumed.
     let _ = fs::remove_file(dir.join("stop"));
     enqueue(&dir, message)?;
-    // A drainer that is working or idling picks the message up itself; one
-    // that is stopping after a failure or a kill does not, so start another
-    // (it waits for the lock).
+    // A working or idling drainer picks the message up itself; one stopping
+    // after a failure or kill does not, so start another (it waits for the lock).
     let state = load(id)?.state;
     if !alive(&dir) || matches!(state, State::Failed | State::Killed) {
         request_drainer(id)?;
@@ -258,9 +227,8 @@ pub fn send(id: &str, message: &str, account: Option<&str>) -> Result<(), String
     Ok(())
 }
 
-/// Mark the run as having work about to start, then start a drainer. The mark
-/// covers the moment before the drainer holds the lock, so nothing mistakes
-/// the run for finished in between.
+/// The `pending` mark covers the moment before the drainer holds the lock, so
+/// nothing mistakes the run for finished in between.
 pub(crate) fn request_drainer(id: &str) -> Result<(), String> {
     crate::paths::write_atomic(&run_dir(id).join("pending"), b"", 0o600)
         .map_err(|e| format!("could not queue the run: {e}"))?;
@@ -274,8 +242,7 @@ fn enqueue(dir: &Path, message: &str) -> Result<(), String> {
     enqueue_named(dir, message, nanos)
 }
 
-/// Queue a message ahead of everything already queued (`order` keeps several
-/// in sequence).
+/// Sorts ahead of `enqueue`'s nanosecond names; `order` keeps several in sequence.
 pub(crate) fn enqueue_first(dir: &Path, message: &str, order: usize) -> Result<(), String> {
     enqueue_named(dir, message, order as u128)
 }
@@ -286,7 +253,6 @@ fn enqueue_named(dir: &Path, message: &str, order: u128) -> Result<(), String> {
         .map_err(|e| format!("could not queue the message: {e}"))
 }
 
-/// Pending messages, oldest first, removed from the inbox.
 pub(crate) fn take_inbox(dir: &Path) -> Vec<String> {
     let mut names: Vec<PathBuf> = fs::read_dir(dir.join("inbox"))
         .into_iter()
@@ -327,8 +293,8 @@ pub(crate) fn lock_file(dir: &Path) -> std::io::Result<File> {
     crate::paths::append(&dir.join("run.lock"))
 }
 
-/// Whether a drainer is alive for this run: it holds the lock exclusively.
-/// Probed with a shared lock, so two probes never mistake each other for it.
+/// A drainer holds the lock exclusively. Probed with a shared lock, so two
+/// probes never mistake each other for it.
 pub fn alive(dir: &Path) -> bool {
     match lock_file(dir) {
         Ok(f) => matches!(f.try_lock_shared(), Err(std::fs::TryLockError::WouldBlock)),
@@ -336,12 +302,11 @@ pub fn alive(dir: &Path) -> bool {
     }
 }
 
-/// Nothing running and nothing about to run. A drainer idling with a warm
-/// Claude counts as finished.
+/// A drainer idling with a warm Claude counts as finished.
 pub fn finished(id: &str) -> Result<bool, String> {
     let dir = run_dir(id);
     // In this order: the drainer marks the run working before it empties the
-    // inbox, so a message is always seen in one place or the other.
+    // inbox, so a message is seen in one place or the other.
     if pending(&dir) {
         load(id)?;
         return Ok(false);
@@ -349,7 +314,7 @@ pub fn finished(id: &str) -> Result<bool, String> {
     let queued = queued(&dir);
     let meta = load(id)?;
     let state = meta.state;
-    // Messages left queued behind a failure or a kill wait for the next send.
+    // Messages queued behind a failure or kill wait for the next send.
     let stopped = matches!(state, State::Failed | State::Killed);
     Ok(if alive(&dir) {
         queued == 0 && (stopped || (state == State::Idle && meta.background == 0))
@@ -373,7 +338,6 @@ pub fn effective_state(meta: &Meta) -> State {
         return State::Waiting;
     }
     match meta.state {
-        // Its turn ended, but Claude will be back when its tasks finish.
         State::Idle if alive && meta.background > 0 => State::Working,
         State::Working if !alive => State::Failed,
         State::Idle if queued(&dir) > 0 => State::Queued,
@@ -394,7 +358,7 @@ fn spawn_drainer(id: &str) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        // Its own process group: it survives the caller's shell and terminal.
+        // Its own process group, so it survives the caller's terminal.
         cmd.arg0("claude-proxy").process_group(0);
     }
     cmd.spawn()
@@ -402,8 +366,6 @@ fn spawn_drainer(id: &str) -> Result<(), String> {
         .map_err(|e| format!("could not start the run: {e}"))
 }
 
-/// Why an account could not serve a turn — the failures moving to another
-/// account can fix (overloaded or server errors are not account-specific).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Reason {
     Limit,
@@ -419,16 +381,13 @@ impl Reason {
     }
 }
 
-/// What a turn reported besides its transcript.
 #[derive(Default)]
 pub(crate) struct Signals {
     pub(crate) result_error: bool,
-    /// The typed `error` Claude puts on an assistant message wrapping an API
-    /// error (`rate_limit`, `billing_error`, `authentication_failed`, …).
+    /// The `error` Claude puts on an assistant message wrapping an API error.
     pub(crate) api_error: Option<String>,
     /// A `rate_limit_event` with status `rejected`.
     pub(crate) rejected: bool,
-    /// Claude printed `Not logged in` instead of starting.
     pub(crate) not_logged_in: bool,
 }
 
@@ -447,8 +406,7 @@ pub(crate) fn classify(s: &Signals) -> Option<Reason> {
     }
 }
 
-/// The account to continue on, never one already tried for this message. One
-/// named account is pinned; a list is tried in order; `auto` picks by quota.
+/// One named account is pinned; a list is tried in order; `auto` picks by quota.
 pub(crate) fn next_account(meta: &Meta, tried: &[String]) -> Option<String> {
     match meta.pool.as_slice() {
         [_] => None,
@@ -468,8 +426,8 @@ fn next_in_pool(pool: &[String], tried: &[String]) -> Option<String> {
     pool.iter().find(|a| !tried.contains(a)).cloned()
 }
 
-/// An account spec: `auto` (empty pool), one name, or `a,b,c` in preference
-/// order. `claude` is the primary profile.
+/// `auto` (empty pool), one name, or `a,b,c` in preference order. `claude` is
+/// the primary profile.
 pub fn parse_pool(spec: &str) -> Result<Vec<String>, String> {
     if spec.trim() == "auto" {
         return Ok(Vec::new());
@@ -492,7 +450,6 @@ pub fn parse_pool(spec: &str) -> Result<Vec<String>, String> {
     Ok(pool)
 }
 
-/// The account a pool starts on: its first name, or the best by quota.
 pub fn first_account(pool: &[String]) -> Result<String, String> {
     if let Some(first) = pool.first() {
         return Ok(first.clone());
@@ -503,14 +460,12 @@ pub fn first_account(pool: &[String]) -> Result<String, String> {
         .ok_or_else(|| "no logged-in account to use. Add one with:  claude-proxy add <name>".into())
 }
 
-/// The session's transcript as the current account's Claude sees it.
 fn session_file(meta: &Meta) -> Option<PathBuf> {
     let config = account_dir(&meta.account).unwrap_or_else(|| home().join(".claude"));
     find_session(&config.join("projects"), &meta.session_id)
 }
 
-/// A session's transcript, searched by id so the project-directory naming
-/// does not matter. Every profile shares `~/.claude/projects`.
+/// Searched by id, so Claude's project-directory naming does not matter.
 pub fn find_session(projects: &Path, session_id: &str) -> Option<PathBuf> {
     let name = format!("{session_id}.jsonl");
     fs::read_dir(projects)
@@ -526,9 +481,6 @@ pub(crate) fn session_len(meta: &Meta) -> u64 {
         .map_or(0, |m| m.len())
 }
 
-/// The `claude` process for the run: its account, session, MCP servers (the
-/// user's, plus `__permit` for the decisions it cannot make alone), what
-/// `allow` granted, and the caller's Claude flags. Messages go in on stdin.
 pub(crate) fn turn_command(dir: &Path, meta: &Meta) -> Result<Command, String> {
     let account = account_dir(&meta.account);
     // Built first: it links the shared setup, so the session is visible below.
@@ -540,8 +492,7 @@ pub(crate) fn turn_command(dir: &Path, meta: &Meta) -> Result<Command, String> {
     let exe = std::env::current_exe().map_err(|e| format!("could not locate claude-proxy: {e}"))?;
     servers.insert(
         asks::SERVER.into(),
-        // An ask may wait for a person: allow it a day rather than Claude's
-        // default tool timeout.
+        // An ask may wait for a person: a day, not Claude's default tool timeout.
         json!({"type": "stdio", "command": exe, "args": ["__permit", meta.id], "timeout": 86_400_000}),
     );
     let config = dir.join("mcp.json");
@@ -586,7 +537,6 @@ pub(crate) fn turn_command(dir: &Path, meta: &Meta) -> Result<Command, String> {
     }
     cmd.current_dir(&meta.cwd)
         .env("CLAUDE_CODE_ENABLE_ASK_USER_QUESTION_TOOL", "1")
-        // Lets hooks and skills inside the run know they are in one.
         .env("CLAUDE_PROXY_RUN", &meta.id)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped());
@@ -602,8 +552,7 @@ pub(crate) fn turn_command(dir: &Path, meta: &Meta) -> Result<Command, String> {
     Ok(cmd)
 }
 
-/// Fold one stream-json event into the run's status and the turn's signals.
-/// Returns whether the status changed.
+/// Returns whether the run's status changed.
 pub(crate) fn observe(meta: &mut Meta, v: &Value, signals: &mut Signals) -> bool {
     let text = |key: &str| {
         v.get(key)
@@ -629,8 +578,7 @@ pub(crate) fn observe(meta: &mut Meta, v: &Value, signals: &mut Signals) -> bool
             if let Some(error) = text("error") {
                 signals.api_error = Some(error);
             }
-            // What it is doing right now; a task summary can be long stale
-            // while a tool runs.
+            // A task summary can be long stale while a tool runs.
             let tool = v
                 .pointer("/message/content")
                 .and_then(Value::as_array)
@@ -669,8 +617,7 @@ pub(crate) fn observe(meta: &mut Meta, v: &Value, signals: &mut Signals) -> bool
     }
 }
 
-/// Append one of our own events to the transcript, in a single write so it
-/// never interleaves with another process appending.
+/// A single write, so it never interleaves with another appender.
 pub fn marker(dir: &Path, mut event: Value) {
     event["type"] = json!("claude_proxy");
     event["at"] = json!(now_secs());
@@ -679,9 +626,8 @@ pub fn marker(dir: &Path, mut event: Value) {
     }
 }
 
-/// Stop a run: the current turn is terminated (escalating to SIGKILL) and the
-/// drainer exits; queued messages are kept. Returns whether it was running —
-/// an idle run just lets go of its warm Claude.
+/// Queued messages are kept. Returns whether it was running; an idle run just
+/// lets go of its warm Claude.
 pub fn kill(id: &str) -> Result<bool, String> {
     let meta = load(id)?;
     let dir = run_dir(id);
@@ -711,7 +657,6 @@ pub fn kill(id: &str) -> Result<bool, String> {
     Ok(true)
 }
 
-/// Signal the process group led by `pid` (Claude starts as a group leader).
 /// Never through the `kill` binary: Linux procps reads `kill -TERM -<pgid>`
 /// as "every process you own".
 #[cfg(unix)]
@@ -774,8 +719,7 @@ fn inert(text: &str) -> String {
     out
 }
 
-/// Child text is untrusted: its run-result tags are made inert and its length
-/// capped.
+/// Child text is untrusted: its run-result tags are made inert and its length capped.
 fn parent_message(meta: &Meta, news: &str) -> String {
     let name = meta
         .name
@@ -789,7 +733,6 @@ fn parent_message(meta: &Meta, news: &str) -> String {
     )
 }
 
-/// Tell the run that started this one what happened; the message wakes it.
 pub(crate) fn notify_parent(meta: &Meta, news: &str) {
     let Some(parent) = &meta.parent else {
         return;
@@ -803,7 +746,6 @@ pub(crate) fn notify_parent(meta: &Meta, news: &str) {
     let _ = send(parent, &parent_message(meta, news), None);
 }
 
-/// Every run, each followed by the runs it started, as (depth, run).
 pub fn tree(all: Vec<Meta>) -> Vec<(usize, Meta)> {
     let ids: std::collections::HashSet<String> = all.iter().map(|m| m.id.clone()).collect();
     let (roots, mut children): (Vec<Meta>, Vec<Meta>) = all
@@ -827,7 +769,6 @@ pub fn tree(all: Vec<Meta>) -> Vec<(usize, Meta)> {
     out
 }
 
-/// The runs a Claude session started, and everything they started in turn.
 pub fn of_session(all: &[Meta], session: &str) -> Vec<String> {
     let mut ids: Vec<String> = all
         .iter()
@@ -847,7 +788,6 @@ pub fn of_session(all: &[Meta], session: &str) -> Vec<String> {
     }
 }
 
-/// Ask an idle drainer to exit and wait until it has.
 fn release(dir: &Path) -> Result<(), String> {
     crate::paths::write_atomic(&dir.join("release"), b"", 0o600)
         .map_err(|e| format!("could not release the run: {e}"))?;
@@ -864,12 +804,10 @@ fn release(dir: &Path) -> Result<(), String> {
 
 pub enum Waited {
     Done(Meta),
-    /// Blocked on decisions only the caller can make.
     Asking(Vec<Ask>),
     TimedOut(Meta),
 }
 
-/// Block until the run has nothing running or queued, or needs an answer.
 pub fn wait(id: &str, timeout: Option<Duration>) -> Result<Waited, String> {
     let started = Instant::now();
     let dir = run_dir(id);
@@ -888,8 +826,6 @@ pub fn wait(id: &str, timeout: Option<Duration>) -> Result<Waited, String> {
     }
 }
 
-/// Open the run's session interactively in this terminal. Messages sent
-/// meanwhile wait behind the run lock and are delivered after it closes.
 pub fn attach(id: &str) -> Result<i32, String> {
     let meta = load(id)?;
     let dir = run_dir(id);
@@ -937,7 +873,6 @@ pub fn attach(id: &str) -> Result<i32, String> {
         .map_err(|e| format!("could not start claude: {e}"))
 }
 
-/// Every run, most recently active first.
 pub fn list() -> Vec<Meta> {
     let mut all: Vec<Meta> = fs::read_dir(runs_dir())
         .into_iter()
@@ -949,8 +884,7 @@ pub fn list() -> Vec<Meta> {
     all
 }
 
-/// Delete a run, and its worktree and branch when nothing would be lost.
-/// Returns what was kept.
+/// Returns what was kept: a worktree with changes, an unmerged branch.
 pub fn remove(id: &str) -> Result<Vec<String>, String> {
     let meta = load(id)?;
     let dir = run_dir(id);
@@ -979,10 +913,6 @@ pub fn remove(id: &str) -> Result<Vec<String>, String> {
     Ok(kept)
 }
 
-/// Delete finished runs untouched for `CLAUDE_PROXY_KEEP_HOURS` (default 24;
-/// 0 keeps everything). Never one that is going, has messages queued, kept a
-/// worktree, or started a run that is still going. Claude's own transcript of
-/// the session stays, so `claude --resume` still works.
 pub fn prune() {
     let hours: i64 = std::env::var("CLAUDE_PROXY_KEEP_HOURS")
         .ok()
@@ -1021,7 +951,7 @@ pub fn prune() {
     }
 }
 
-/// Remember a removed run, so a later lookup can say what became of it.
+/// Read back by `removed_note`.
 fn record_removed(meta: &Meta, how: &str) {
     let path = runs_dir().join(".removed");
     let line = format!(
@@ -1064,8 +994,7 @@ fn removed_note(id: &str) -> Option<String> {
     ))
 }
 
-/// A worktree of the repository containing `cwd`, on a new branch from HEAD.
-/// Returns it and the directory in it matching `cwd`.
+/// Returns the worktree and the directory in it matching `cwd`.
 fn make_worktree(cwd: &Path, id: &str) -> Result<(Worktree, PathBuf), String> {
     let repo = git(cwd, &["rev-parse", "--show-toplevel"]).map_err(|_| {
         format!(
@@ -1112,9 +1041,8 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// The final text of the last turn, from the transcript, and whether it
-/// succeeded. `None` when the last turn produced no result (it is still
-/// working, or was killed or crashed) — never an older turn's answer.
+/// `None` when the last turn has no result (still working, killed, crashed),
+/// never an older turn's answer.
 pub fn last_result(id: &str) -> Option<(String, bool)> {
     last_result_in(&fs::read_to_string(events_path(id)).ok()?)
 }
@@ -1154,7 +1082,6 @@ fn random_u64() -> u64 {
     h.finish()
 }
 
-/// A random (v4-shaped) UUID for `--session-id`.
 fn new_uuid() -> String {
     let mut b = [0u8; 16];
     b[..8].copy_from_slice(&random_u64().to_be_bytes());
@@ -1323,7 +1250,6 @@ mod tests {
         );
         assert_eq!(with(None, true, false), Some(Reason::Limit));
         assert_eq!(with(None, false, true), Some(Reason::Auth));
-        // Not the account's fault: moving would not help.
         assert_eq!(with(Some("overloaded"), false, false), None);
         assert_eq!(with(Some("server_error"), false, false), None);
         assert_eq!(with(None, false, false), None);
@@ -1339,7 +1265,6 @@ mod tests {
             Some("c")
         );
         assert_eq!(next_in_pool(&pool, &tried(&["a", "b", "c"])), None);
-        // One named account is pinned.
         let mut m = meta();
         m.pool = vec!["a".into()];
         assert_eq!(next_account(&m, &tried(&["a"])), None);

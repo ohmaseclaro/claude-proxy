@@ -1,12 +1,5 @@
-//! Decisions a run cannot make alone — permission prompts and Claude's
-//! `AskUserQuestion` — handed to whoever manages the run.
-//!
-//! Every turn starts Claude with `--permission-prompt-tool` pointing at
-//! `claude-proxy __permit <id>`, a one-tool MCP server. When Claude needs a
-//! decision, the server records it as `asks/<key>.json` and blocks until
-//! `allow`, `deny`, or `answer` writes `asks/<key>.answer`. What `allow` grants
-//! for good (`--always`, `--accept-edits`) is also kept in the run's `allowed`
-//! and `mode` files, so a fresh Claude process starts with it.
+//! Decisions a run cannot make alone go through the `__permit` MCP server, which
+//! records `asks/<key>.json` and waits for `allow`, `deny` or `answer`.
 
 use std::fs;
 use std::io::{BufRead, Write};
@@ -45,8 +38,8 @@ impl Ask {
     }
 }
 
-/// Unanswered asks, oldest first. Only meaningful while the run is alive: the
-/// drainer clears them when a turn ends.
+/// Only meaningful while the run is alive: the drainer clears asks when Claude
+/// exits.
 pub fn pending(dir: &Path) -> Vec<Ask> {
     let asks = dir.join("asks");
     let mut keys: Vec<String> = fs::read_dir(&asks)
@@ -80,21 +73,17 @@ pub enum Reply {
     Answer(Vec<String>),
 }
 
-/// What an `allow` grants beyond this one request.
 #[derive(Default)]
 pub struct Grant {
     /// Stop asking for requests like this one.
     pub always: bool,
-    /// Stop asking for requests matching this permission rule.
     pub rule: Option<String>,
-    /// Accept file edits without asking from now on.
     pub accept_edits: bool,
 }
 
 const EDIT_TOOLS: &[&str] = &["Edit", "Write", "MultiEdit", "NotebookEdit"];
 
-/// Answer the oldest pending ask of run `id`. Returns it and what was granted
-/// for good, in words.
+/// Answers the oldest pending ask. Returns it and what was granted for good, in words.
 pub fn reply(id: &str, reply: Reply) -> Result<(Ask, Vec<String>), String> {
     let meta = runs::load(id)?;
     let dir = run_dir(id);
@@ -151,8 +140,7 @@ pub fn reply(id: &str, reply: Reply) -> Result<(Ask, Vec<String>), String> {
     Ok((ask, granted))
 }
 
-/// The permission updates an `allow` sends Claude for the live process, after
-/// recording them for the processes that come later.
+/// Updates for the live Claude process, after recording them for later processes.
 fn grant_updates(
     dir: &Path,
     meta: &runs::Meta,
@@ -177,7 +165,7 @@ fn grant_updates(
     let mode = if grant.accept_edits || (grant.always && rule.is_none() && edit) {
         Some("acceptEdits")
     } else if ask.tool == "ExitPlanMode" && started_in_plan_mode(meta) {
-        // Approved: later processes must not start back in plan mode.
+        // Approved: later processes must not restart in plan mode.
         Some("default")
     } else {
         None
@@ -222,8 +210,7 @@ fn started_in_plan_mode(meta: &runs::Meta) -> bool {
             .any(|a| a == "--permission-mode=plan")
 }
 
-/// The narrowest rule covering a request: the exact command, the domain, or
-/// the tool.
+/// The narrowest rule covering the request.
 fn rule_for(tool: &str, input: &Value) -> Result<String, String> {
     match tool {
         "Bash" => {
@@ -260,7 +247,7 @@ fn url_host(url: &str) -> String {
     host.to_ascii_lowercase()
 }
 
-/// Rules granted with `allow --always` / `--rule`, for Claude's `--allowedTools`.
+/// For Claude's `--allowedTools`.
 pub fn allowed_rules(dir: &Path) -> Vec<String> {
     fs::read(dir.join("allowed"))
         .ok()
@@ -268,7 +255,6 @@ pub fn allowed_rules(dir: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The permission mode granted through `allow`, if any.
 pub fn granted_mode(dir: &Path) -> Option<String> {
     fs::read_to_string(dir.join("mode"))
         .ok()
@@ -276,7 +262,7 @@ pub fn granted_mode(dir: &Path) -> Option<String> {
         .filter(|m| !m.is_empty())
 }
 
-/// The MCP server Claude talks to over stdio: newline-delimited JSON-RPC.
+/// Newline-delimited JSON-RPC over stdio.
 pub fn serve(id: &str) -> Result<(), String> {
     let dir = run_dir(id);
     let mut out = std::io::stdout();
@@ -327,8 +313,7 @@ pub fn serve(id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Post one ask and block until it is answered, the run is killed, or Claude
-/// goes away. Returns the permission-prompt-tool decision.
+/// Blocks until answered, the run is stopped, or Claude (our parent) goes away.
 fn decide(dir: &Path, id: &str, args: &Value) -> Value {
     let tool = args["tool_name"].as_str().unwrap_or("tool").to_string();
     let input = args.get("input").cloned().unwrap_or_else(|| json!({}));
@@ -402,8 +387,8 @@ fn parent_id() -> u32 {
     0
 }
 
-/// Unique within the process and ordered by posting time, so same-tick asks
-/// never overwrite each other and still list oldest first.
+/// Unique and ordered by posting time, so same-tick asks never overwrite each
+/// other and still list oldest first.
 fn ask_key(nanos: u128) -> String {
     static ASKS: AtomicUsize = AtomicUsize::new(0);
     let n = ASKS.fetch_add(1, Ordering::Relaxed);

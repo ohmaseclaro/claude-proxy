@@ -1,7 +1,5 @@
-//! End-to-end: managed runs against a fake `claude` on PATH, in a throwaway
-//! HOME. Exercises the real binary — background drainer, resume flags, the
-//! transcript, status, kill, and resume-after-kill — with no network and no
-//! real accounts.
+//! End-to-end tests of managed runs against a fake `claude` on PATH, in a
+//! throwaway HOME.
 #![cfg(unix)]
 
 use std::os::unix::fs::PermissionsExt;
@@ -11,18 +9,15 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-/// Speaks Claude's stream-json: reads one user message per stdin line, and
-/// for each echoes it back (`isReplay`), plays one turn, and records it in the
-/// session file the way Claude does. Logs every message with how the process
-/// was started (`new`, `resume`, `fork:<parent>`; `warm` for later messages to
-/// the same process). A prompt starting with `sleep` hangs (a turn to kill);
-/// `nap` takes 2 seconds (a turn to message while it works); `limited` fails
-/// with a usage limit on the account `acct-a`; `ask` puts a permission prompt
-/// to the run's `__permit` server the way Claude does (`ask question`: a
-/// question, `ask plan`: plan approval, `ask star`: a command with a `*`) and
-/// echoes the decision; `bgtask`
-/// leaves a background task that ends 2 seconds later, when Claude wakes up
-/// on its own and answers `bg done`.
+/// Speaks Claude's stream-json: echoes each message (`isReplay`), plays one turn,
+/// and appends to the session file. `$FAKE_LOG` gets `<mode> <sid> <account>
+/// <prompt>`, mode being `new`, `resume`, `fork:<parent>` or `warm`. Prompts:
+/// - `sleep`: hangs (a turn to kill)
+/// - `nap`: takes 2s (a turn to message while it works)
+/// - `limited`: usage limit on `acct-a`
+/// - `ask`: a Bash permission prompt through `__permit`; the decision is echoed
+/// - `ask question` / `ask plan` / `ask star`: AskUserQuestion / ExitPlanMode / a `*` command
+/// - `bgtask`: a background task ending 2s later; Claude wakes and answers `bg done`
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
 echo "run=${CLAUDE_PROXY_RUN:-} $*" >> "$FAKE_ARGS_LOG"
 sid=""; mode=""; fork=""; cfg=""
@@ -134,7 +129,7 @@ fn run_as(env: &Env, exe: &Path, args: &[&str], vars: &[(&str, &str)]) -> Output
         .env("PATH", &env.path)
         .env("FAKE_LOG", &env.log)
         .env("FAKE_ARGS_LOG", &env.args_log)
-        // Each turn's drainer exits at once unless a test asks for a warm one.
+        // Drainers exit at once unless a test asks for a warm one.
         .env("CLAUDE_PROXY_IDLE_SECS", "0")
         .current_dir(&env.home);
     for (k, v) in vars {
@@ -179,7 +174,6 @@ fn a_run_is_started_messaged_read_killed_resumed_and_removed() {
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(stdout(&out), "echo: hello");
 
-    // A follow-up resumes the same session.
     assert!(cp(&env, &["send", &id, "again"]).status.success());
     let out = cp(&env, &["wait", &id, "--timeout", "30"]);
     assert_eq!(stdout(&out), "echo: again");
@@ -213,7 +207,6 @@ fn a_run_is_started_messaged_read_killed_resumed_and_removed() {
     assert_eq!(s["summary"], "echoed again");
     assert_eq!(s["last_result"]["text"], "echo: again");
 
-    // Kill a working turn; queued work stops and `send` resumes it.
     assert!(cp(&env, &["send", &id, "sleep please"]).status.success());
     wait_until("the turn is working", || {
         let s = status(&env, &id);
@@ -291,8 +284,7 @@ fn a_usage_limit_moves_the_session_to_the_next_account() {
         stdout(&out)
     );
 
-    // Same session, resumed on the other account — the message had already
-    // reached the session, so it is not sent twice.
+    // The message had already reached the session, so it is not sent twice.
     let log = std::fs::read_to_string(&env.log).unwrap();
     let calls: Vec<Vec<&str>> = log.lines().map(|l| l.splitn(4, ' ').collect()).collect();
     assert_eq!(calls.len(), 2);
@@ -307,7 +299,6 @@ fn a_usage_limit_moves_the_session_to_the_next_account() {
     assert!(stdout(&cp(&env, &["read", &id]))
         .contains("⇄ acct-a hit its usage limit — continuing on acct-b"));
 
-    // Follow-ups stay on the account it moved to.
     assert!(cp(&env, &["send", &id, "and then"]).status.success());
     assert_eq!(
         stdout(&cp(&env, &["wait", &id, "--timeout", "30"])),
@@ -328,7 +319,6 @@ fn a_pinned_account_does_not_move() {
     assert_eq!(s["account"], "acct-a");
     assert!(stdout(&cp(&env, &["read", &id]))
         .contains("⇄ acct-a hit its usage limit — no other account to continue on"));
-    // Moving it by hand works.
     assert!(cp(&env, &["send", &id, "--account", "acct-b", "go on"])
         .status
         .success());
@@ -346,8 +336,8 @@ fn wait_after_send_reports_the_new_turn_even_under_status_probes() {
 
     let env = Arc::new(setup());
     let id = stdout(&cp(&env, &["run", "--account", "acct-a", "limited start"]));
-    // Every `status` briefly takes the run lock — the probes the drainer and
-    // `wait` must not trip over.
+    // Each `status` briefly takes the run lock; the drainer and `wait` must not
+    // trip over these probes.
     let stop = Arc::new(AtomicBool::new(false));
     let probers: Vec<_> = (0..3)
         .map(|_| {
@@ -370,8 +360,8 @@ fn wait_after_send_reports_the_new_turn_even_under_status_probes() {
         Some(1)
     );
     for i in 0..12 {
-        // Alternate a turn that fails (pinned, no failover) with one that
-        // succeeds, so most sends land on a failed run.
+        // Alternate failing (pinned, no failover) and passing turns, so most
+        // sends land on a failed run.
         let fails = i % 2 == 1;
         let msg = if fails {
             format!("limited {i}")
@@ -400,7 +390,6 @@ fn a_permission_prompt_waits_for_allow_or_deny() {
     let env = setup();
     let id = stdout(&cp(&env, &["run", "--account", "claude", "ask first"]));
 
-    // `wait` returns as soon as the run needs a decision, and prints it.
     let out = cp(&env, &["wait", &id, "--timeout", "30"]);
     assert_eq!(
         out.status.code(),
@@ -492,7 +481,7 @@ fn a_fork_starts_from_a_copy_of_another_session() {
     std::fs::create_dir_all(&projects).unwrap();
     std::fs::write(projects.join(format!("{parent}.jsonl")), "{}\n").unwrap();
 
-    // With no id, the Claude session it runs inside.
+    // `--fork` with no id forks the calling session.
     let out = run_as(
         &env,
         Path::new(env!("CARGO_BIN_EXE_claude-proxy")),
@@ -577,7 +566,6 @@ fn a_worktree_run_works_on_its_own_branch_and_is_cleaned_up() {
     assert!(!tree.exists());
     assert!(git(&["branch", "--list", &format!("claude-proxy/{id}")]).is_empty());
 
-    // Uncommitted work is never thrown away.
     let id = start();
     cp(&env, &["wait", &id, "--timeout", "30"]);
     let tree = PathBuf::from(status(&env, &id)["worktree"]["path"].as_str().unwrap());
@@ -622,7 +610,7 @@ fn profiles_get_the_users_mcp_servers() {
     cp(&env, &["wait", &id, "--timeout", "30"]);
     assert!(config_of(&id).0["mcpServers"].get("demo").is_none());
 
-    // An account's own command gets them too, ahead of its arguments.
+    // An account's own command gets them too.
     let proxy = env.bin.join("acct-a");
     std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_claude-proxy"), &proxy).unwrap();
     assert!(run_as(&env, &proxy, &["mcp", "list"], &[]).status.success());
@@ -722,7 +710,6 @@ fn always_and_accept_edits_outlive_the_request() {
     assert!(
         stdout(&cp(&env, &["read", &id])).contains("↪ allowed · from now on: Bash(rm -rf build)")
     );
-    // A later Claude process starts with the rule.
     assert!(cp(&env, &["send", &id, "hi"]).status.success());
     cp(&env, &["wait", &id, "--timeout", "30"]);
     let args = std::fs::read_to_string(&env.args_log).unwrap();
@@ -916,7 +903,6 @@ fn a_child_run_wakes_the_run_that_started_it() {
     assert_eq!(status(&env, &child)["parent"], parent.as_str());
     cp(&env, &["wait", &child, "--timeout", "30"]);
 
-    // The parent got a message and took it as a new turn.
     let out = stdout(&cp(&env, &["wait", &parent, "--timeout", "30"]));
     assert!(
         out.starts_with(&format!(
@@ -931,7 +917,6 @@ fn a_child_run_wakes_the_run_that_started_it() {
     let p = rows.iter().position(|r| r.starts_with(&parent)).unwrap();
     assert!(rows[p + 1].starts_with(&format!("└ {child}")), "{tree}");
 
-    // A question it cannot settle reaches the parent too.
     let asking = stdout(&run_as(
         &env,
         exe,
@@ -957,8 +942,8 @@ fn a_child_run_wakes_the_run_that_started_it() {
 fn a_run_waits_for_its_background_tasks() {
     let env = setup();
     let id = stdout(&cp(&env, &["run", "--account", "claude", "bgtask"]));
-    // Its turn ends first; the run is not done until Claude has woken up on
-    // the finished task, even with an idle timeout of zero.
+    // Its turn ends first; the run is not done until Claude wakes on the
+    // finished task, even with an idle timeout of zero.
     let out = cp(&env, &["wait", &id, "--timeout", "30"]);
     if stdout(&out) != "bg done" {
         eprintln!("DEBUG status: {}", status(&env, &id));
@@ -1084,7 +1069,6 @@ fn old_runs_leave_the_list_then_go_away() {
     assert!(listed.contains("1 more"), "{listed}");
     assert!(stdout(&cp(&env, &["runs", "--all"])).contains(&id));
 
-    // A run in another project is not listed here either.
     let other = env.home.parent().unwrap().join("other");
     std::fs::create_dir_all(&other).unwrap();
     let elsewhere = stdout(&cp(
@@ -1119,7 +1103,6 @@ fn old_runs_leave_the_list_then_go_away() {
         stderr(&gone)
     );
 
-    // `rm` leaves the same trail.
     assert!(cp(&env, &["rm", &elsewhere]).status.success());
     assert!(stderr(&cp(&env, &["watch", &elsewhere])).contains("with `claude-proxy rm`"));
 }

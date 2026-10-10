@@ -1,17 +1,5 @@
-//! Claude Code hooks the plugin installs (`claude-proxy __hook <event>`, the
-//! hook's JSON on stdin).
-//!
-//! - `prompt` (UserPromptSubmit) remembers the session's permission mode, so a
-//!   run it starts inherits it the way a subagent would, and tells the session
-//!   which of its runs finished or are asking since its last prompt.
-//! - `session-start` lists the session's runs still going, after a resume or a
-//!   compaction has dropped the waits that were watching them.
-//! - `pre-tool-use` (Agent|Task) turns a subagent call back with the
-//!   equivalent `claude-proxy run`, unless the description starts `[direct]`.
-//!
-//! In a session the proxy-runs mod marks (`sessions/<id>.mod`), the mod reports
-//! runs and turns Agent calls back itself, so `prompt` and `pre-tool-use` stay
-//! quiet there.
+//! The plugin's Claude Code hooks (`claude-proxy __hook <event>`). A session the mod
+//! marked (`sessions/<id>.mod`) gets no prompt news or redirect from here.
 
 use std::fs;
 use std::io::Read;
@@ -33,7 +21,7 @@ const BUILT_IN_AGENTS: &[&str] = &[
 ];
 
 pub fn run(event: &str) -> i32 {
-    // Lets the plugin's wrapper tell this binary from one without hooks.
+    // Lets the plugin's wrapper tell a binary with hooks from one without.
     if event == "supported" {
         return 0;
     }
@@ -86,7 +74,6 @@ fn remember_mode(v: &Value) {
     }
 }
 
-/// The permission mode last seen for a Claude session.
 pub fn session_mode(session: &str) -> Option<String> {
     if !crate::paths::valid_id(session) {
         return None;
@@ -115,7 +102,6 @@ fn first_ask(m: &Meta) -> String {
         .unwrap_or_default()
 }
 
-/// The session's runs that finished since its last prompt, and those asking.
 fn news_since_last_prompt(session: &str) -> Option<String> {
     if !crate::paths::valid_id(session) {
         return None;
@@ -165,7 +151,6 @@ fn news_since_last_prompt(session: &str) -> Option<String> {
     })
 }
 
-/// The session's runs not yet done, for a session that lost track of them.
 fn runs_still_going(session: &str) -> Option<String> {
     let all = runs::list();
     let mine = runs::of_session(&all, session);
@@ -194,7 +179,6 @@ fn runs_still_going(session: &str) -> Option<String> {
     })
 }
 
-/// Whether the proxy-runs mod marked this hook's session as loaded.
 fn mod_handles(sessions: &Path, v: &Value) -> bool {
     v["session_id"].as_str().is_some_and(|s| {
         crate::paths::valid_id(s)
@@ -208,7 +192,6 @@ fn policy_applies() -> bool {
         && std::env::var("CLAUDE_PROXY_POLICY").map_or(true, |p| p != "off")
 }
 
-/// Why a subagent call should be a run instead, with the command to use.
 fn redirect(v: &Value, applies: bool) -> Option<String> {
     let tool = v["tool_name"].as_str()?;
     if !applies || !matches!(tool, "Agent" | "Task") {
