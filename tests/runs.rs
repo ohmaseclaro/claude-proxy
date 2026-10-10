@@ -15,9 +15,11 @@ use serde_json::Value;
 /// - `sleep`: hangs (a turn to kill)
 /// - `nap`: takes 2s (a turn to message while it works)
 /// - `limited`: usage limit on `acct-a`
+/// - `overloaded`: a non-account API error on `acct-a`
 /// - `ask`: a Bash permission prompt through `__permit`; the decision is echoed
 /// - `ask question` / `ask plan` / `ask star`: AskUserQuestion / ExitPlanMode / a `*` command
 /// - `bgtask`: a background task ending 2s later; Claude wakes and answers `bg done`
+/// - `$FAKE_LOGGED_OUT`: an account that is not logged in
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
 echo "run=${CLAUDE_PROXY_RUN:-} $*" >> "$FAKE_ARGS_LOG"
 sid=""; mode=""; fork=""; cfg=""
@@ -32,6 +34,7 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$fork" ] && mode="fork:$fork"
 acct=$(basename "${CLAUDE_CONFIG_DIR:-primary}")
+if [ "$acct" = "${FAKE_LOGGED_OUT:-}" ]; then echo 'Not logged in · Please run /login'; exit 1; fi
 while IFS= read -r line; do
   prompt=$(printf '%s\n' "$line" | sed 's/.*"content":"\(.*\)","role":"user".*/\1/')
   echo "$mode $sid $acct $prompt" >> "$FAKE_LOG"
@@ -54,6 +57,12 @@ while IFS= read -r line; do
       if [ "$acct" = "acct-a" ]; then
         echo '{"type":"assistant","message":{"content":[{"type":"text","text":"usage limit reached"}]},"error":"rate_limit"}'
         echo '{"type":"result","subtype":"success","is_error":true,"result":"usage limit reached"}'
+        exit 1
+      fi ;;
+    overloaded*)
+      if [ "$acct" = "acct-a" ]; then
+        echo '{"type":"assistant","message":{"content":[{"type":"text","text":"overloaded"}]},"error":"overloaded"}'
+        echo '{"type":"result","subtype":"success","is_error":true,"result":"overloaded"}'
         exit 1
       fi ;;
     ask*)
@@ -136,6 +145,29 @@ fn run_as(env: &Env, exe: &Path, args: &[&str], vars: &[(&str, &str)]) -> Output
         cmd.env(k, v);
     }
     cmd.output().unwrap()
+}
+
+fn cp_stdin(env: &Env, args: &[&str], input: &str) -> Output {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_claude-proxy"))
+        .args(args)
+        .env_clear()
+        .env("HOME", &env.home)
+        .env("XDG_CONFIG_HOME", env.home.join(".config"))
+        .env("PATH", &env.path)
+        .env("FAKE_LOG", &env.log)
+        .env("FAKE_ARGS_LOG", &env.args_log)
+        .env("CLAUDE_PROXY_IDLE_SECS", "0")
+        .current_dir(&env.home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // A command that exits before reading closes the pipe.
+    let _ = child.stdin.take().unwrap().write_all(input.as_bytes());
+    child.wait_with_output().unwrap()
 }
 
 fn stdout(out: &Output) -> String {
@@ -862,23 +894,7 @@ fn the_hook_turns_subagent_calls_into_runs() {
 }
 
 fn hook(env: &Env, event: &str, input: &str) -> Output {
-    use std::io::Write;
-    let mut child = Command::new(env!("CARGO_BIN_EXE_claude-proxy"))
-        .args(["__hook", event])
-        .env_clear()
-        .env("HOME", &env.home)
-        .env("XDG_CONFIG_HOME", env.home.join(".config"))
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input.as_bytes())
-        .unwrap();
-    child.wait_with_output().unwrap()
+    cp_stdin(env, &["__hook", event], input)
 }
 
 #[test]
@@ -1250,4 +1266,227 @@ fn a_kill_that_times_out_leaves_the_run_stopping() {
         !log.contains(&format!("(claude-proxy) Run {child}")),
         "{log}"
     );
+}
+
+#[test]
+fn an_account_that_cannot_sign_in_hands_the_message_to_the_next_in_the_list() {
+    let env = setup();
+    std::fs::write(
+        env.home.join(".config/claude-proxy/registry.json"),
+        r#"{"labels":["acct-a","acct-b","acct-c"]}"#,
+    )
+    .unwrap();
+    let id = stdout(&run_as(
+        &env,
+        Path::new(env!("CARGO_BIN_EXE_claude-proxy")),
+        &["run", "--account", "acct-a,acct-c,acct-b", "hello"],
+        &[("FAKE_LOGGED_OUT", "acct-a")],
+    ));
+    let out = cp(&env, &["wait", &id, "--timeout", "30"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        stdout(&cp(&env, &["read", &id]))
+    );
+    // It never reached acct-a, so it goes over as it was, with no notice.
+    assert_eq!(stdout(&out), "echo: hello");
+
+    let s = status(&env, &id);
+    assert_eq!(s["account"], "acct-c");
+    assert_eq!(s["moved"], "from acct-a, which could not sign in");
+    let log = std::fs::read_to_string(&env.log).unwrap();
+    let calls: Vec<Vec<&str>> = log.lines().map(|l| l.splitn(4, ' ').collect()).collect();
+    assert_eq!(calls.len(), 1, "{log}");
+    assert_eq!(calls[0][0], "new");
+    assert_eq!(calls[0][1].len(), 36, "{log}");
+    assert_eq!(calls[0][2..], ["acct-c", "hello"]);
+    assert!(stdout(&cp(&env, &["read", &id]))
+        .contains("⇄ acct-a could not sign in — continuing on acct-c"));
+}
+
+#[test]
+fn an_error_that_is_not_the_accounts_does_not_move_the_session() {
+    let env = setup();
+    let id = stdout(&cp(
+        &env,
+        &["run", "--account", "acct-a,acct-b", "overloaded job"],
+    ));
+    assert_eq!(
+        cp(&env, &["wait", &id, "--timeout", "30"]).status.code(),
+        Some(1)
+    );
+    let s = status(&env, &id);
+    assert_eq!(s["state"], "failed");
+    assert_eq!(s["account"], "acct-a");
+    assert!(s["moved"].is_null(), "{s}");
+    let log = std::fs::read_to_string(&env.log).unwrap();
+    assert_eq!(log.lines().count(), 1, "{log}");
+    assert!(!stdout(&cp(&env, &["read", &id])).contains('⇄'));
+}
+
+#[test]
+fn the_permit_server_lists_its_tool_and_denies_what_it_cannot_record() {
+    let env = setup();
+    let run = env.home.join(".config/claude-proxy/runs/abc123");
+    std::fs::create_dir_all(&run).unwrap();
+    std::fs::write(run.join("asks"), "").unwrap();
+    std::fs::set_permissions(run.join("asks"), std::fs::Permissions::from_mode(0o600)).unwrap();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#;
+    let call = r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"permit","arguments":{"tool_name":"Bash","input":{"command":"rm -rf build"},"tool_use_id":"t1"}}}"#;
+    let replies = |lines: &[&str]| -> Vec<Value> {
+        let out = cp_stdin(&env, &["__permit", "abc123"], &(lines.join("\n") + "\n"));
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    };
+    let decision = |reply: &Value| -> Value {
+        serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+    };
+
+    let got = replies(&[
+        init,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"nope"}"#,
+        call,
+    ]);
+    let ids: Vec<&Value> = got.iter().map(|r| &r["id"]).collect();
+    assert_eq!(ids, [1, 2, 3, 4], "{got:?}");
+    let tool = &got[1]["result"]["tools"][0];
+    assert_eq!(tool["name"], "permit");
+    let required = tool["inputSchema"]["required"].as_array().unwrap();
+    assert!(required.contains(&"tool_name".into()) && required.contains(&"input".into()));
+    assert_eq!(got[2]["error"]["code"], -32601);
+    let d = decision(&got[3]);
+    assert_eq!(d["behavior"], "deny");
+    assert_eq!(d["message"], "claude-proxy could not record the request.");
+
+    std::fs::remove_file(run.join("asks")).unwrap();
+    std::fs::write(run.join("stop"), "").unwrap();
+    let got = replies(&[init, call]);
+    assert_eq!(got.len(), 2, "{got:?}");
+    let d = decision(&got[1]);
+    assert_eq!(d["behavior"], "deny");
+    assert_eq!(d["message"], "The run was stopped.");
+    let left = std::fs::read_dir(run.join("asks"))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+        .count();
+    assert_eq!(left, 0);
+}
+
+#[test]
+fn a_permission_ask_reaches_its_session_and_only_a_question_takes_an_answer() {
+    let env = setup();
+    let session = "44444444-4444-4444-8444-555555555555";
+    let id = stdout(&run_as(
+        &env,
+        Path::new(env!("CARGO_BIN_EXE_claude-proxy")),
+        &["run", "--account", "claude", "ask first"],
+        &[("CLAUDE_CODE_SESSION_ID", session)],
+    ));
+    assert_eq!(
+        cp(&env, &["wait", &id, "--timeout", "30"]).status.code(),
+        Some(2)
+    );
+    let out = cp(&env, &["answer", &id, "yes"]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("not asking a question"), "{err}");
+
+    let news = stdout(&hook(
+        &env,
+        "prompt",
+        &format!(r#"{{"session_id":"{session}","permission_mode":"default"}}"#),
+    ));
+    assert!(
+        news.contains(&format!(
+            "- {id} is waiting for an answer: ? permission to use Bash"
+        )),
+        "{news}"
+    );
+    assert!(cp(&env, &["deny", &id, "no"]).status.success());
+    assert_eq!(
+        cp(&env, &["wait", &id, "--timeout", "30"]).status.code(),
+        Some(0)
+    );
+}
+
+#[test]
+fn pruning_spares_queued_messages_live_children_and_kept_worktrees() {
+    let env = setup();
+    let repo = env.home.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("file.txt"), "x").unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+            .args(args)
+            .current_dir(&repo)
+            .env("HOME", &env.home)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    git(&["add", "."]);
+    git(&["commit", "-qm", "init"]);
+
+    // Every run exists before any is aged: `run` prunes too.
+    let start = |args: &[&str]| {
+        let id = stdout(&cp(&env, args));
+        cp(&env, &["wait", &id, "--timeout", "30"]);
+        id
+    };
+    let done = start(&["run", "--account", "claude", "hello"]);
+    let failed = start(&["run", "--account", "acct-a", "limited job"]);
+    let parent = start(&["run", "--account", "claude", "--name", "orch", "plan it"]);
+    let tree = start(&[
+        "run",
+        "--account",
+        "claude",
+        "--worktree",
+        "--cwd",
+        repo.to_str().unwrap(),
+        "hi",
+    ]);
+    let child = stdout(&run_as(
+        &env,
+        Path::new(env!("CARGO_BIN_EXE_claude-proxy")),
+        &["run", "--account", "claude", "sleep please"],
+        &[("CLAUDE_PROXY_RUN", parent.as_str())],
+    ));
+    wait_until("the child works", || {
+        status(&env, &child)["state"] == "working"
+    });
+
+    for id in [&done, &failed, &parent, &tree] {
+        age(&env, id, 25 * 3600);
+    }
+    let inbox = env
+        .home
+        .join(format!(".config/claude-proxy/runs/{failed}/inbox"));
+    std::fs::create_dir_all(&inbox).unwrap();
+    std::fs::write(
+        inbox.join("000000000000000000000001-00000000000000ab.txt"),
+        "later",
+    )
+    .unwrap();
+
+    cp(&env, &["runs"]);
+    assert!(!cp(&env, &["status", &done]).status.success(), "not pruned");
+    for id in [&failed, &parent, &tree] {
+        assert!(
+            cp(&env, &["status", id]).status.success(),
+            "{id} was pruned"
+        );
+    }
+    cp(&env, &["kill", &child]);
 }
