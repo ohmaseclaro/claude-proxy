@@ -37,7 +37,7 @@ them (for example, `meta.json` is written only under `run.lock`).
 
 ## Checks
 
-The same commands CI runs, in its order:
+What CI runs (shellcheck only on Linux), as you would run it locally:
 
 ```console
 $ cargo fmt --all -- --check
