@@ -9,8 +9,8 @@
 //! idle a while. It holds `run.lock` while alive — that lock, not a pid, is how
 //! every other command knows it is there.
 //!
-//! `~/.config/claude-proxy/runs/<id>/`: `meta.json` (written only by the
-//! drainer once it starts), `events.jsonl` (the transcript: Claude's
+//! `~/.config/claude-proxy/runs/<id>/`: `meta.json` (written only under
+//! run.lock), `events.jsonl` (the transcript: Claude's
 //! stream-json plus our message/turn markers), `inbox/` (queued messages),
 //! `account` (a pending account switch), `stop` (a kill in progress),
 //! `pending` (a drainer was requested and has not taken the lock yet),
@@ -19,7 +19,7 @@
 //! and a permission mode granted through `allow`), `mcp.json` (the MCP servers
 //! Claude starts with), `stderr.log`, `run.lock`.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -143,7 +143,7 @@ pub fn events_path(id: &str) -> PathBuf {
 }
 
 pub fn load(id: &str) -> Result<Meta, String> {
-    if id.is_empty() || id.contains(['/', '\\', '.']) {
+    if !crate::paths::valid_id(id) {
         return Err(format!("no run {id:?}"));
     }
     let bytes = fs::read(run_dir(id).join("meta.json")).map_err(|_| match removed_note(id) {
@@ -153,6 +153,7 @@ pub fn load(id: &str) -> Result<Meta, String> {
     serde_json::from_slice(&bytes).map_err(|e| format!("run {id:?} is unreadable: {e}"))
 }
 
+/// Callers hold run.lock, or are `start` creating the run before any drainer.
 pub(crate) fn save(dir: &Path, meta: &mut Meta) -> Result<(), String> {
     meta.updated_at = now_secs();
     serde_json::to_vec_pretty(meta)
@@ -241,7 +242,7 @@ pub fn send(id: &str, message: &str, account: Option<&str>) -> Result<(), String
     load(id)?;
     let dir = run_dir(id);
     if let Some(account) = account {
-        fs::write(dir.join("account"), account)
+        crate::paths::write_atomic(&dir.join("account"), account.as_bytes(), 0o600)
             .map_err(|e| format!("could not switch the account: {e}"))?;
     }
     // A new message is how a killed run is resumed.
@@ -261,7 +262,7 @@ pub fn send(id: &str, message: &str, account: Option<&str>) -> Result<(), String
 /// covers the moment before the drainer holds the lock, so nothing mistakes
 /// the run for finished in between.
 pub(crate) fn request_drainer(id: &str) -> Result<(), String> {
-    fs::write(run_dir(id).join("pending"), "")
+    crate::paths::write_atomic(&run_dir(id).join("pending"), b"", 0o600)
         .map_err(|e| format!("could not queue the run: {e}"))?;
     spawn_drainer(id)
 }
@@ -323,12 +324,7 @@ pub(crate) fn inbox_names(dir: &Path) -> Vec<String> {
 }
 
 pub(crate) fn lock_file(dir: &Path) -> std::io::Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(dir.join("run.lock"))
+    crate::paths::append(&dir.join("run.lock"))
 }
 
 /// Whether a drainer is alive for this run: it holds the lock exclusively.
@@ -696,11 +692,12 @@ pub fn kill(id: &str) -> Result<bool, String> {
         release(&dir)?;
         return Ok(false);
     }
-    fs::write(dir.join("stop"), "").map_err(|e| format!("could not stop the run: {e}"))?;
+    crate::paths::write_atomic(&dir.join("stop"), b"", 0o600)
+        .map_err(|e| format!("could not stop the run: {e}"))?;
     let started = Instant::now();
     while alive(&dir) || pending(&dir) {
         if started.elapsed() > Duration::from_secs(10) {
-            return Err("the run did not stop within 10s".into());
+            return Err(format!("run {id} did not stop within 10s. It is still marked to stop and stops as soon as it can; a message sent to it before then resumes it instead."));
         }
         // A pid in meta is this run's only while its drainer holds the lock,
         // and it can land just after we look.
@@ -797,8 +794,10 @@ pub(crate) fn notify_parent(meta: &Meta, news: &str) {
     let Some(parent) = &meta.parent else {
         return;
     };
-    // A killed parent stays stopped: a message would resume it.
-    if load(parent).map_or(true, |p| p.state == State::Killed) {
+    // A killed or stopping parent stays stopped: a message would resume it.
+    if load(parent).map_or(true, |p| p.state == State::Killed)
+        || run_dir(parent).join("stop").exists()
+    {
         return;
     }
     let _ = send(parent, &parent_message(meta, news), None);
@@ -850,7 +849,8 @@ pub fn of_session(all: &[Meta], session: &str) -> Vec<String> {
 
 /// Ask an idle drainer to exit and wait until it has.
 fn release(dir: &Path) -> Result<(), String> {
-    fs::write(dir.join("release"), "").map_err(|e| format!("could not release the run: {e}"))?;
+    crate::paths::write_atomic(&dir.join("release"), b"", 0o600)
+        .map_err(|e| format!("could not release the run: {e}"))?;
     let started = Instant::now();
     while alive(dir) {
         if started.elapsed() > Duration::from_secs(10) {
@@ -891,7 +891,7 @@ pub fn wait(id: &str, timeout: Option<Duration>) -> Result<Waited, String> {
 /// Open the run's session interactively in this terminal. Messages sent
 /// meanwhile wait behind the run lock and are delivered after it closes.
 pub fn attach(id: &str) -> Result<i32, String> {
-    let mut meta = load(id)?;
+    let meta = load(id)?;
     let dir = run_dir(id);
     // Two processes must never hold the same session: let go of a warm one.
     if alive(&dir) && is_idle(&meta) && queued(&dir) == 0 {
@@ -903,6 +903,8 @@ pub fn attach(id: &str) -> Result<i32, String> {
             "run {id} is working; wait for it or stop it first:  claude-proxy kill {id}"
         ));
     }
+    // The released drainer saved on its way out.
+    let mut meta = load(id)?;
     let mut cmd = crate::proxy::interactive_command(&meta.account, Path::new(&meta.cwd))?;
     let flag = if session_file(&meta).is_some() {
         "--resume"

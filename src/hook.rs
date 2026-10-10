@@ -78,7 +78,7 @@ fn remember_mode(v: &Value) {
     else {
         return;
     };
-    if valid_session_id(session) {
+    if crate::paths::valid_id(session) {
         let dir = config_dir().join("sessions");
         // ponytail: one small file per session, never pruned; prune by age if it ever matters.
         let _ = crate::paths::private_dir(&dir)
@@ -88,7 +88,7 @@ fn remember_mode(v: &Value) {
 
 /// The permission mode last seen for a Claude session.
 pub fn session_mode(session: &str) -> Option<String> {
-    if !valid_session_id(session) {
+    if !crate::paths::valid_id(session) {
         return None;
     }
     fs::read_to_string(config_dir().join("sessions").join(session))
@@ -117,7 +117,7 @@ fn first_ask(m: &Meta) -> String {
 
 /// The session's runs that finished since its last prompt, and those asking.
 fn news_since_last_prompt(session: &str) -> Option<String> {
-    if !valid_session_id(session) {
+    if !crate::paths::valid_id(session) {
         return None;
     }
     let all = runs::list();
@@ -194,14 +194,10 @@ fn runs_still_going(session: &str) -> Option<String> {
     })
 }
 
-fn valid_session_id(s: &str) -> bool {
-    !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-}
-
 /// Whether the proxy-runs mod marked this hook's session as loaded.
 fn mod_handles(sessions: &Path, v: &Value) -> bool {
     v["session_id"].as_str().is_some_and(|s| {
-        valid_session_id(s)
+        crate::paths::valid_id(s)
             && fs::read_to_string(sessions.join(format!("{s}.mod"))).is_ok_and(|m| m.trim() == "on")
     })
 }
@@ -242,7 +238,7 @@ fn redirect(v: &Value, applies: bool) -> Option<String> {
     }
     Some(format!(
         "The user's claude-proxy policy sends subagent work to managed runs, so this {tool} \
-         call was not made. Run instead:\n\n  {cmd} <<'EOF'\n  <the same prompt>\n  EOF\n\n\
+         call was not made. Run instead:\n\n  {cmd} <<'CLAUDE_PROXY_TASK'\n  <the same prompt>\n  CLAUDE_PROXY_TASK\n\n\
          Then run `claude-proxy wait <id>` on its own — in the background if you will be \
          notified when it ends, otherwise in the foreground — where exit code 2 means it is \
          asking you something; and tell the user the run id, its account, and \
@@ -281,6 +277,7 @@ mod tests {
             ),
             "{message}"
         );
+        assert!(message.contains("<<'CLAUDE_PROXY_TASK'"), "{message}");
         let builtin = call(json!({"subagent_type": "Explore", "description": "look"})).unwrap();
         assert!(
             builtin.contains("claude-proxy run --name look -"),
@@ -308,13 +305,5 @@ mod tests {
         assert!(!mod_handles(dir.path(), &call));
         let escape = json!({"session_id": "../s-1"});
         assert!(!mod_handles(&dir.path().join("x"), &escape));
-    }
-
-    #[test]
-    fn session_ids_cannot_escape_the_sessions_dir() {
-        assert!(valid_session_id("7ecce39f-0ebf-43d2-bdff-c0fa9272d4b0"));
-        for bad in ["", "../x", "a/b", "a.b"] {
-            assert!(!valid_session_id(bad), "{bad:?}");
-        }
     }
 }

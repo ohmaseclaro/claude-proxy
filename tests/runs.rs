@@ -354,7 +354,12 @@ fn wait_after_send_reports_the_new_turn_even_under_status_probes() {
             let (env, id, stop) = (Arc::clone(&env), id.clone(), Arc::clone(&stop));
             std::thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
-                    cp(&env, &["status", &id]);
+                    let out = cp(&env, &["status", &id]);
+                    assert!(
+                        out.status.success(),
+                        "status read an unreadable meta.json: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    );
                 }
             })
         })
@@ -669,6 +674,35 @@ fn a_warm_claude_takes_follow_ups_without_restarting() {
         cp(&env, &["rm", &id]).status.success(),
         "rm lets go of a warm run"
     );
+}
+
+#[test]
+fn attach_keeps_what_the_released_drainer_saved() {
+    let env = setup();
+    let exe = Path::new(env!("CARGO_BIN_EXE_claude-proxy"));
+    let id = stdout(&run_as(
+        &env,
+        exe,
+        &["run", "--account", "claude", "hello"],
+        &[("CLAUDE_PROXY_IDLE_SECS", "60")],
+    ));
+    cp(&env, &["wait", &id, "--timeout", "30"]);
+    let path = env
+        .home
+        .join(format!(".config/claude-proxy/runs/{id}/meta.json"));
+    let meta = || -> Value { serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap() };
+    assert!(meta()["turn_pid"].is_number(), "the warm Claude is up");
+
+    let out = cp(&env, &["attach", &id]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    settled(&env, &id);
+    let after = meta();
+    assert!(after["turn_pid"].is_null(), "{after}");
+    assert!(after["activity"].is_null(), "{after}");
 }
 
 #[test]
@@ -1117,7 +1151,7 @@ fn run_state_is_private_to_the_user() {
         .find(|p| p.extension().is_some_and(|x| x == "json"))
         .unwrap();
     assert_eq!(mode(&ask), 0o600);
-    for file in ["events.jsonl", "stderr.log", "mcp.json"] {
+    for file in ["events.jsonl", "stderr.log", "mcp.json", "run.lock"] {
         assert_eq!(mode(&run.join(file)), 0o600, "{file}");
     }
 
@@ -1197,4 +1231,42 @@ fn kill_never_signals_a_pid_a_dead_drainer_left() {
     let _ = bystander.kill();
     let _ = bystander.wait();
     assert!(alive, "kill signalled a pid no drainer held");
+}
+
+#[test]
+fn a_kill_that_times_out_leaves_the_run_stopping() {
+    let env = setup();
+    let exe = Path::new(env!("CARGO_BIN_EXE_claude-proxy"));
+    let parent = stdout(&cp(
+        &env,
+        &["run", "--account", "claude", "--name", "orch", "plan it"],
+    ));
+    cp(&env, &["wait", &parent, "--timeout", "30"]);
+    settled(&env, &parent);
+    let run = env.home.join(".config/claude-proxy/runs").join(&parent);
+    // No drainer ever takes the lock, so the kill cannot finish.
+    std::fs::write(run.join("pending"), "").unwrap();
+
+    let out = cp(&env, &["kill", &parent]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("still marked to stop"), "{err}");
+    assert_eq!(mode(&run.join("stop")), 0o600);
+
+    let inside = [("CLAUDE_PROXY_RUN", parent.as_str())];
+    let child = stdout(&run_as(
+        &env,
+        exe,
+        &["run", "--account", "claude", "build it"],
+        &inside,
+    ));
+    cp(&env, &["wait", &child, "--timeout", "30"]);
+    settled(&env, &child);
+    assert!(run.join("stop").exists(), "a child resumed a stopping run");
+    assert_eq!(status(&env, &parent)["queued"], 0);
+    let log = std::fs::read_to_string(&env.log).unwrap();
+    assert!(
+        !log.contains(&format!("(claude-proxy) Run {child}")),
+        "{log}"
+    );
 }

@@ -285,7 +285,7 @@ test('a run started through Bash gets its card under the command', async ($, on)
     props: {
       tool_use_id: 'b1',
       tool: 'Bash',
-      input: { command: 'claude-proxy run - <<EOF\nhi\nEOF', description: 'Start run' },
+      input: { command: 'claude-proxy run - <<CLAUDE_PROXY_TASK\nhi\nCLAUDE_PROXY_TASK', description: 'Start run' },
       output: { stdout: 'abc123\n', stderr: 'claude-proxy: run abc123 on claude-personal — follow it', interrupted: false },
       isRunning: false,
       isErrored: false,

@@ -43,6 +43,11 @@ pub fn home() -> PathBuf {
     PathBuf::from(".")
 }
 
+/// A run or Claude session id that is safe as one file name under the config dir.
+pub fn valid_id(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
 /// Replace `path` through a temp created with `mode`, unique per process and call.
 pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
     static WRITES: AtomicUsize = AtomicUsize::new(0);
@@ -172,6 +177,17 @@ mod tests {
         fs::set_permissions(&old, fs::Permissions::from_mode(0o755)).unwrap();
         private_dir(&old).unwrap();
         assert_eq!(mode(&old), 0o700);
+    }
+
+    #[test]
+    fn ids_cannot_escape_their_dir() {
+        for good in ["a1b2c3", "7ecce39f-0ebf-43d2-bdff-c0fa9272d4b0"] {
+            assert!(valid_id(good), "{good:?}");
+        }
+        let long = "a".repeat(65);
+        for bad in ["", "../x", "a/b", "a.b", "a b", long.as_str()] {
+            assert!(!valid_id(bad), "{bad:?}");
+        }
     }
 
     #[test]
