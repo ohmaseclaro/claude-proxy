@@ -48,7 +48,8 @@ jobs:
         with:
           node-version: 22
       - name: install Claude Code
-        run: npm i -g @anthropic-ai/claude-code
+        # Pinned: later releases skip writing the mod types in a logged-out session.
+        run: npm i -g @anthropic-ai/claude-code@2.1.288
       - name: validate
         run: |
           claude plugin validate . --strict
