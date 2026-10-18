@@ -431,7 +431,7 @@ fn list_cmd(as_json: bool, refresh: bool) -> Result<i32, String> {
     }
     let reports = quota::reports(&quota::accounts(), refresh);
     let now = quota::now_secs();
-    let pick = quota::choose_among(&reports, now, |r| registry.in_auto(&r.label));
+    let pick = quota::choose_among(&reports, now, None, |r| registry.in_auto(&r.label));
 
     if as_json {
         let accounts: Vec<_> = reports
@@ -444,6 +444,7 @@ fn list_cmd(as_json: bool, refresh: bool) -> Result<i32, String> {
                     "logged_in": r.logged_in,
                     "auto": registry.in_auto(&r.label),
                     "pressure": r.pressure(now),
+                    "drain_rate": quota::drain_rate(r, now, None),
                     "windows": r.windows.iter().map(|w| json!({
                         "name": w.name,
                         "used": w.used_at(now),
@@ -479,6 +480,9 @@ fn list_cmd(as_json: bool, refresh: bool) -> Result<i32, String> {
             r.email.as_deref().unwrap_or("-"),
             quota_text(r, now),
         );
+        if let Some(rate) = quota::drain_rate(r, now, None).filter(|_| r.logged_in) {
+            line.push_str(&format!("  · weekly {rate:.2}%/h to reset"));
+        }
         if !registry.in_auto(&r.label) {
             line.push_str("  (not in auto)");
         }
@@ -488,7 +492,8 @@ fn list_cmd(as_json: bool, refresh: bool) -> Result<i32, String> {
         println!("{}", line.trim_end());
     }
     println!(
-        "\n→ = what `claude-proxy auto` would use · (…) = time to reset · \
+        "\n→ = what `claude-proxy auto` would use: room in every window, then the weekly \
+         quota that expires fastest (%/h left until its reset) · (…) = time to reset · \
          cached {} min (--refresh to update)",
         quota::CACHE_TTL_SECS / 60
     );
@@ -498,7 +503,8 @@ fn list_cmd(as_json: bool, refresh: bool) -> Result<i32, String> {
 fn auto_cmd(args: &[OsString]) -> Result<i32, String> {
     let reports = quota::reports(&quota::auto_accounts(), false);
     let now = quota::now_secs();
-    let pick = quota::choose(&reports, now).ok_or(NO_AUTO_ACCOUNT)?;
+    let pick = quota::choose_for(&reports, now, quota::model_arg(args).as_deref())
+        .ok_or(NO_AUTO_ACCOUNT)?;
     let r = &reports[pick];
     eprintln!("claude-proxy: auto → {} ({})", r.label, quota_text(r, now));
     if r.pressure(now).is_some_and(|p| p >= 100.0) {
