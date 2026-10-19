@@ -185,9 +185,20 @@ owner-only files. The proxy clears inherited credentials and any host app's
 session identity, then execs `claude`.
 
 The primary `~/.claude` login takes part in `list` and `auto` whenever it is
-logged in. `auto` picks the account under the least pressure: the fullest usage
-window (5-hour, 7-day, or a model-scoped weekly cap) that has not reset yet, ties
-going to the emptier 7-day window. It chooses once, at launch.
+logged in. Weekly quota is use-it-or-lose-it: what is unused at the weekly
+reset is gone. So `auto`, a run's first account and failover pick, among
+accounts under 95% in every window that limits the run (5-hour, 7-day, and the
+model-scoped weekly cap for its `--model`, such as `7d fable` for a Fable run),
+the one whose unused weekly quota expires fastest: percent left per hour until
+its weekly reset. An account near its reset with quota left is spent before one
+with a distant reset. Ties go to the least pressure (the fullest window not yet
+reset). Accounts near a limit, at one, and with unknown quota come after, in
+that order. `auto` chooses once, at launch. A managed run on `auto` keeps
+choosing: between turns (at most every 15 minutes, and never while Claude has
+background tasks) it moves to the best account when that account drains its
+weekly quota at least 1.5 times as fast, or when its own is near a limit, so a
+long run does not pin one account for days. `CLAUDE_PROXY_REBALANCE=0` turns
+this off.
 
 ### Quota
 

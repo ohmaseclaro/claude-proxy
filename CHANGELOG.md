@@ -11,6 +11,31 @@ has its own version and first shipped in 0.8.0.
 
 ## [Unreleased]
 
+### Changed
+
+- Account choice (`auto`, a run's first account, failover) spends the weekly
+  quota that expires soonest: among accounts under 95% in every window that
+  limits the run, the one with the most unused weekly percent per hour until
+  its weekly reset wins, ties going to the least pressure. Accounts near a
+  limit, at one, and with unknown quota follow, in that order.
+- A model-scoped weekly cap (`7d fable`, `7d opus`, `7d sonnet`) now limits
+  only runs whose `--model` is in that family.
+- A run on `auto` follows the balance instead of staying on the account it
+  started on: between turns, at most every 15 minutes and only while Claude has
+  no background tasks, it moves to the best account when that account drains
+  its weekly quota at least 1.5 times as fast (and 0.1 points an hour more), or
+  when its own account is near or at a limit. A balance move needs room in the
+  target's 5-hour window (under 70%), takes one run onto an account per 15
+  minutes, and skips an account that refused a turn in the last hour. The check
+  reads the cache first, so a turn waits on a lookup only to confirm a move.
+  The move shows as `⇄` in the transcript and as `moved` in `status`.
+  `CLAUDE_PROXY_REBALANCE=0` turns it off.
+
+### Added
+
+- `list` shows each account's weekly drain rate; `list --json` adds
+  `drain_rate`.
+
 ## [0.11.0] - 2026-10-18
 
 ### Added

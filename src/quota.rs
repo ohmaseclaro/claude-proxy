@@ -88,21 +88,78 @@ impl Report {
 }
 
 pub fn pressure(windows: &[Window], now: i64) -> Option<f64> {
+    pressure_for(windows, now, None)
+}
+
+fn pressure_for(windows: &[Window], now: i64, model: Option<&str>) -> Option<f64> {
     windows
         .iter()
+        .filter(|w| applies(w, model))
         .map(|w| w.used_at(now))
         .fold(None, |acc, u| Some(acc.map_or(u, |a: f64| a.max(u))))
 }
 
-pub fn choose(reports: &[Report], now: i64) -> Option<usize> {
-    choose_among(reports, now, |_| true)
+/// From here a run is likely to hit the limit and move, so the account waits
+/// behind every account with more room.
+const NEAR_LIMIT: f64 = 95.0;
+/// A weekly window with no reset time has not started yet.
+const WEEK_SECS: i64 = 7 * 86_400;
+const MIN_HOURS_LEFT: f64 = 0.25;
+
+/// A model-scoped weekly cap (`7d fable`) limits only runs on that model;
+/// with no model known, every window counts.
+fn applies(w: &Window, model: Option<&str>) -> bool {
+    let family = w
+        .name
+        .strip_prefix("7d ")
+        .and_then(|f| f.split_whitespace().next());
+    match (family, model) {
+        (Some(family), Some(model)) => model.to_lowercase().contains(family),
+        _ => true,
+    }
 }
 
-/// The best of the reports `keep` accepts, as an index into all of them.
-pub fn choose_among(reports: &[Report], now: i64, keep: impl Fn(&Report) -> bool) -> Option<usize> {
-    let rank = |r: &Report| match r.pressure(now) {
-        Some(p) => (0u8, p, weekly_used(r, now)),
-        None => (1u8, 0.0, 0.0),
+/// Percent of the binding weekly window still unused, per hour until it resets.
+/// Weekly quota left at the reset is lost, so the highest rate is spent first.
+pub fn drain_rate(r: &Report, now: i64, model: Option<&str>) -> Option<f64> {
+    r.windows
+        .iter()
+        .filter(|w| w.name.starts_with("7d") && applies(w, model))
+        .map(|w| {
+            let left = (100.0 - w.used_at(now)).max(0.0);
+            let secs = w
+                .resets_at
+                .filter(|t| *t > now)
+                .map_or(WEEK_SECS, |t| t - now);
+            (left, left / (secs as f64 / 3600.0).max(MIN_HOURS_LEFT))
+        })
+        .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal))
+        .map(|(_, rate)| rate)
+}
+
+pub fn choose_for(reports: &[Report], now: i64, model: Option<&str>) -> Option<usize> {
+    choose_among(reports, now, model, |_| true)
+}
+
+/// The best of the reports `keep` accepts for a run on `model`, as an index
+/// into all of them: room in every window that limits the run, then the
+/// highest [`drain_rate`], then the least pressure. Accounts near a limit, at
+/// one, and with unknown quota follow, in that order.
+pub fn choose_among(
+    reports: &[Report],
+    now: i64,
+    model: Option<&str>,
+    keep: impl Fn(&Report) -> bool,
+) -> Option<usize> {
+    let fresh_week = 100.0 / (WEEK_SECS as f64 / 3600.0);
+    let rank = |r: &Report| match pressure_for(&r.windows, now, model) {
+        None => (3u8, 0.0, 0.0),
+        Some(p) if p >= 100.0 => (2, p, 0.0),
+        Some(p) => (
+            u8::from(p >= NEAR_LIMIT),
+            -drain_rate(r, now, model).unwrap_or(fresh_week),
+            p,
+        ),
     };
     reports
         .iter()
@@ -112,15 +169,104 @@ pub fn choose_among(reports: &[Report], now: i64, keep: impl Fn(&Report) -> bool
         .map(|(i, _)| i)
 }
 
-fn weekly_used(r: &Report, now: i64) -> f64 {
-    r.windows
+/// A run moves between turns only when the best account drains its weekly
+/// quota this many times as fast as the run's account, and by this many points
+/// an hour: a move re-reads the conversation without the prompt cache.
+const MOVE_RATIO: f64 = 1.5;
+const MOVE_MIN_GAP: f64 = 0.1;
+/// Runs do not move for balance onto an account whose 5-hour window is this
+/// full: the moves themselves would push it over.
+const MOVE_MAX_5H: f64 = 70.0;
+
+/// A move [`rebalance_target`] recommends. `urgent` when the run's account is
+/// near or at a limit; otherwise the move is for balance.
+#[derive(Debug, PartialEq)]
+pub struct Move {
+    pub to: String,
+    pub why: String,
+    pub urgent: bool,
+}
+
+/// Where a run on `current` should move between turns, if anywhere, among the
+/// accounts `skip` does not rule out: the best account for `model` when
+/// `current` is near or at a limit and the best is not, or when the best drains
+/// its weekly quota much faster and has room in its 5-hour window.
+pub fn rebalance_target(
+    reports: &[Report],
+    now: i64,
+    model: Option<&str>,
+    current: &str,
+    skip: impl Fn(&str) -> bool,
+) -> Option<Move> {
+    let cur = reports.iter().find(|r| r.label == current)?;
+    let best = &reports[choose_among(reports, now, model, |r| {
+        r.label == current || !skip(&r.label)
+    })?];
+    if best.label == current {
+        return None;
+    }
+    let (cur_p, best_p) = (
+        pressure_for(&cur.windows, now, model)?,
+        pressure_for(&best.windows, now, model)?,
+    );
+    let to = best.label.clone();
+    for (limit, why) in [
+        (100.0, "is at its limit"),
+        (NEAR_LIMIT, "is near its limit"),
+    ] {
+        if cur_p >= limit && best_p < limit {
+            let why = why.to_string();
+            return Some(Move {
+                to,
+                why,
+                urgent: true,
+            });
+        }
+    }
+    let five_hour = best
+        .windows
         .iter()
-        .find(|w| w.name == "7d")
-        .map_or(0.0, |w| w.used_at(now))
+        .find(|w| w.name == "5h")
+        .map_or(0.0, |w| w.used_at(now));
+    if best_p >= NEAR_LIMIT || five_hour >= MOVE_MAX_5H {
+        return None;
+    }
+    let (b, c) = (drain_rate(best, now, model)?, drain_rate(cur, now, model)?);
+    (b >= c * MOVE_RATIO && b - c >= MOVE_MIN_GAP).then(|| Move {
+        why: format!("spends weekly quota slower ({c:.2}%/h left to its reset, {to} {b:.2}%/h)"),
+        to,
+        urgent: false,
+    })
+}
+
+/// The model a `claude` command line asks for: `--model x` or `--model=x`.
+pub fn model_arg<S: AsRef<std::ffi::OsStr>>(args: &[S]) -> Option<String> {
+    let mut it = args.iter().map(|a| a.as_ref().to_string_lossy());
+    while let Some(a) = it.next() {
+        if a == "--model" {
+            return it.next().map(|m| m.into_owned());
+        }
+        if let Some(m) = a.strip_prefix("--model=") {
+            return Some(m.to_string());
+        }
+    }
+    None
 }
 
 pub fn reports(accounts: &[Account], force: bool) -> Vec<Report> {
     reports_with(accounts, |a| report(a, force))
+}
+
+/// Like [`reports`], from the cache only, whatever its age: no network.
+pub fn cached_reports(accounts: &[Account]) -> Vec<Report> {
+    reports_with(accounts, |a| lookup(a, Fetch::Never))
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Fetch {
+    Never,
+    IfStale,
+    Always,
 }
 
 fn reports_with(accounts: &[Account], lookup: impl Fn(&Account) -> Report + Sync) -> Vec<Report> {
@@ -149,6 +295,10 @@ fn reports_with(accounts: &[Account], lookup: impl Fn(&Account) -> Report + Sync
 }
 
 pub fn report(account: &Account, force: bool) -> Report {
+    lookup(account, if force { Fetch::Always } else { Fetch::IfStale })
+}
+
+fn lookup(account: &Account, fetch: Fetch) -> Report {
     let now = now_secs();
     let cache = cache_path(&account.label);
     let cached = read_cache(&cache);
@@ -196,7 +346,7 @@ pub fn report(account: &Account, force: bool) -> Report {
     let fresh = cached
         .as_ref()
         .is_some_and(|(at, _)| now - at < CACHE_TTL_SECS);
-    if fresh && !force {
+    if fetch == Fetch::Never || (fresh && fetch == Fetch::IfStale) {
         apply_cache(&mut r);
         return r;
     }
@@ -434,6 +584,31 @@ fn email(config_dir: Option<&Path>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Mark that something happened to an account now, for every run to see:
+/// `refused` when it refused a turn, `moved-in` when a run moved onto it.
+pub fn stamp(label: &str, kind: &str) {
+    stamp_at(&cache_path(label).with_extension(kind), now_secs());
+}
+
+/// Whether [`stamp`] marked `kind` on the account in the last `secs` seconds.
+pub fn stamped_within(label: &str, kind: &str, secs: i64) -> bool {
+    stamped_within_at(&cache_path(label).with_extension(kind), now_secs(), secs)
+}
+
+fn stamp_at(path: &Path, now: i64) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, now.to_string());
+}
+
+fn stamped_within_at(path: &Path, now: i64, secs: i64) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .is_some_and(|at| now - at < secs)
+}
+
 pub fn invalidate(label: &str) {
     let _ = std::fs::remove_file(cache_path(label));
 }
@@ -567,6 +742,10 @@ mod tests {
         }
     }
 
+    fn choose(reports: &[Report], now: i64) -> Option<usize> {
+        choose_for(reports, now, None)
+    }
+
     fn report(label: &str, logged_in: bool, windows: Vec<Window>) -> Report {
         Report {
             label: label.into(),
@@ -653,8 +832,11 @@ mod tests {
             report("busy", true, vec![window("5h", 80.0, None)]),
         ];
         assert_eq!(choose(&reports, 0), Some(0));
-        assert_eq!(choose_among(&reports, 0, |r| r.label != "roomy"), Some(1));
-        assert_eq!(choose_among(&reports, 0, |_| false), None);
+        assert_eq!(
+            choose_among(&reports, 0, None, |r| r.label != "roomy"),
+            Some(1)
+        );
+        assert_eq!(choose_among(&reports, 0, None, |_| false), None);
     }
 
     #[test]
@@ -686,6 +868,135 @@ mod tests {
             ),
         ];
         assert_eq!(choose(&reports, 0), Some(1));
+    }
+
+    #[test]
+    fn drains_the_weekly_quota_that_expires_soonest() {
+        let h = 3600;
+        let reports = vec![
+            // 90% left over 120h: 0.75%/h.
+            report("fresh", true, vec![window("7d", 10.0, Some(120 * h))]),
+            // 30% left, gone in 2h: 15%/h.
+            report("expiring", true, vec![window("7d", 70.0, Some(2 * h))]),
+        ];
+        assert_eq!(choose(&reports, 0), Some(1));
+        assert!((drain_rate(&reports[0], 0, None).unwrap() - 0.75).abs() < 1e-9);
+        // After its reset, a whole new week drains slower than the old one.
+        assert!(drain_rate(&reports[1], 3 * h, None).unwrap() < 0.6);
+        assert_eq!(choose(&reports, 3 * h), Some(0));
+    }
+
+    #[test]
+    fn near_limit_and_blocked_accounts_wait_behind_room() {
+        let h = 3600;
+        let reports = vec![
+            report(
+                "hot",
+                true,
+                vec![window("5h", 97.0, Some(h)), window("7d", 50.0, Some(h))],
+            ),
+            report("blocked", true, vec![window("7d", 100.0, Some(h))]),
+            report("roomy", true, vec![window("7d", 5.0, Some(150 * h))]),
+        ];
+        assert_eq!(choose(&reports, 0), Some(2));
+        assert_eq!(choose(&reports[..2], 0), Some(0));
+    }
+
+    #[test]
+    fn model_scoped_caps_only_limit_their_model() {
+        let h = 3600;
+        let reports = vec![
+            report(
+                "fable-spent",
+                true,
+                vec![
+                    window("7d", 60.0, Some(10 * h)),
+                    window("7d fable", 100.0, Some(10 * h)),
+                ],
+            ),
+            report("steady", true, vec![window("7d", 20.0, Some(140 * h))]),
+        ];
+        assert_eq!(choose_for(&reports, 0, Some("claude-fable-5-1")), Some(1));
+        assert_eq!(choose_for(&reports, 0, Some("claude-sonnet-5-5")), Some(0));
+        assert_eq!(choose(&reports, 0), Some(1));
+    }
+
+    #[test]
+    fn rebalance_moves_only_for_a_clear_gain() {
+        let h = 3600;
+        let acct = |label: &str, used: f64, reset_h: i64| {
+            report(label, true, vec![window("7d", used, Some(reset_h * h))])
+        };
+        let none = |_: &str| false;
+        // 51% over 142h (0.36%/h) against 88% over 125h (0.70%/h): move.
+        let reports = vec![acct("busy", 49.0, 142), acct("idle", 12.0, 125)];
+        let m = rebalance_target(&reports, 0, None, "busy", none).unwrap();
+        assert_eq!((m.to.as_str(), m.urgent), ("idle", false));
+        assert!(m.why.contains("0.36"));
+        // Already on the best account, or the best is ruled out: stay.
+        assert!(rebalance_target(&reports, 0, None, "idle", none).is_none());
+        assert!(rebalance_target(&reports, 0, None, "busy", |l| l == "idle").is_none());
+        // 0.60 against 0.70: not worth losing the cache.
+        let close = vec![acct("a", 0.0, 168), acct("b", 12.0, 125)];
+        assert!(rebalance_target(&close, 0, None, "a", none).is_none());
+        // Nowhere better to go, or the current account is unknown: stay.
+        let full = vec![acct("x", 96.0, 100), acct("y", 97.0, 100)];
+        assert!(rebalance_target(&full, 0, None, "x", none).is_none());
+        assert!(rebalance_target(&reports, 0, None, "gone", none).is_none());
+    }
+
+    #[test]
+    fn rebalance_leaves_a_limit_and_spares_a_busy_5h_window() {
+        let h = 3600;
+        let none = |_: &str| false;
+        let with_5h = |label: &str, five: f64, week: f64| {
+            report(
+                label,
+                true,
+                vec![
+                    window("5h", five, Some(h)),
+                    window("7d", week, Some(140 * h)),
+                ],
+            )
+        };
+        // Near a limit: move to an account with room, at once.
+        let hot = vec![with_5h("hot", 96.0, 20.0), with_5h("cool", 10.0, 30.0)];
+        let m = rebalance_target(&hot, 0, None, "hot", none).unwrap();
+        assert_eq!((m.to.as_str(), m.urgent), ("cool", true));
+        // At a limit, every other account at 95-99%: still better than certain refusal.
+        let stuck = vec![with_5h("stuck", 10.0, 100.0), with_5h("tight", 10.0, 97.0)];
+        let m = rebalance_target(&stuck, 0, None, "stuck", none).unwrap();
+        assert_eq!(
+            (m.to.as_str(), m.why.as_str()),
+            ("tight", "is at its limit")
+        );
+        // A much better weekly rate, but its 5-hour window is 75% full: stay.
+        let busy = vec![with_5h("here", 10.0, 60.0), with_5h("there", 75.0, 5.0)];
+        assert!(rebalance_target(&busy, 0, None, "here", none).is_none());
+    }
+
+    #[test]
+    fn stamps_expire() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("acct.refused");
+        assert!(!stamped_within_at(&path, 100, 60));
+        stamp_at(&path, 100);
+        assert!(stamped_within_at(&path, 159, 60));
+        assert!(!stamped_within_at(&path, 160, 60));
+    }
+
+    #[test]
+    fn model_arg_reads_both_spellings() {
+        assert_eq!(
+            model_arg(&["-p", "--model", "opus"]).as_deref(),
+            Some("opus")
+        );
+        assert_eq!(
+            model_arg(&["--model=claude-haiku-5-5"]).as_deref(),
+            Some("claude-haiku-5-5")
+        );
+        assert_eq!(model_arg(&["--effort", "high"]), None);
+        assert_eq!(model_arg::<&str>(&[]), None);
     }
 
     #[test]
