@@ -55,6 +55,7 @@ pub fn drain(id: &str) -> Result<(), String> {
         idle: idle_timeout(),
         running: 0,
         wake_due: None,
+        balance_checked: None,
     };
     loop {
         match d.step() {
@@ -193,10 +194,16 @@ struct Drainer {
     running: u32,
     /// Since a background task ended while Claude was idle; it should wake up.
     wake_due: Option<Instant>,
+    balance_checked: Option<Instant>,
 }
 
 /// How long to wait for Claude to wake up on a finished task.
 const WAKE_GRACE: Duration = Duration::from_secs(120);
+/// How often a run on `auto` checks, between turns, for a better account, and
+/// how long an account takes no second run moving onto it for balance.
+const BALANCE_SECS: i64 = quota::CACHE_TTL_SECS;
+/// How long an account that refused a turn takes no run moving onto it.
+const REFUSED_SECS: i64 = 3600;
 
 impl Drainer {
     /// The drainer's stderr is the run's stderr.log.
@@ -250,6 +257,7 @@ impl Drainer {
         let during_turn = self.busy;
         let before = self.meta.state;
         if !during_turn {
+            self.rebalance();
             // Marked working before the inbox is emptied, so a waiter sees the
             // message in one place or the other.
             self.meta.state = State::Working;
@@ -283,7 +291,10 @@ impl Drainer {
             return;
         };
         let _ = fs::remove_file(self.dir.join("account"));
-        match parse_pool(spec.trim()).and_then(|pool| Ok((first_account(&pool)?, pool))) {
+        let model = crate::quota::model_arg(&self.meta.claude_args);
+        match parse_pool(spec.trim())
+            .and_then(|pool| Ok((first_account(&pool, model.as_deref())?, pool)))
+        {
             Ok((account, pool)) => {
                 if account != self.meta.account {
                     self.close();
@@ -297,6 +308,54 @@ impl Drainer {
                 json!({"event": "note", "text": format!("account switch ignored: {e}")}),
             ),
         }
+    }
+
+    /// Between turns, move a run on `auto` to an account whose weekly quota is
+    /// going to waste much faster, so long runs follow the balance instead of
+    /// staying where they started. Never while Claude has background tasks:
+    /// closing it would end them. `CLAUDE_PROXY_REBALANCE=0` turns it off.
+    fn rebalance(&mut self) {
+        if !self.meta.pool.is_empty()
+            || self.running > 0
+            || self.meta.background > 0
+            || self
+                .balance_checked
+                .is_some_and(|t| t.elapsed().as_secs() < BALANCE_SECS as u64)
+            || std::env::var("CLAUDE_PROXY_REBALANCE").is_ok_and(|v| v.trim() == "0")
+        {
+            return;
+        }
+        self.balance_checked = Some(Instant::now());
+        let accounts = quota::auto_accounts();
+        let model = quota::model_arg(&self.meta.claude_args);
+        let current = self.meta.account.clone();
+        let target = |reports: &[quota::Report]| {
+            quota::rebalance_target(reports, now_secs(), model.as_deref(), &current, |l| {
+                quota::stamped_within(l, "refused", REFUSED_SECS)
+            })
+        };
+        // The cache decides whether to look further, so a turn waits on the
+        // network only to confirm a move.
+        if target(&quota::cached_reports(&accounts)).is_none() {
+            return;
+        }
+        let Some(m) = target(&quota::reports(&accounts, false)) else {
+            return;
+        };
+        // One run at a time moves onto an account for balance, so runs do not
+        // all pile onto the same one before its figures catch up.
+        if !m.urgent && quota::stamped_within(&m.to, "moved-in", BALANCE_SECS) {
+            return;
+        }
+        quota::stamp(&m.to, "moved-in");
+        self.close();
+        let from = std::mem::replace(&mut self.meta.account, m.to.clone());
+        marker(
+            &self.dir,
+            json!({"event": "failover", "from": from, "to": m.to, "reason": m.why}),
+        );
+        self.meta.moved = Some(format!("from {from}, which {}", m.why));
+        self.save();
     }
 
     /// A wake-up Claude owes for an ended task counts as background work.
@@ -468,6 +527,7 @@ impl Drainer {
         let from = self.meta.account.clone();
         if reason == Reason::Limit {
             quota::invalidate(&from);
+            quota::stamp(&from, "refused");
         }
         let next = if self.dir.join("stop").exists() {
             None
