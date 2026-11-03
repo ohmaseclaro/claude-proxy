@@ -161,6 +161,29 @@ With 25, the account at 40% loses to one at 60% and wins over one at 70%. A
 reserve never puts it behind an account already at its limit. `list` marks it
 `(reserve 25)`.
 
+A login lasts about a month and cannot be refreshed past its end, so every
+account needs a new sign-in now and then. `doctor` checks them all live and
+signs in again, one at a time, the ones you say yes to:
+
+```console
+$ claude-proxy doctor
+✓ claude-gmail      5h 3% (4h10m) · 7d 22% (1d23h) · login ends in 27d
+✗ claude-struct     not logged in
+✗ claude-toptal     5h 0% · 7d 4% (3d15h) · login ends in 2d
+
+Sign claude-struct in again? [y/N] y
+Sign in as struct@example.com in the browser: it uses whichever claude.ai account is open there.
+✓ claude-struct     5h 0% · 7d 4% (6d4h) · login ends in 29d
+
+Sign claude-toptal in again? [y/N] n
+
+1 account(s) still need a sign-in.
+```
+
+It offers each account that is logged out, whose sign-in was refused, or whose
+login ends within three days, which `list` also flags. Without a terminal it
+only reports, and it exits 1 while any account still needs a sign-in.
+
 ```console
 $ id=$(claude-proxy run "fix the failing test in src/parser.rs")
 $ claude-proxy watch $id                                 # follow it live

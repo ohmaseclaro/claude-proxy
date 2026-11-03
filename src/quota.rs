@@ -23,6 +23,10 @@ const REFRESH_USER_AGENT: &str = "claude-cli/1.0";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 pub const CACHE_TTL_SECS: i64 = 15 * 60;
 const REFRESH_BUFFER_SECS: i64 = 300;
+/// Claude warns this long before a login ends.
+pub const LOGIN_WARN_SECS: i64 = 3 * 86_400;
+/// Ends every error that a new sign-in fixes; `needs_login` keys off it.
+pub const SIGN_IN_AGAIN: &str = "sign it in again with:  claude-proxy doctor";
 
 pub const PRIMARY_LABEL: &str = "claude";
 
@@ -84,11 +88,22 @@ pub struct Report {
     pub fetched_at: Option<i64>,
     pub error: Option<String>,
     pub reserve: u8,
+    /// When the login itself ends; no refresh outlives it.
+    pub login_ends: Option<i64>,
 }
 
 impl Report {
     pub fn pressure(&self, now: i64) -> Option<f64> {
         pressure(&self.windows, now)
+    }
+
+    pub fn needs_login(&self, now: i64) -> bool {
+        !self.logged_in
+            || self
+                .error
+                .as_deref()
+                .is_some_and(|e| e.ends_with(SIGN_IN_AGAIN))
+            || self.login_ends.is_some_and(|t| t - now <= LOGIN_WARN_SECS)
     }
 }
 
@@ -154,6 +169,7 @@ fn reports_with(accounts: &[Account], lookup: impl Fn(&Account) -> Report + Sync
                     fetched_at: None,
                     error: Some("quota lookup failed".into()),
                     reserve: a.reserve,
+                    login_ends: None,
                 })
             })
             .collect()
@@ -173,6 +189,7 @@ pub fn report(account: &Account, force: bool) -> Report {
         fetched_at: None,
         error: None,
         reserve: account.reserve,
+        login_ends: None,
     };
     let apply_cache = |r: &mut Report| {
         if let Some((at, usage)) = &cached {
@@ -205,6 +222,7 @@ pub fn report(account: &Account, force: bool) -> Report {
             return r;
         }
     };
+    r.login_ends = login_ends(&blob);
 
     let fresh = cached
         .as_ref()
@@ -240,7 +258,19 @@ fn fetch_live(
         doc = refresh_locked(account, source, now)?;
     }
     let token = oauth_str(&doc, "accessToken").ok_or("no access token in the credential")?;
-    get_usage(&token, &account.label)
+    get_usage(&token)
+}
+
+fn login_ends(blob: &str) -> Option<i64> {
+    let doc: Value = serde_json::from_str(blob).ok()?;
+    let oauth = doc.get("claudeAiOauth")?;
+    let ends = (oauth.get("refreshTokenExpiresAt")?.as_f64()? / 1000.0) as i64;
+    let access = oauth
+        .get("expiresAt")
+        .and_then(Value::as_f64)
+        .map_or(0, |ms| (ms / 1000.0) as i64);
+    // Claude's own rule: an access token that outlives it by days means it is stale.
+    (access <= ends + LOGIN_WARN_SECS).then_some(ends)
 }
 
 /// A credential item can outlive its login with blank tokens.
@@ -289,7 +319,7 @@ fn refresh_locked(account: &Account, source: &creds::Source, now: i64) -> Result
         return Ok(doc);
     }
     let refresh_token = oauth_str(&doc, "refreshToken").ok_or("no refresh token")?;
-    let (access, rotated, expires_in) = post_refresh(&refresh_token, &account.label)?;
+    let (access, rotated, expires_in, login_left) = post_refresh(&refresh_token)?;
 
     let oauth = doc
         .get_mut("claudeAiOauth")
@@ -300,12 +330,14 @@ fn refresh_locked(account: &Account, source: &creds::Source, now: i64) -> Result
         oauth.insert("refreshToken".into(), json!(rt));
     }
     oauth.insert("expiresAt".into(), json!(now * 1000 + expires_in * 1000));
+    if let Some(secs) = login_left {
+        oauth.insert("refreshTokenExpiresAt".into(), json!((now + secs) * 1000));
+    }
 
     if let Err(e) = creds::write(source, &doc.to_string()) {
         if rotated.is_some() {
             return Err(format!(
-                "refreshed the login but could not save it ({e}); run `{}` to sign in again",
-                account.label
+                "refreshed the login but could not save it ({e}); {SIGN_IN_AGAIN}"
             ));
         }
         // Only the access token changed: losing it costs one more refresh.
@@ -313,7 +345,7 @@ fn refresh_locked(account: &Account, source: &creds::Source, now: i64) -> Result
     Ok(doc)
 }
 
-fn post_refresh(refresh_token: &str, label: &str) -> Result<(String, Option<String>, i64), String> {
+fn post_refresh(refresh_token: &str) -> Result<(String, Option<String>, i64, Option<i64>), String> {
     let resp = ureq::post(TOKEN_URL)
         .timeout(HTTP_TIMEOUT)
         .set("Content-Type", "application/json")
@@ -344,16 +376,20 @@ fn post_refresh(refresh_token: &str, label: &str) -> Result<(String, Option<Stri
                 .get("expires_in")
                 .and_then(Value::as_f64)
                 .map_or(3600, |f| f as i64);
-            Ok((access, rotated, expires_in))
+            let login_left = v
+                .get("refresh_token_expires_in")
+                .and_then(Value::as_f64)
+                .map(|f| f as i64);
+            Ok((access, rotated, expires_in, login_left))
         }
         Err(ureq::Error::Status(code, _)) => Err(format!(
-            "token refresh failed (HTTP {code}); run `{label}` to sign in again"
+            "token refresh failed (HTTP {code}); {SIGN_IN_AGAIN}"
         )),
         Err(ureq::Error::Transport(t)) => Err(format!("token refresh failed: {}", t.kind())),
     }
 }
 
-fn get_usage(token: &str, label: &str) -> Result<Value, String> {
+fn get_usage(token: &str) -> Result<Value, String> {
     let resp = ureq::get(USAGE_URL)
         .timeout(HTTP_TIMEOUT)
         .set("Authorization", &format!("Bearer {token}"))
@@ -365,9 +401,7 @@ fn get_usage(token: &str, label: &str) -> Result<Value, String> {
         Ok(r) => r
             .into_json()
             .map_err(|_| "unreadable usage response".to_string()),
-        Err(ureq::Error::Status(401, _)) => {
-            Err(format!("sign-in expired; run `{label}` to log in again"))
-        }
+        Err(ureq::Error::Status(401, _)) => Err(format!("sign-in expired; {SIGN_IN_AGAIN}")),
         Err(ureq::Error::Status(429, _)) => Err("rate limited by the usage endpoint".into()),
         Err(ureq::Error::Status(code, _)) => Err(format!("usage lookup failed (HTTP {code})")),
         Err(ureq::Error::Transport(t)) => Err(format!("usage lookup failed: {}", t.kind())),
@@ -458,7 +492,7 @@ fn login(path: &Path, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn email(config_dir: Option<&Path>) -> Option<String> {
+pub(crate) fn email(config_dir: Option<&Path>) -> Option<String> {
     login(&claude_json(config_dir), "emailAddress")
 }
 
@@ -642,6 +676,7 @@ mod tests {
             fetched_at: None,
             error: None,
             reserve: 0,
+            login_ends: None,
         }
     }
 
@@ -782,6 +817,38 @@ mod tests {
             r#"{"claudeAiOauth":{"accessToken":"","refreshToken":"r"}}"#
         ));
         assert!(!signed_out("not json"));
+    }
+
+    #[test]
+    fn the_login_end_is_read_unless_a_fresher_token_outlives_it() {
+        let blob = |ends: i64, access: i64| {
+            json!({"claudeAiOauth": {"accessToken": "a", "refreshToken": "r",
+                   "expiresAt": access * 1000, "refreshTokenExpiresAt": ends * 1000}})
+            .to_string()
+        };
+        assert_eq!(login_ends(&blob(1_000_000, 900_000)), Some(1_000_000));
+        assert_eq!(
+            login_ends(&blob(1_000_000, 1_000_000 + LOGIN_WARN_SECS + 1)),
+            None
+        );
+        assert_eq!(login_ends(r#"{"claudeAiOauth":{"accessToken":"a"}}"#), None);
+    }
+
+    #[test]
+    fn a_login_is_needed_when_out_refused_or_ending_soon() {
+        let now = 1_000_000;
+        let mut r = report("a", true, vec![]);
+        assert!(!r.needs_login(now));
+        r.login_ends = Some(now + LOGIN_WARN_SECS + 1);
+        assert!(!r.needs_login(now));
+        r.login_ends = Some(now + LOGIN_WARN_SECS);
+        assert!(r.needs_login(now));
+        r.login_ends = None;
+        r.error = Some("usage lookup failed (HTTP 500)".into());
+        assert!(!r.needs_login(now));
+        r.error = Some(format!("sign-in expired; {SIGN_IN_AGAIN}"));
+        assert!(r.needs_login(now));
+        assert!(report("b", false, vec![]).needs_login(now));
     }
 
     #[test]

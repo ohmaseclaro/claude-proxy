@@ -68,6 +68,9 @@ enum Command {
         #[arg(value_parser = clap::value_parser!(u8).range(0..=100))]
         points: u8,
     },
+    /// Check every account's login live, then offer to sign in again, one by one,
+    /// each that is logged out, refused, or ends within three days.
+    Doctor,
     /// Remove a proxy's command (its profile and login are kept).
     Remove {
         /// The command name to remove.
@@ -274,6 +277,7 @@ fn dispatch(command: Command) -> Result<i32, String> {
         Command::Reserve { label, points } => reserve_cmd(&label, points),
         Command::List { json, refresh } => list_cmd(json, refresh),
         Command::Auto { args } => auto_cmd(&args),
+        Command::Doctor => doctor_cmd(),
         Command::Remove { label } => remove_cmd(&label),
         Command::Run {
             message,
@@ -369,7 +373,9 @@ fn dispatch(command: Command) -> Result<i32, String> {
     }
 }
 
-pub(crate) const NO_AUTO_ACCOUNT: &str = "no logged-in account for auto to use. Add one with:  \
+pub(crate) const NO_AUTO_ACCOUNT: &str =
+    "no logged-in account for auto to use. Sign them in again \
+     with:  claude-proxy doctor, add one with:  \
      claude-proxy add <name>, or let one back in with:  claude-proxy include-auto <name>";
 
 fn edit_account(label: &str, edit: impl FnOnce(&mut Registry)) -> Result<(), String> {
@@ -473,6 +479,7 @@ fn list_cmd(as_json: bool, refresh: bool) -> Result<i32, String> {
                     "logged_in": r.logged_in,
                     "auto": registry.in_auto(&r.label),
                     "reserve": r.reserve,
+                    "login_ends": r.login_ends,
                     "pressure": r.pressure(now),
                     "windows": r.windows.iter().map(|w| json!({
                         "name": w.name,
@@ -515,6 +522,9 @@ fn list_cmd(as_json: bool, refresh: bool) -> Result<i32, String> {
         if r.reserve > 0 {
             line.push_str(&format!("  (reserve {})", r.reserve));
         }
+        if r.logged_in && r.needs_login(now) {
+            line.push_str(&format!("  ({} — claude-proxy doctor)", login_text(r, now)));
+        }
         if !r.primary && !install::command_path(&bin_dir, &r.label).exists() {
             line.push_str("  (command missing — `claude-proxy add` to reinstall)");
         }
@@ -526,6 +536,91 @@ fn list_cmd(as_json: bool, refresh: bool) -> Result<i32, String> {
         quota::CACHE_TTL_SECS / 60
     );
     Ok(0)
+}
+
+fn doctor_cmd() -> Result<i32, String> {
+    let accounts = quota::accounts();
+    let reports = quota::reports(&accounts, true);
+    let now = quota::now_secs();
+    let names: Vec<String> = reports.iter().map(display_name).collect();
+    let width = names.iter().map(|n| n.chars().count()).max().unwrap_or(0);
+    for (r, name) in reports.iter().zip(&names) {
+        println!("{}", doctor_line(r, name, width, now));
+    }
+
+    let interactive = std::io::stdin().is_terminal();
+    let mut left = 0;
+    for ((account, r), name) in accounts.iter().zip(&reports).zip(&names) {
+        if !r.needs_login(now) {
+            continue;
+        }
+        if !interactive || !confirm(&format!("\nSign {} in again?", account.label)) {
+            left += 1;
+            continue;
+        }
+        let was = quota::email(account.config_dir.as_deref());
+        if let Some(email) = &was {
+            println!("Sign in as {email} in the browser: it uses whichever claude.ai account is open there.");
+        }
+        #[cfg(windows)]
+        crate::win::leave_ctrl_c_to_child();
+        crate::proxy::claude_command(account.config_dir.as_deref())
+            .args(["auth", "login"])
+            .status()
+            .map_err(|e| format!("could not run `claude`: {e}"))?;
+        let again = quota::report(account, true);
+        println!("{}", doctor_line(&again, name, width, quota::now_secs()));
+        if let (Some(was), Some(now_as)) = (&was, &again.email) {
+            if was != now_as {
+                println!("  note: it was {was} before; now it is {now_as}.");
+            }
+        }
+        if again.needs_login(quota::now_secs()) {
+            left += 1;
+        }
+    }
+
+    if left == 0 {
+        println!("\nEvery account is signed in.");
+        return Ok(0);
+    }
+    println!("\n{left} account(s) still need a sign-in.");
+    if !interactive {
+        println!("Run it in a terminal to sign them in:  claude-proxy doctor");
+    }
+    Ok(1)
+}
+
+fn doctor_line(r: &Report, name: &str, width: usize, now: i64) -> String {
+    let mark = if r.needs_login(now) {
+        "✗"
+    } else if r.error.is_some() {
+        "!"
+    } else {
+        "✓"
+    };
+    let mut line = format!("{mark} {name:width$}  {}", quota_text(r, now));
+    if r.logged_in && r.login_ends.is_some() {
+        line.push_str(&format!(" · {}", login_text(r, now)));
+    }
+    line
+}
+
+fn login_text(r: &Report, now: i64) -> String {
+    match r.login_ends {
+        Some(t) if t > now => format!("login ends in {}", quota::short_duration(t - now)),
+        Some(_) => "login ended".into(),
+        None => "login end unknown".into(),
+    }
+}
+
+fn confirm(question: &str) -> bool {
+    use std::io::Write;
+    print!("{question} [y/N] ");
+    let _ = std::io::stdout().flush();
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer).is_ok()
+        && matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 fn auto_cmd(args: &[OsString]) -> Result<i32, String> {
