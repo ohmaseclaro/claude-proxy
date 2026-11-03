@@ -13,11 +13,12 @@ has its own version and first shipped in 0.8.0.
 
 ### Added
 
-- `claude-proxy doctor`: checks every account's login live, then asks, one
-  account at a time, whether to sign in again each that is logged out, whose
+- `claude-proxy doctor`: checks every added account's login live, then asks,
+  one account at a time, whether to sign in again each that is logged out, whose
   sign-in was refused, or whose login ends within three days, runs Claude's own
-  `auth login` for it, and checks it again. Without a terminal it only reports;
-  it exits 1 while any account still needs a sign-in.
+  `auth login` for it, and checks it again. Ctrl-C cancels just that sign-in. The
+  primary `claude` login is left alone. Without a terminal it only reports; it
+  exits 1 while any account still needs a sign-in.
 - `list` flags a login that ends within three days, and `list --json` carries
   `login_ends`. A login lasts about a month and no refresh outlives it.
 

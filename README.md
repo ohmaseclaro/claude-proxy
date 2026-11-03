@@ -162,8 +162,9 @@ reserve never puts it behind an account already at its limit. `list` marks it
 `(reserve 25)`.
 
 A login lasts about a month and cannot be refreshed past its end, so every
-account needs a new sign-in now and then. `doctor` checks them all live and
-signs in again, one at a time, the ones you say yes to:
+account needs a new sign-in now and then. `doctor` checks every added account
+live and signs in again, one at a time, the ones you say yes to (the primary
+`claude` login is yours to manage):
 
 ```console
 $ claude-proxy doctor
@@ -181,8 +182,9 @@ Sign claude-toptal in again? [y/N] n
 ```
 
 It offers each account that is logged out, whose sign-in was refused, or whose
-login ends within three days, which `list` also flags. Without a terminal it
-only reports, and it exits 1 while any account still needs a sign-in.
+login ends within three days, which `list` also flags. Ctrl-C during a sign-in
+cancels that one and moves on. Without a terminal it only reports, and it exits
+1 while any account still needs a sign-in.
 
 ```console
 $ id=$(claude-proxy run "fix the failing test in src/parser.rs")

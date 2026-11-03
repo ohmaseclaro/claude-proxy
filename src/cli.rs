@@ -68,8 +68,9 @@ enum Command {
         #[arg(value_parser = clap::value_parser!(u8).range(0..=100))]
         points: u8,
     },
-    /// Check every account's login live, then offer to sign in again, one by one,
-    /// each that is logged out, refused, or ends within three days.
+    /// Check every added account's login live, then offer to sign in again, one by
+    /// one, each that is logged out, refused, or ends within three days. Leaves
+    /// the primary `claude` login alone.
     Doctor,
     /// Remove a proxy's command (its profile and login are kept).
     Remove {
@@ -522,7 +523,7 @@ fn list_cmd(as_json: bool, refresh: bool) -> Result<i32, String> {
         if r.reserve > 0 {
             line.push_str(&format!("  (reserve {})", r.reserve));
         }
-        if r.logged_in && r.needs_login(now) {
+        if r.logged_in && !r.primary && r.needs_login(now) {
             line.push_str(&format!("  ({} — claude-proxy doctor)", login_text(r, now)));
         }
         if !r.primary && !install::command_path(&bin_dir, &r.label).exists() {
@@ -539,7 +540,10 @@ fn list_cmd(as_json: bool, refresh: bool) -> Result<i32, String> {
 }
 
 fn doctor_cmd() -> Result<i32, String> {
-    let accounts = quota::accounts();
+    let accounts: Vec<_> = quota::accounts()
+        .into_iter()
+        .filter(|a| a.config_dir.is_some())
+        .collect();
     let reports = quota::reports(&accounts, true);
     let now = quota::now_secs();
     let names: Vec<String> = reports.iter().map(display_name).collect();
@@ -562,12 +566,7 @@ fn doctor_cmd() -> Result<i32, String> {
         if let Some(email) = &was {
             println!("Sign in as {email} in the browser: it uses whichever claude.ai account is open there.");
         }
-        #[cfg(windows)]
-        crate::win::leave_ctrl_c_to_child();
-        crate::proxy::claude_command(account.config_dir.as_deref())
-            .args(["auth", "login"])
-            .status()
-            .map_err(|e| format!("could not run `claude`: {e}"))?;
+        sign_in(account)?;
         let again = quota::report(account, true);
         println!("{}", doctor_line(&again, name, width, quota::now_secs()));
         if let (Some(was), Some(now_as)) = (&was, &again.email) {
@@ -589,6 +588,30 @@ fn doctor_cmd() -> Result<i32, String> {
         println!("Run it in a terminal to sign them in:  claude-proxy doctor");
     }
     Ok(1)
+}
+
+/// Ctrl-C during Claude's login cancels that sign-in, not the doctor.
+fn sign_in(account: &quota::Account) -> Result<(), String> {
+    #[cfg(windows)]
+    crate::win::leave_ctrl_c_to_child();
+    #[cfg(unix)]
+    let previous = {
+        extern "C" fn ignore(_: libc::c_int) {}
+        // A handler, not SIG_IGN: exec resets it, so Claude still gets Ctrl-C.
+        // SAFETY: the handler only returns; the previous one is restored below.
+        unsafe { libc::signal(libc::SIGINT, ignore as *const () as libc::sighandler_t) }
+    };
+    let status = crate::proxy::claude_command(account.config_dir.as_deref())
+        .args(["auth", "login"])
+        .status();
+    // SAFETY: puts back the handler saved above.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGINT, previous);
+    }
+    status
+        .map(drop)
+        .map_err(|e| format!("could not run `claude`: {e}"))
 }
 
 fn doctor_line(r: &Report, name: &str, width: usize, now: i64) -> String {
