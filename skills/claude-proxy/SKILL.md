@@ -240,8 +240,9 @@ only after a usage-limit error or when the user asks.
 - **Usage limit:** a run moves on its own; it stays `failed` only when no
   account is left or it was pinned — `claude-proxy send <id> --account auto
   "continue"` moves it by hand.
-- **`not logged in` / `sign-in expired`:** tell the user to run that account's
-  command (e.g. `claude-personal`) and log in. Never log in for them.
+- **`not logged in` / `sign-in expired` / `login ends in …`:** tell the user to
+  run `claude-proxy doctor` in their own terminal; it signs the accounts in
+  again through the browser, one by one. Never log in for them.
 - **`no logged-in account`:** ask the user to add one with
   `claude-proxy add <name>`.
 
