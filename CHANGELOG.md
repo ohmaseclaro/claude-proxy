@@ -21,7 +21,8 @@ has its own version and first shipped in 0.8.0.
   `bypassPermissions` allows them, `acceptEdits` allows edits, `dontAsk` denies
   them. Questions and plan approvals stay pending. `status` (and `--json`,
   `runs --json`) show `mode` and `mode_source`, and the proxy-runs mod has a
-  `mode` tool.
+  `mode` tool. A run whose drainer does not answer in 10s (one an older
+  claude-proxy started) is told to restart its Claude with `kill` and `send`.
 - `allow`, `deny` and `answer` take `--key <ask>` to settle that pending ask
   instead of the oldest one, and fail if it was already settled. `status --json`
   lists each ask's `key`.
