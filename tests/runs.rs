@@ -20,6 +20,8 @@ use serde_json::Value;
 /// - `bgtask`: a background task ending 2s later; Claude wakes and answers `bg done`
 /// - `$FAKE_LOGGED_OUT`: an account that is not logged in
 ///
+/// A `remote_control` request is answered with a session on the account, and
+/// logged to `$FAKE_ARGS_LOG.remote` as `<name>|<reattached session or new>`.
 /// A `set_permission_mode` control request is answered, and logged to
 /// `$FAKE_ARGS_LOG` as `control <mode>`; bypassPermissions needs
 /// `--allow-dangerously-skip-permissions`, as with Claude.
@@ -40,6 +42,13 @@ done
 acct=${CLAUDE_CONFIG_DIR:-primary}; acct=${acct##*[/\\]}
 if [ "$acct" = "${FAKE_LOGGED_OUT:-}" ]; then echo 'Not logged in · Please run /login'; exit 1; fi
 while IFS= read -r line; do
+  case "$line" in *'"subtype":"remote_control"'*)
+    name=$(printf '%s\n' "$line" | sed 's/.*"name":"\([^"]*\)".*/\1/')
+    again=$(printf '%s\n' "$line" | sed -n 's/.*"reattach_session_id":"\([^"]*\)".*/\1/p')
+    echo "$name|${again:-new}" >> "$FAKE_ARGS_LOG.remote"
+    echo '{"type":"control_response","response":{"subtype":"success","request_id":"claude-proxy-remote","response":{"session_url":"https://claude.ai/code/session_fake'"$acct"'","bridge_session_id":"cse_fake'"$acct"'"}}}'
+    continue ;;
+  esac
   case "$line" in *'"control_request"'*)
     want=$(printf '%s\n' "$line" | sed 's/.*"mode":"\([^"]*\)".*/\1/')
     echo "control $want" >> "$FAKE_ARGS_LOG"
@@ -826,6 +835,53 @@ fn a_runs_mode_is_shown_and_changed_live_settling_what_it_would_not_ask() {
     let out = stdout(&cp(&env, &["wait", &id, "--timeout", "30"]));
     assert!(out.contains("now dontAsk"), "{out}");
     assert!(cp(&env, &["rm", &id]).status.success());
+}
+
+#[test]
+fn a_run_opens_in_remote_control_unless_told_not_to() {
+    let env = setup();
+    let id = stdout(&cp(
+        &env,
+        &["run", "--account", "claude", "--name", "fix ci", "hi"],
+    ));
+    cp(&env, &["wait", &id, "--timeout", "30"]);
+    let s = status(&env, &id);
+    assert_eq!(s["remote_control"], true);
+    assert_eq!(
+        s["remote_url"],
+        "https://claude.ai/code/session_fakeprimary"
+    );
+    let runs: Value = serde_json::from_slice(&cp(&env, &["runs", "--json"]).stdout).unwrap();
+    assert_eq!(runs[0]["remote_url"], s["remote_url"]);
+    assert!(stdout(&cp(&env, &["status", &id]))
+        .contains("remote   https://claude.ai/code/session_fakeprimary (on claude)"));
+
+    // A later process keeps the same session.
+    cp(&env, &["send", &id, "again"]);
+    cp(&env, &["wait", &id, "--timeout", "30"]);
+    let remote_log = env.args_log.with_extension("log.remote");
+    let opened = std::fs::read_to_string(&remote_log).unwrap();
+    assert_eq!(
+        opened.lines().collect::<Vec<_>>(),
+        [
+            format!("fix ci · {id}|new"),
+            format!("fix ci · {id}|cse_fakeprimary")
+        ]
+    );
+
+    let id = stdout(&cp(
+        &env,
+        &["run", "--account", "claude", "--no-remote-control", "hi"],
+    ));
+    cp(&env, &["wait", &id, "--timeout", "30"]);
+    let s = status(&env, &id);
+    assert_eq!(
+        (s["remote_control"].as_bool(), s["remote_url"].is_null()),
+        (Some(false), true)
+    );
+    assert!(stdout(&cp(&env, &["status", &id])).contains("remote   off"));
+    let opened = std::fs::read_to_string(&remote_log).unwrap();
+    assert_eq!(opened.lines().count(), 2, "{opened}");
 }
 
 #[test]

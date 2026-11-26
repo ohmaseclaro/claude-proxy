@@ -165,6 +165,10 @@ session. `--allowedTools "Bash(cargo test:*)"` after `--` widens it further;
 never `--mode bypassPermissions` or `--dangerously-skip-permissions` unless the
 user asked.
 
+Runs open in Remote Control by default: `status <id>` prints a claude.ai link
+the user can open on the web or in the Claude app (on the run's account). Pass
+`--no-remote-control` when the user does not want that.
+
 To see or change a running run's mode, no restart needed:
 
 ```bash

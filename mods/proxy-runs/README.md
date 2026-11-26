@@ -5,7 +5,7 @@ A Claude Code mod (function-hooks plugin, Claude Code 2.1.287+) that makes
 
 - **A tool in place of Agent.** `mcp__proxy-runs__run` takes Agent's inputs
   (`prompt`, `description`, `subagent_type`, `model`, `isolation: "worktree"`,
-  `cwd`, `name`) plus `mode`, starts `claude-proxy run - --json …` with the task on stdin
+  `cwd`, `name`) plus `mode` and `remote_control` (`false` for `--no-remote-control`), starts `claude-proxy run - --json …` with the task on stdin
   (`--agent` only for non-built-in types, `-- --model` for the model) and
   returns at once with the run id and its account, and asks Claude to start
   `claude-proxy watch --task <id>` as a background Bash command.

@@ -13,6 +13,14 @@ has its own version and first shipped in 0.8.0.
 
 ### Added
 
+- Runs open in Remote Control by default, so claude.ai/code and the Claude app
+  list them, named `<name> · <id>` (or `claude-proxy <id>`), on the run's
+  account. Each Claude process reattaches the same session, so the link stays
+  the same; it is online while the run's Claude is running or warm.
+  `run --no-remote-control` and the proxy-runs `remote_control: false` turn it
+  off. `status` shows the link, `--json` and `runs --json` `remote_control`,
+  `remote_url` and `remote_error`. Runs started before this keep it off.
+
 - `claude-proxy mode <id>` shows a run's permission mode and what set it (how
   it started, an `allow` grant, or `mode`); `mode <id> <MODE>` changes it. A
   running Claude switches at once, for the turn in progress, through Claude's

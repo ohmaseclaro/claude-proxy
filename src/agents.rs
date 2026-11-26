@@ -24,6 +24,7 @@ pub struct RunOpts {
     pub worktree: bool,
     pub agent: Option<String>,
     pub mode: String,
+    pub remote_control: bool,
     pub claude_args: Vec<String>,
 }
 
@@ -86,6 +87,7 @@ pub fn run(opts: RunOpts) -> Result<i32, String> {
         worktree: opts.worktree,
         parent,
         session,
+        remote_control: opts.remote_control,
     })?;
     eprintln!(
         "claude-proxy: run {} on {} — follow it with:  claude-proxy watch {}",
@@ -285,6 +287,12 @@ pub fn status(id: &str, as_json: bool) -> Result<i32, String> {
     row("account", &format!("{} · {failover}", m.account));
     let (mode, source) = asks::effective_mode(&runs::run_dir(id), &m);
     row("mode", &format!("{mode} · {}", mode_source(&source)));
+    match (&m.remote, &m.remote_error) {
+        _ if !m.remote_control => row("remote", "off"),
+        (_, Some(e)) => row("remote", &format!("unavailable: {e}")),
+        (Some(r), None) => row("remote", &format!("{} (on {})", r.url, r.account)),
+        (None, None) => row("remote", "opens when Claude starts"),
+    }
     if let Some(moved) = &m.moved {
         row("moved", moved);
     }
@@ -348,6 +356,9 @@ fn status_json(m: &Meta) -> serde_json::Value {
     json!({
         "mode": mode,
         "mode_source": mode_source,
+        "remote_control": m.remote_control,
+        "remote_url": m.remote.as_ref().map(|r| &r.url),
+        "remote_error": m.remote_error,
         "id": m.id,
         "name": m.name,
         "state": runs::effective_state(m).as_str(),
