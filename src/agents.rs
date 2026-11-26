@@ -596,7 +596,7 @@ pub fn mode(id: &str, mode: Option<&str>) -> Result<i32, String> {
     match ack {
         Some(Ok(())) => println!("Run {id} is in {mode} now, for the turn in progress too."),
         Some(Err(e)) => println!(
-            "Run {id} will be in {mode} from its next Claude process; the running one refused \
+            "Run {id} will be in {mode} from its next Claude process; the running one did not switch \
              ({e}). To switch now:  claude-proxy kill {id} && claude-proxy send {id} \"carry on\""
         ),
         None => {
@@ -630,7 +630,8 @@ fn live_mode(dir: &Path, mode: &str) -> Option<Result<(), String>> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    None
+    // A drainer from an older claude-proxy never reads `setmode`.
+    Some(Err("no answer within 10s".into()))
 }
 
 pub fn attach(id: &str) -> Result<i32, String> {
