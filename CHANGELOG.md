@@ -11,6 +11,19 @@ has its own version and first shipped in 0.8.0.
 
 ## [Unreleased]
 
+### Added
+
+- `allow`, `deny` and `answer` take `--key <ask>` to settle that pending ask
+  instead of the oldest one, and fail if it was already settled. `status --json`
+  lists each ask's `key`.
+
+### Changed
+
+- `run --mode` sets the permission mode a run starts in, `auto` by default, and
+  the proxy-runs `run` tool takes a `mode`. A run no longer inherits the calling
+  session's mode: a hub in default mode made every Bash call in its runs wait
+  for approval.
+
 ## [0.14.0] - 2026-11-03
 
 ### Added

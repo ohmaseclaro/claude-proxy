@@ -87,16 +87,23 @@ pub struct Grant {
 
 const EDIT_TOOLS: &[&str] = &["Edit", "Write", "MultiEdit", "NotebookEdit"];
 
-/// Answers the oldest pending ask. Returns it and what was granted for good, in words.
-pub fn reply(id: &str, reply: Reply) -> Result<(Ask, Vec<String>), String> {
+/// Answers the pending ask named by `key`, or the oldest one. Returns it and what was
+/// granted for good, in words.
+pub fn reply(id: &str, key: Option<&str>, reply: Reply) -> Result<(Ask, Vec<String>), String> {
     let meta = runs::load(id)?;
     let dir = run_dir(id);
     let ask = pending(&dir)
         .into_iter()
-        .next()
+        .find(|a| key.is_none_or(|k| a.key == k))
         .filter(|_| runs::alive(&dir))
-        .ok_or_else(|| {
-            format!("run {id} is not waiting for an answer. See:  claude-proxy status {id}")
+        .ok_or_else(|| match key {
+            Some(k) => format!(
+                "run {id} has no pending ask {k}: it was settled or the run moved on. \
+                 See:  claude-proxy status {id}"
+            ),
+            None => {
+                format!("run {id} is not waiting for an answer. See:  claude-proxy status {id}")
+            }
         })?;
     let mut granted = Vec::new();
     let answer = match reply {

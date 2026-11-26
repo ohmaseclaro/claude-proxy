@@ -69,6 +69,7 @@ type Input = {
   subagent_type?: string
   model?: string
   isolation?: string
+  mode?: string
   cwd?: string
   name?: string
 }
@@ -81,6 +82,7 @@ function runArgv(input: Input): string[] {
   }
   if (input.isolation === 'worktree') argv.push('--worktree')
   if (input.cwd) argv.push('--cwd', input.cwd)
+  if (input.mode) argv.push('--mode', input.mode)
   if (input.model) argv.push('--', '--model', input.model)
   return argv
 }
@@ -612,6 +614,11 @@ export const register: Register = on => {
           subagent_type: { type: 'string', description: 'The agent type to run as' },
           model: { type: 'string', description: 'Model alias or id for the run' },
           isolation: { type: 'string', enum: ['worktree'], description: 'Work in a new git worktree' },
+          mode: {
+            type: 'string',
+            enum: ['auto', 'acceptEdits', 'plan', 'manual', 'dontAsk', 'bypassPermissions'],
+            description: 'Permission mode the run starts in (default auto). Not inherited from this session',
+          },
           cwd: { type: 'string', description: 'Working directory for the run' },
           name: { type: 'string', description: 'A label for the run (default: description)' },
         },
