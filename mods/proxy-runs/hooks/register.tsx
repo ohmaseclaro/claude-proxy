@@ -16,6 +16,8 @@ import type { Block } from './transcript'
 
 const TOOL = 'mcp__proxy-runs__run'
 const WATCH = 'mcp__proxy-runs__watch'
+const MODE = 'mcp__proxy-runs__mode'
+const MODES = ['auto', 'acceptEdits', 'plan', 'manual', 'dontAsk', 'bypassPermissions']
 const PANE = 'runs'
 const BIN = 'claude-proxy'
 const BUILT_IN_AGENTS = [
@@ -616,7 +618,7 @@ export const register: Register = on => {
           isolation: { type: 'string', enum: ['worktree'], description: 'Work in a new git worktree' },
           mode: {
             type: 'string',
-            enum: ['auto', 'acceptEdits', 'plan', 'manual', 'dontAsk', 'bypassPermissions'],
+            enum: MODES,
             description: 'Permission mode the run starts in (default auto). Not inherited from this session',
           },
           cwd: { type: 'string', description: 'Working directory for the run' },
@@ -636,6 +638,22 @@ export const register: Register = on => {
         properties: {
           id: { type: 'string', description: 'One run id, as `claude-proxy runs` lists it; leave out for all going runs' },
         },
+      },
+    })
+    await $.tool.register({
+      name: 'mode',
+      description:
+        "Show a claude-proxy run's permission mode, or change it. A change applies to the turn in progress " +
+        'when Claude is running, else from its next process, and settles the pending asks the new mode would ' +
+        'not ask about (bypassPermissions allows them, acceptEdits allows edits, dontAsk denies them). Never ' +
+        'bypassPermissions unless the user asked.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: 'The run id' },
+          mode: { type: 'string', enum: MODES, description: 'The mode to switch to; leave out to show it' },
+        },
+        required: ['id'],
       },
     })
     await $.command.register({ name: 'runs', description: "Show this session's claude-proxy runs" })
@@ -694,6 +712,17 @@ export const register: Register = on => {
         shown.map(r => `run ${label(r)} is ${r.state} on ${r.account}`).join('; ') +
         '. Their rows in this conversation now show them live; no need to list them again.',
     }
+  })
+
+  on('tool.call', { tool: MODE }, async ($, e) => {
+    const { id, mode } = e as { id?: unknown; mode?: unknown }
+    if (!validId(str(id))) return { deny: 'Give a run id, as `claude-proxy runs --all` lists it.' }
+    if (mode !== undefined && !MODES.includes(str(mode))) return { deny: `mode must be one of ${MODES.join(', ')}` }
+    const ran = await cli($, ['mode', str(id), ...(mode === undefined ? [] : [str(mode)])])
+    if (ran === undefined) return { deny: `${BIN} cannot be started from this session; run \`${BIN} mode\` through Bash.` }
+    if (ran.exitCode !== 0) return { deny: `${BIN} mode failed: ${ran.stderr.trim()}` }
+    await refresh($, str(id))
+    return { result: ran.stdout.trim() }
   })
 
   // Above classic.PreToolUse, so this answer wins over quota-router's shell hook.

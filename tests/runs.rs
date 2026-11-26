@@ -19,11 +19,16 @@ use serde_json::Value;
 /// - `ask question` / `ask plan` / `ask star`: AskUserQuestion / ExitPlanMode / a `*` command
 /// - `bgtask`: a background task ending 2s later; Claude wakes and answers `bg done`
 /// - `$FAKE_LOGGED_OUT`: an account that is not logged in
+///
+/// A `set_permission_mode` control request is answered, and logged to
+/// `$FAKE_ARGS_LOG` as `control <mode>`; bypassPermissions needs
+/// `--allow-dangerously-skip-permissions`, as with Claude.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
 echo "run=${CLAUDE_PROXY_RUN:-} $*" >> "$FAKE_ARGS_LOG"
-sid=""; mode=""; fork=""; cfg=""
+sid=""; mode=""; fork=""; cfg=""; bypass=""
 while [ $# -gt 0 ]; do
   case "$1" in
+    --allow-dangerously-skip-permissions) bypass=1 ;;
     --session-id) mode="new"; sid="$2"; shift ;;
     --resume) mode="resume"; sid="$2"; shift ;;
     --fork-session) fork="$sid" ;;
@@ -35,6 +40,16 @@ done
 acct=${CLAUDE_CONFIG_DIR:-primary}; acct=${acct##*[/\\]}
 if [ "$acct" = "${FAKE_LOGGED_OUT:-}" ]; then echo 'Not logged in · Please run /login'; exit 1; fi
 while IFS= read -r line; do
+  case "$line" in *'"control_request"'*)
+    want=$(printf '%s\n' "$line" | sed 's/.*"mode":"\([^"]*\)".*/\1/')
+    echo "control $want" >> "$FAKE_ARGS_LOG"
+    if [ "$want" = bypassPermissions ] && [ -z "$bypass" ]; then
+      echo '{"type":"control_response","response":{"subtype":"error","request_id":"claude-proxy-mode","error":"not launched with --dangerously-skip-permissions"}}'
+    else
+      echo '{"type":"control_response","response":{"subtype":"success","request_id":"claude-proxy-mode","response":{"mode":"'"$want"'"}}}'
+    fi
+    continue ;;
+  esac
   prompt=$(printf '%s\n' "$line" | sed 's/.*"content":"\(.*\)","role":"user".*/\1/')
   echo "$mode $sid $acct $prompt" >> "$FAKE_LOG"
   mode="warm"
@@ -716,6 +731,101 @@ fn profiles_get_the_users_mcp_servers() {
     let last = args.lines().last().unwrap();
     assert!(last.starts_with("run= --mcp-config="), "{last}");
     assert!(last.ends_with(" mcp list"), "{last}");
+}
+
+#[test]
+fn a_runs_mode_is_shown_and_changed_live_settling_what_it_would_not_ask() {
+    let env = setup();
+    let exe = Path::new(env!("CARGO_BIN_EXE_claude-proxy"));
+    let id = stdout(&cp(
+        &env,
+        &["run", "--account", "claude", "--mode", "plan", "hi"],
+    ));
+    cp(&env, &["wait", &id, "--timeout", "30"]);
+    assert_eq!(stdout(&cp(&env, &["mode", &id])), "plan (as it started)");
+    let s = status(&env, &id);
+    assert_eq!(
+        (s["mode"].as_str(), s["mode_source"].as_str()),
+        (Some("plan"), Some("start"))
+    );
+    let runs: Value = serde_json::from_slice(&cp(&env, &["runs", "--json"]).stdout).unwrap();
+    assert_eq!(runs[0]["mode"], "plan");
+    assert!(stdout(&cp(&env, &["status", &id])).contains("mode     plan · as it started"));
+
+    // No Claude running: the next process starts in it.
+    let out = stdout(&cp(&env, &["mode", &id, "acceptEdits"]));
+    assert!(out.contains("from its next Claude process"), "{out}");
+    assert!(!cp(&env, &["mode", &id, "yolo"]).status.success());
+    cp(&env, &["send", &id, "again"]);
+    cp(&env, &["wait", &id, "--timeout", "30"]);
+    let args = std::fs::read_to_string(&env.args_log).unwrap();
+    let last = args.lines().last().unwrap();
+    assert!(last.ends_with("--permission-mode acceptEdits"), "{last}");
+    assert!(
+        last.contains("--allow-dangerously-skip-permissions"),
+        "{last}"
+    );
+    assert_eq!(
+        stdout(&cp(&env, &["mode", &id])),
+        "acceptEdits (set with claude-proxy mode)"
+    );
+
+    // Claude running and asking: switched live, and the ask it would not make is allowed.
+    let warm = [("CLAUDE_PROXY_IDLE_SECS", "60")];
+    let id = stdout(&run_as(
+        &env,
+        exe,
+        &["run", "--account", "claude", "ask first"],
+        &warm,
+    ));
+    assert_eq!(
+        cp(&env, &["wait", &id, "--timeout", "30"]).status.code(),
+        Some(2)
+    );
+    let out = stdout(&cp(&env, &["mode", &id, "bypassPermissions"]));
+    assert!(out.contains("in bypassPermissions now"), "{out}");
+    assert!(
+        out.contains("Allowed its pending request to use Bash"),
+        "{out}"
+    );
+    let out = cp(&env, &["wait", &id, "--timeout", "30"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        stdout(&out).contains(r#"{"behavior":"allow","#),
+        "{}",
+        stdout(&out)
+    );
+    let args = std::fs::read_to_string(&env.args_log).unwrap();
+    assert!(
+        args.lines().any(|l| l == "control bypassPermissions"),
+        "{args}"
+    );
+    assert!(stdout(&cp(&env, &["read", &id])).contains("permission mode set to bypassPermissions"));
+
+    // A question is for a person, whatever the mode; dontAsk denies a permission ask.
+    assert!(cp(&env, &["send", &id, "ask question"]).status.success());
+    assert_eq!(
+        cp(&env, &["wait", &id, "--timeout", "30"]).status.code(),
+        Some(2)
+    );
+    let out = stdout(&cp(&env, &["mode", &id, "dontAsk"]));
+    assert!(!out.contains("pending request"), "{out}");
+    assert_eq!(status(&env, &id)["asks"][0]["tool"], "AskUserQuestion");
+    assert!(cp(&env, &["answer", &id, "Red"]).status.success());
+    cp(&env, &["wait", &id, "--timeout", "30"]);
+    assert!(cp(&env, &["send", &id, "ask again"]).status.success());
+    assert_eq!(
+        cp(&env, &["wait", &id, "--timeout", "30"]).status.code(),
+        Some(2)
+    );
+    let out = stdout(&cp(&env, &["mode", &id, "dontAsk"]));
+    assert!(
+        out.contains("Denied its pending request to use Bash"),
+        "{out}"
+    );
+    let out = stdout(&cp(&env, &["wait", &id, "--timeout", "30"]));
+    assert!(out.contains("now dontAsk"), "{out}");
+    assert!(cp(&env, &["rm", &id]).status.success());
 }
 
 #[test]

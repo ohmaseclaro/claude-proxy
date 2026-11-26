@@ -543,6 +543,8 @@ pub(crate) fn turn_command(dir: &Path, meta: &Meta) -> Result<Command, String> {
         "stream-json",
         "--verbose",
         "--replay-user-messages",
+        // Only makes bypassPermissions reachable, for `claude-proxy mode`.
+        "--allow-dangerously-skip-permissions",
     ])
     .arg(crate::mcp::flag(&config));
     let allowed = asks::allowed_rules(dir);
