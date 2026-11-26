@@ -93,6 +93,21 @@ pub struct Meta {
     /// and Claude has looked at them.
     #[serde(default)]
     pub background: u32,
+    /// Missing on runs from before it existed, which keep it off.
+    #[serde(default)]
+    pub remote_control: bool,
+    #[serde(default)]
+    pub remote: Option<Remote>,
+    #[serde(default)]
+    pub remote_error: Option<String>,
+}
+
+/// The Remote Control session Claude opened for the run, on `account`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Remote {
+    pub account: String,
+    pub url: String,
+    pub session: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,6 +165,7 @@ pub struct NewRun {
     pub worktree: bool,
     pub parent: Option<String>,
     pub session: Option<String>,
+    pub remote_control: bool,
 }
 
 pub fn start(new: NewRun) -> Result<Meta, String> {
@@ -200,6 +216,9 @@ pub fn start(new: NewRun) -> Result<Meta, String> {
         parent: new.parent,
         session: new.session,
         background: 0,
+        remote_control: new.remote_control,
+        remote: None,
+        remote_error: None,
     };
     save(&dir, &mut meta)?;
     enqueue(&dir, &new.message)?;
@@ -1201,6 +1220,9 @@ mod tests {
             parent: None,
             session: None,
             background: 0,
+            remote_control: false,
+            remote: None,
+            remote_error: None,
         }
     }
 

@@ -255,7 +255,7 @@ $ claude-proxy watch $id
 
 | | |
 |---|---|
-| `claude-proxy run "<task>" [-- <claude flags>]` | start; `-` reads the task from stdin. `--account` (`auto`, a name to pin, or `a,b` in order), `--agent <type>`, `--mode <mode>`, `--worktree`, `--fork` / `--fork-from <session>`, `--name`, `--cwd`, `--wait`, `--json` |
+| `claude-proxy run "<task>" [-- <claude flags>]` | start; `-` reads the task from stdin. `--account` (`auto`, a name to pin, or `a,b` in order), `--agent <type>`, `--mode <mode>`, `--no-remote-control`, `--worktree`, `--fork` / `--fork-from <session>`, `--name`, `--cwd`, `--wait`, `--json` |
 | `claude-proxy status <id>` | state, what it is doing, what it is asking, Claude's summary of its last turn, cost (`--json`) |
 | `claude-proxy read <id>` | the transcript (`-n N`, `-f` to follow, `--full`, `--json` raw events) |
 | `claude-proxy tail <id>` / `watch <id>` | the last entries / follow live until it stops working |
@@ -286,6 +286,20 @@ plugin's session-start hook lists it, and the mod shows it on screen and hands
 the details to Claude with your next message. What a session was told is kept
 on disk (`claude-proxy news`), so nothing is told twice, and nothing counts as
 told before it reached the session.
+
+### Remote Control
+
+Every run opens in Claude Code Remote Control, so you can open it from
+claude.ai/code or the Claude app. `status` prints its link. The session is
+named `<name> · <id>` (`claude-proxy <id>` without a name) and lives on the
+run's account: sign in to claude.ai with that account to see it. Each Claude
+process the run starts reattaches the same session, so the link stays the same,
+and a failover to another account opens a new one. It is online while the
+run's Claude is working or warm (`CLAUDE_PROXY_IDLE_SECS`). Once that process
+exits it stays listed but offline until the next `send`. Permission asks still
+come to `claude-proxy allow` / `deny`. `run --no-remote-control` leaves it off;
+if Claude refuses it (an org policy, for example), the run goes on and `status`
+shows why.
 
 ### Failover
 

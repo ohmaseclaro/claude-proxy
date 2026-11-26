@@ -120,6 +120,9 @@ enum Command {
         #[arg(long, value_name = "MODE", default_value = "auto",
               value_parser = clap::builder::PossibleValuesParser::new(crate::asks::MODES))]
         mode: String,
+        /// Do not open the run in Remote Control (claude.ai/code, the Claude app).
+        #[arg(long)]
+        no_remote_control: bool,
         /// Arguments for `claude`, after `--`.
         #[arg(last = true)]
         claude_args: Vec<String>,
@@ -315,6 +318,7 @@ fn dispatch(command: Command) -> Result<i32, String> {
             worktree,
             agent,
             mode,
+            no_remote_control,
             claude_args,
         } => crate::agents::run(crate::agents::RunOpts {
             message,
@@ -327,6 +331,7 @@ fn dispatch(command: Command) -> Result<i32, String> {
             worktree,
             agent,
             mode,
+            remote_control: !no_remote_control,
             claude_args,
         }),
         Command::Runs { json, all } => crate::agents::runs(json, all),

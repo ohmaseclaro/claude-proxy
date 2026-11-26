@@ -201,6 +201,13 @@ test('built-in agent types are not passed as --agent', async ($, on) => {
   expect(w.argvs.find(a => a[1] === 'run')).toEqual(['claude-proxy', 'run', '-', '--json', '--name', 'look'])
 })
 
+test('remote_control false opts the run out of Remote Control', async ($, on) => {
+  const w = world(on)
+  await start($)
+  await $.tool.call({ tool: TOOL, tool_use_id: 'tu3', prompt: 'p', description: 'quiet', remote_control: false })
+  expect(w.argvs.find(a => a[1] === 'run')).toEqual(['claude-proxy', 'run', '-', '--json', '--name', 'quiet', '--no-remote-control'])
+})
+
 const picked = (select: { props: Record<string, unknown> } | undefined) =>
   (select?.props.options as { label: string }[] | undefined)?.map(o => o.label)
 

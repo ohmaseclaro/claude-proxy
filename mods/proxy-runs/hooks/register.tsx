@@ -72,6 +72,7 @@ type Input = {
   model?: string
   isolation?: string
   mode?: string
+  remote_control?: boolean
   cwd?: string
   name?: string
 }
@@ -85,6 +86,7 @@ function runArgv(input: Input): string[] {
   if (input.isolation === 'worktree') argv.push('--worktree')
   if (input.cwd) argv.push('--cwd', input.cwd)
   if (input.mode) argv.push('--mode', input.mode)
+  if (input.remote_control === false) argv.push('--no-remote-control')
   if (input.model) argv.push('--', '--model', input.model)
   return argv
 }
@@ -620,6 +622,10 @@ export const register: Register = on => {
             type: 'string',
             enum: MODES,
             description: 'Permission mode the run starts in (default auto). Not inherited from this session',
+          },
+          remote_control: {
+            type: 'boolean',
+            description: 'Open the run in Remote Control, for claude.ai/code and the Claude app (default true)',
           },
           cwd: { type: 'string', description: 'Working directory for the run' },
           name: { type: 'string', description: 'A label for the run (default: description)' },

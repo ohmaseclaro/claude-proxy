@@ -26,6 +26,7 @@ const POLL: Duration = Duration::from_millis(300);
 /// Written by `claude-proxy mode`; the drainer answers in `MODE_ACK`.
 pub const SET_MODE: &str = "setmode";
 pub const MODE_ACK: &str = "mode-ack.json";
+const REMOTE_REQUEST: &str = "claude-proxy-remote";
 
 fn mode_ack(dir: &Path, mode: &str, live: bool, error: Option<&str>) {
     let ack = json!({"mode": mode, "live": live, "error": error});
@@ -354,11 +355,15 @@ impl Drainer {
 
     fn write(&mut self, text: &str) -> Result<(), String> {
         self.unechoed.push_back(text.to_string());
-        if self.proc.is_none() {
+        let spawned = self.proc.is_none();
+        if spawned {
             let proc = Proc::spawn(&self.dir, &self.meta)?;
             self.meta.turn_pid = Some(proc.child.id());
             self.save();
             self.proc = Some(proc);
+        }
+        if spawned {
+            self.open_remote();
         }
         if let Some(proc) = self.proc.as_mut() {
             // A failed write means Claude exited; stdout's end says why.
@@ -377,6 +382,57 @@ impl Drainer {
         }
     }
 
+    /// Reattaches the run's Remote Control session when it is on this account,
+    /// so its claude.ai link stays the same across processes.
+    fn open_remote(&mut self) {
+        if !self.meta.remote_control {
+            return;
+        }
+        let name = match &self.meta.name {
+            Some(name) => format!("{name} · {}", self.meta.id),
+            None => format!("claude-proxy {}", self.meta.id),
+        };
+        let mut request = json!({"subtype": "remote_control", "enabled": true, "name": name,
+            "keep_session_on_exit": true});
+        if let Some(r) = self
+            .meta
+            .remote
+            .as_ref()
+            .filter(|r| r.account == self.meta.account)
+        {
+            request["reattach_session_id"] = json!(r.session);
+        }
+        if let Some(proc) = self.proc.as_mut() {
+            let _ = proc.send(
+                &json!({"type": "control_request", "request_id": REMOTE_REQUEST, "request": request}),
+            );
+        }
+    }
+
+    fn on_remote(&mut self, r: &Value) {
+        if r["subtype"] == "success" {
+            let answer = &r["response"];
+            if let (Some(url), Some(session)) = (
+                answer["session_url"].as_str(),
+                answer["bridge_session_id"].as_str(),
+            ) {
+                self.meta.remote = Some(crate::runs::Remote {
+                    account: self.meta.account.clone(),
+                    url: url.into(),
+                    session: session.into(),
+                });
+                self.meta.remote_error = None;
+            }
+        } else if self.meta.remote.take().is_some() {
+            // The old session may be gone; open a new one.
+            self.open_remote();
+            return;
+        } else {
+            self.meta.remote_error = Some(r["error"].as_str().unwrap_or("refused").into());
+        }
+        self.save();
+    }
+
     fn on_line(&mut self, line: &str) -> Flow {
         // One write per line: `__permit` appends to the same file.
         let _ = self.events.write_all(format!("{line}\n").as_bytes());
@@ -388,7 +444,9 @@ impl Drainer {
         };
         if v["type"] == "control_response" {
             let r = &v["response"];
-            if r["request_id"] == "claude-proxy-mode" {
+            if r["request_id"] == REMOTE_REQUEST {
+                self.on_remote(r);
+            } else if r["request_id"] == "claude-proxy-mode" {
                 if let Some(mode) = self.mode_request.take() {
                     let ok = r["subtype"] == "success";
                     mode_ack(&self.dir, &mode, ok, r["error"].as_str());
