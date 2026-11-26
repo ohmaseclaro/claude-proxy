@@ -13,6 +13,15 @@ has its own version and first shipped in 0.8.0.
 
 ### Added
 
+- `claude-proxy mode <id>` shows a run's permission mode and what set it (how
+  it started, an `allow` grant, or `mode`); `mode <id> <MODE>` changes it. A
+  running Claude switches at once, for the turn in progress, through Claude's
+  `set_permission_mode` control request; otherwise the next Claude process
+  starts in it. Pending asks the new mode would not ask about are settled:
+  `bypassPermissions` allows them, `acceptEdits` allows edits, `dontAsk` denies
+  them. Questions and plan approvals stay pending. `status` (and `--json`,
+  `runs --json`) show `mode` and `mode_source`, and the proxy-runs mod has a
+  `mode` tool.
 - `allow`, `deny` and `answer` take `--key <ask>` to settle that pending ask
   instead of the oldest one, and fail if it was already settled. `status --json`
   lists each ask's `key`.
@@ -23,6 +32,12 @@ has its own version and first shipped in 0.8.0.
   the proxy-runs `run` tool takes a `mode`. A run no longer inherits the calling
   session's mode: a hub in default mode made every Bash call in its runs wait
   for approval.
+
+### Security
+
+- Runs start Claude with `--allow-dangerously-skip-permissions`, which makes
+  `bypassPermissions` reachable without entering it, so `claude-proxy mode` can
+  switch a running Claude to it. A run still starts in its `--mode`.
 
 ## [0.14.0] - 2026-11-03
 

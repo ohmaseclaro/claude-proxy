@@ -34,6 +34,9 @@ A Claude Code mod (function-hooks plugin, Claude Code 2.1.287+) that makes
   characters, as `claude-proxy run` prints it; a malformed id is refused. The
   policy section (and quota-router's) tells the model to call it whenever you
   ask to see, show, watch or follow runs. `/runs <id>` opens the pane on that run.
+- **A run's mode.** `mcp__proxy-runs__mode` takes a run id and shows its
+  permission mode, or with `mode` changes it through `claude-proxy mode`: live
+  for the turn in progress, settling the asks the new mode would not make.
 - **Runs started through Bash.** A `claude-proxy run` Bash row gets the run's
   row under the command's own, from the id the command printed.
 - **The notice reads as one line.** The prompt the mod submits when a run

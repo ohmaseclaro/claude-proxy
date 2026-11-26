@@ -165,6 +165,18 @@ session. `--allowedTools "Bash(cargo test:*)"` after `--` widens it further;
 never `--mode bypassPermissions` or `--dangerously-skip-permissions` unless the
 user asked.
 
+To see or change a running run's mode, no restart needed:
+
+```bash
+claude-proxy mode <id>                    # e.g. "auto (as it started)"
+claude-proxy mode <id> acceptEdits        # live, for the turn in progress too
+```
+
+A change settles the pending asks the new mode would not ask about
+(`bypassPermissions` allows them all, `acceptEdits` allows edits, `dontAsk`
+denies them); questions and plan approvals stay for you. The same rule as above:
+`bypassPermissions` only when the user asked.
+
 ## Everything else you can do
 
 | You want to… | Command |

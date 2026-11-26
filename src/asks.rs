@@ -182,8 +182,7 @@ fn grant_updates(
         None
     };
     if let Some(mode) = mode {
-        crate::paths::write_atomic(&dir.join("mode"), mode.as_bytes(), 0o600)
-            .map_err(|e| format!("could not save the mode: {e}"))?;
+        save_mode(dir, mode, "allow")?;
         updates.push(json!({"type": "setMode", "mode": mode, "destination": "session"}));
         if mode == "acceptEdits" {
             granted.push("accepting edits".into());
@@ -266,11 +265,86 @@ pub fn allowed_rules(dir: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+pub const MODES: &[&str] = &[
+    "auto",
+    "acceptEdits",
+    "plan",
+    "manual",
+    "dontAsk",
+    "bypassPermissions",
+];
+
+/// `<run>/mode`: the mode, then what set it (`allow` or `mode`).
+pub fn save_mode(dir: &Path, mode: &str, by: &str) -> Result<(), String> {
+    crate::paths::write_atomic(
+        &dir.join("mode"),
+        format!("{mode}\n{by}\n").as_bytes(),
+        0o600,
+    )
+    .map_err(|e| format!("could not save the mode: {e}"))
+}
+
+fn saved_mode(dir: &Path) -> Option<(String, String)> {
+    let text = fs::read_to_string(dir.join("mode")).ok()?;
+    let mut lines = text.lines().map(str::trim);
+    let mode = lines.next().filter(|m| !m.is_empty())?.to_string();
+    Some((mode, lines.next().unwrap_or("allow").to_string()))
+}
+
 pub fn granted_mode(dir: &Path) -> Option<String> {
-    fs::read_to_string(dir.join("mode"))
-        .ok()
-        .map(|m| m.trim().to_string())
-        .filter(|m| !m.is_empty())
+    saved_mode(dir).map(|(mode, _)| mode)
+}
+
+/// The mode the run's Claude uses and what set it: `start`, `allow` or `mode`.
+pub fn effective_mode(dir: &Path, meta: &runs::Meta) -> (String, String) {
+    if let Some(saved) = saved_mode(dir) {
+        return saved;
+    }
+    let args = &meta.claude_args;
+    let mut mode = "default".to_string();
+    for (i, a) in args.iter().enumerate() {
+        if a == "--dangerously-skip-permissions" {
+            mode = "bypassPermissions".into();
+        } else if let Some(m) = a.strip_prefix("--permission-mode=") {
+            mode = m.into();
+        } else if a == "--permission-mode" {
+            if let Some(m) = args.get(i + 1) {
+                mode = m.clone();
+            }
+        }
+    }
+    (mode, "start".into())
+}
+
+/// Settles the pending permission asks `mode` would not ask about: everything
+/// under bypassPermissions, edits under acceptEdits, a denial under dontAsk.
+/// Questions and plan approvals stay for a person.
+pub fn settle_for_mode(dir: &Path, mode: &str) -> Vec<(Ask, bool)> {
+    let mut settled = Vec::new();
+    for ask in pending(dir) {
+        if ask.is_question() || ask.tool == "ExitPlanMode" {
+            continue;
+        }
+        let answer = match mode {
+            "bypassPermissions" => json!({"behavior": "allow"}),
+            "acceptEdits" if EDIT_TOOLS.contains(&ask.tool.as_str()) => {
+                json!({"behavior": "allow"})
+            }
+            "dontAsk" => json!({"behavior": "deny",
+                "message": "The run's permission mode is now dontAsk: tools not already allowed are denied."}),
+            _ => continue,
+        };
+        let allowed = answer["behavior"] == "allow";
+        if write_json(
+            &dir.join("asks").join(format!("{}.answer", ask.key)),
+            &answer,
+        )
+        .is_ok()
+        {
+            settled.push((ask, allowed));
+        }
+    }
+    settled
 }
 
 /// Newline-delimited JSON-RPC over stdio.

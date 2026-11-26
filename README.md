@@ -264,6 +264,7 @@ $ claude-proxy watch $id
 | `claude-proxy send <id> "<message>"` | a follow-up; sent while it works, Claude folds it into the turn in progress. `--account` moves the run to other accounts |
 | `claude-proxy wait <id>` | block until it is done (exit 0 done, 1 failed or killed, 2 waiting for an answer, 124 on `--timeout`) |
 | `claude-proxy allow <id>` / `deny <id> ["why"]` | settle a permission prompt; `allow --always`, `--rule "<rule>"` or `--accept-edits` also stop it asking again |
+| `claude-proxy mode <id> [<mode>]` | show its permission mode and what set it, or change it, live for the turn in progress |
 | `claude-proxy answer <id> "<answer>"…` | answer its question, one answer per question |
 | `claude-proxy attach <id>` | open the session interactively in your terminal |
 | `claude-proxy kill <id>` | stop the current turn (the conversation is kept; `send` resumes it); on an idle run, free its Claude process |
@@ -324,6 +325,16 @@ Grants last for the run. A run starts in `--mode` (`auto` by default, never the
 calling session's mode), unless you pass `--permission-mode` after `--`. Asks
 wait up to a day. With several asks pending, `allow`, `deny` and `answer` take
 `--key <ask>` (from `status --json`) to settle that one.
+
+`claude-proxy mode <id>` prints the mode the run uses and what set it;
+`claude-proxy mode <id> bypassPermissions` (or any `--mode` value) changes it.
+A running Claude switches at once, in the middle of a turn too; with none
+running, the next one starts in it. Asks already pending that the new mode
+would not ask about are settled: `bypassPermissions` allows them, `acceptEdits`
+allows edits, `dontAsk` denies them. Questions and plan approvals stay for you.
+A Claude process an older claude-proxy started cannot switch to
+`bypassPermissions` live: `mode` says so, and `kill` then `send` restarts the
+run's Claude in it, conversation kept.
 
 ### Worktrees, forks, agents
 

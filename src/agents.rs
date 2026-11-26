@@ -283,6 +283,8 @@ pub fn status(id: &str, as_json: bool) -> Result<i32, String> {
         pool => format!("fallback {}", pool.join(" → ")),
     };
     row("account", &format!("{} · {failover}", m.account));
+    let (mode, source) = asks::effective_mode(&runs::run_dir(id), &m);
+    row("mode", &format!("{mode} · {}", mode_source(&source)));
     if let Some(moved) = &m.moved {
         row("moved", moved);
     }
@@ -342,7 +344,10 @@ pub fn status(id: &str, as_json: bool) -> Result<i32, String> {
 
 fn status_json(m: &Meta) -> serde_json::Value {
     let dir = runs::run_dir(&m.id);
+    let (mode, mode_source) = asks::effective_mode(&dir, m);
     json!({
+        "mode": mode,
+        "mode_source": mode_source,
         "id": m.id,
         "name": m.name,
         "state": runs::effective_state(m).as_str(),
@@ -562,6 +567,70 @@ pub fn reply(id: &str, key: Option<&str>, reply: Reply) -> Result<i32, String> {
         "claude-proxy: answered run {id}'s {what}{forever} — `claude-proxy wait {id}` to continue waiting"
     );
     Ok(0)
+}
+
+fn mode_source(source: &str) -> &'static str {
+    match source {
+        "start" => "as it started",
+        "allow" => "granted with allow",
+        _ => "set with claude-proxy mode",
+    }
+}
+
+pub fn mode(id: &str, mode: Option<&str>) -> Result<i32, String> {
+    let meta = runs::load(id)?;
+    let dir = runs::run_dir(id);
+    let Some(mode) = mode else {
+        let (mode, source) = asks::effective_mode(&dir, &meta);
+        println!("{mode} ({})", mode_source(&source));
+        return Ok(0);
+    };
+    asks::save_mode(&dir, mode, "mode")?;
+    let live = runs::alive(&dir);
+    let settled = if live {
+        asks::settle_for_mode(&dir, mode)
+    } else {
+        Vec::new()
+    };
+    let ack = live.then(|| live_mode(&dir, mode)).flatten();
+    match ack {
+        Some(Ok(())) => println!("Run {id} is in {mode} now, for the turn in progress too."),
+        Some(Err(e)) => println!(
+            "Run {id} will be in {mode} from its next Claude process; the running one refused \
+             ({e}). To switch now:  claude-proxy kill {id} && claude-proxy send {id} \"carry on\""
+        ),
+        None => {
+            println!("Run {id} will be in {mode} from its next Claude process (none is running).")
+        }
+    }
+    for (ask, allowed) in settled {
+        let how = if allowed { "Allowed" } else { "Denied" };
+        println!("{how} its pending request to use {}.", ask.tool);
+    }
+    Ok(0)
+}
+
+/// None when no Claude process took the request.
+fn live_mode(dir: &Path, mode: &str) -> Option<Result<(), String>> {
+    let ack = dir.join(crate::drainer::MODE_ACK);
+    let _ = std::fs::remove_file(&ack);
+    crate::paths::write_atomic(&dir.join(crate::drainer::SET_MODE), mode.as_bytes(), 0o600).ok()?;
+    let started = std::time::Instant::now();
+    while started.elapsed() < Duration::from_secs(10) {
+        if let Some(v) = std::fs::read(&ack)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        {
+            let _ = std::fs::remove_file(&ack);
+            return match (v["live"].as_bool(), v["error"].as_str()) {
+                (Some(true), _) => Some(Ok(())),
+                (_, Some(e)) => Some(Err(e.to_string())),
+                _ => None,
+            };
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    None
 }
 
 pub fn attach(id: &str) -> Result<i32, String> {

@@ -23,6 +23,15 @@ use crate::runs::{
 
 const POLL: Duration = Duration::from_millis(300);
 
+/// Written by `claude-proxy mode`; the drainer answers in `MODE_ACK`.
+pub const SET_MODE: &str = "setmode";
+pub const MODE_ACK: &str = "mode-ack.json";
+
+fn mode_ack(dir: &Path, mode: &str, live: bool, error: Option<&str>) {
+    let ack = json!({"mode": mode, "live": live, "error": error});
+    let _ = crate::paths::write_atomic(&dir.join(MODE_ACK), ack.to_string().as_bytes(), 0o600);
+}
+
 fn idle_timeout() -> Duration {
     let secs = std::env::var("CLAUDE_PROXY_IDLE_SECS")
         .ok()
@@ -55,6 +64,7 @@ pub fn drain(id: &str) -> Result<(), String> {
         idle: idle_timeout(),
         running: 0,
         wake_due: None,
+        mode_request: None,
     };
     loop {
         match d.step() {
@@ -133,7 +143,10 @@ impl Proc {
     }
 
     fn write(&mut self, text: &str) -> std::io::Result<()> {
-        let message = json!({"type": "user", "message": {"role": "user", "content": text}});
+        self.send(&json!({"type": "user", "message": {"role": "user", "content": text}}))
+    }
+
+    fn send(&mut self, message: &Value) -> std::io::Result<()> {
         self.stdin.write_all(format!("{message}\n").as_bytes())?;
         self.stdin.flush()
     }
@@ -193,6 +206,8 @@ struct Drainer {
     running: u32,
     /// Since a background task ended while Claude was idle; it should wake up.
     wake_due: Option<Instant>,
+    /// A `set_permission_mode` sent to Claude and not yet answered.
+    mode_request: Option<String>,
 }
 
 /// How long to wait for Claude to wake up on a finished task.
@@ -209,6 +224,10 @@ impl Drainer {
     fn step(&mut self) -> Flow {
         if self.dir.join("stop").exists() {
             return self.stop();
+        }
+        if let Ok(mode) = fs::read_to_string(self.dir.join(SET_MODE)) {
+            let _ = fs::remove_file(self.dir.join(SET_MODE));
+            self.set_mode(mode.trim());
         }
         if !self.busy && self.dir.join("release").exists() {
             let _ = fs::remove_file(self.dir.join("release"));
@@ -348,6 +367,16 @@ impl Drainer {
         Ok(())
     }
 
+    /// Live, through Claude's control protocol; a later process reads `<run>/mode`.
+    fn set_mode(&mut self, mode: &str) {
+        let request = json!({"type": "control_request", "request_id": "claude-proxy-mode",
+            "request": {"subtype": "set_permission_mode", "mode": mode}});
+        match self.proc.as_mut().map(|p| p.send(&request)) {
+            Some(Ok(())) => self.mode_request = Some(mode.to_string()),
+            _ => mode_ack(&self.dir, mode, false, None),
+        }
+    }
+
     fn on_line(&mut self, line: &str) -> Flow {
         // One write per line: `__permit` appends to the same file.
         let _ = self.events.write_all(format!("{line}\n").as_bytes());
@@ -357,6 +386,22 @@ impl Drainer {
             }
             return Flow::Continue;
         };
+        if v["type"] == "control_response" {
+            let r = &v["response"];
+            if r["request_id"] == "claude-proxy-mode" {
+                if let Some(mode) = self.mode_request.take() {
+                    let ok = r["subtype"] == "success";
+                    mode_ack(&self.dir, &mode, ok, r["error"].as_str());
+                    if ok {
+                        marker(
+                            &self.dir,
+                            json!({"event": "note", "text": format!("permission mode set to {mode}")}),
+                        );
+                    }
+                }
+            }
+            return Flow::Continue;
+        }
         if v["type"] == "user" && v["isReplay"] == true {
             self.unechoed.pop_front();
             return Flow::Continue;

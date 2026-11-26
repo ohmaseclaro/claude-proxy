@@ -5,6 +5,7 @@ import { blocks, groupLabel, parse } from '../hooks/transcript'
 
 const TOOL = 'mcp__proxy-runs__run'
 const WATCH = 'mcp__proxy-runs__watch'
+const MODE = 'mcp__proxy-runs__mode'
 const SESSION = 'sess-1'
 
 const RUN = {
@@ -178,6 +179,19 @@ test('the tool starts a run and returns its id at once', async ($, on) => {
     '--agent', 'gsd-executor', '--worktree', '--mode', 'acceptEdits', '--', '--model', 'haiku',
   ])
   expect(w.stdins[i]).toBe('reply with ok')
+})
+
+test('the mode tool shows or changes a run\'s mode through the CLI', async ($, on) => {
+  const w = world(on)
+  await start($)
+  expect(w.tools).toContain(MODE)
+  const set = await $.tool.call({ tool: MODE, tool_use_id: 'tm1', id: 'abc123', mode: 'bypassPermissions' })
+  expect(set.result).toBe('mode done')
+  expect(w.argvs).toContainEqual(['claude-proxy', 'mode', 'abc123', 'bypassPermissions'])
+  await $.tool.call({ tool: MODE, tool_use_id: 'tm2', id: 'abc123' })
+  expect(w.argvs).toContainEqual(['claude-proxy', 'mode', 'abc123'])
+  expect((await $.tool.call({ tool: MODE, tool_use_id: 'tm3', id: 'abc123', mode: 'yolo' })).deny).toContain('one of')
+  expect((await $.tool.call({ tool: MODE, tool_use_id: 'tm4', id: '../x' })).deny).toContain('run id')
 })
 
 test('built-in agent types are not passed as --agent', async ($, on) => {

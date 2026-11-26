@@ -118,7 +118,7 @@ enum Command {
         agent: Option<String>,
         /// Permission mode the run starts in. Not inherited from the calling session.
         #[arg(long, value_name = "MODE", default_value = "auto",
-              value_parser = ["auto", "acceptEdits", "plan", "manual", "dontAsk", "bypassPermissions"])]
+              value_parser = clap::builder::PossibleValuesParser::new(crate::asks::MODES))]
         mode: String,
         /// Arguments for `claude`, after `--`.
         #[arg(last = true)]
@@ -198,6 +198,13 @@ enum Command {
         /// Give up after this many seconds.
         #[arg(long)]
         timeout: Option<u64>,
+    },
+    /// Show a run's permission mode, or change it, live if Claude is running.
+    /// Pending asks the new mode would not ask about are settled.
+    Mode {
+        id: String,
+        #[arg(value_parser = clap::builder::PossibleValuesParser::new(crate::asks::MODES))]
+        mode: Option<String>,
     },
     /// Let a waiting run use the tool it asked for.
     Allow {
@@ -361,6 +368,7 @@ fn dispatch(command: Command) -> Result<i32, String> {
             account,
         } => crate::agents::send(&id, &message, account.as_deref()),
         Command::Wait { id, timeout } => crate::agents::wait(&id, timeout),
+        Command::Mode { id, mode } => crate::agents::mode(&id, mode.as_deref()),
         Command::Allow {
             id,
             key,
