@@ -166,6 +166,7 @@ test('the tool starts a run and returns its id at once', async ($, on) => {
     description: 'say ok',
     subagent_type: 'gsd-executor',
     isolation: 'worktree',
+    mode: 'acceptEdits',
     model: 'haiku',
   })
   expect(ran.deny).toBeUndefined()
@@ -174,7 +175,7 @@ test('the tool starts a run and returns its id at once', async ($, on) => {
   const i = w.argvs.findIndex(a => a[1] === 'run')
   expect(w.argvs[i]).toEqual([
     'claude-proxy', 'run', '-', '--json', '--name', 'say ok',
-    '--agent', 'gsd-executor', '--worktree', '--', '--model', 'haiku',
+    '--agent', 'gsd-executor', '--worktree', '--mode', 'acceptEdits', '--', '--model', 'haiku',
   ])
   expect(w.stdins[i]).toBe('reply with ok')
 })

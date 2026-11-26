@@ -255,7 +255,7 @@ $ claude-proxy watch $id
 
 | | |
 |---|---|
-| `claude-proxy run "<task>" [-- <claude flags>]` | start; `-` reads the task from stdin. `--account` (`auto`, a name to pin, or `a,b` in order), `--agent <type>`, `--worktree`, `--fork` / `--fork-from <session>`, `--name`, `--cwd`, `--wait`, `--json` |
+| `claude-proxy run "<task>" [-- <claude flags>]` | start; `-` reads the task from stdin. `--account` (`auto`, a name to pin, or `a,b` in order), `--agent <type>`, `--mode <mode>`, `--worktree`, `--fork` / `--fork-from <session>`, `--name`, `--cwd`, `--wait`, `--json` |
 | `claude-proxy status <id>` | state, what it is doing, what it is asking, Claude's summary of its last turn, cost (`--json`) |
 | `claude-proxy read <id>` | the transcript (`-n N`, `-f` to follow, `--full`, `--json` raw events) |
 | `claude-proxy tail <id>` / `watch <id>` | the last entries / follow live until it stops working |
@@ -320,9 +320,10 @@ question. `allow` can grant more than the one request:
   `--rule "Bash(cargo test:*)"`.
 - `--accept-edits` accepts file edits from now on, as when approving a plan.
 
-Grants last for the run. A run starts with the permission mode of the session
-that started it (the plugin's hook records it), unless you pass one after `--`.
-Asks wait up to a day.
+Grants last for the run. A run starts in `--mode` (`auto` by default, never the
+calling session's mode), unless you pass `--permission-mode` after `--`. Asks
+wait up to a day. With several asks pending, `allow`, `deny` and `answer` take
+`--key <ask>` (from `status --json`) to settle that one.
 
 ### Worktrees, forks, agents
 

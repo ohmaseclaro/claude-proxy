@@ -500,8 +500,19 @@ fn a_permission_prompt_waits_for_allow_or_deny() {
     assert_eq!(s["state"], "waiting");
     assert_eq!(s["asks"][0]["tool"], "Bash");
     assert_eq!(s["asks"][0]["input"]["command"], "rm -rf build");
+    let key = s["asks"][0]["key"].as_str().unwrap().to_string();
 
-    assert!(cp(&env, &["allow", &id]).status.success());
+    let stale = cp(&env, &["allow", &id, "--key", "not-a-pending-ask"]);
+    let stderr = |out: &Output| String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(!stale.status.success());
+    assert!(
+        stderr(&stale).contains("no pending ask not-a-pending-ask"),
+        "{}",
+        stderr(&stale)
+    );
+    assert_eq!(status(&env, &id)["state"], "waiting");
+
+    assert!(cp(&env, &["allow", &id, "--key", &key]).status.success());
     let out = cp(&env, &["wait", &id, "--timeout", "30"]);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(
@@ -842,7 +853,7 @@ fn always_and_accept_edits_outlive_the_request() {
 }
 
 #[test]
-fn a_run_inherits_the_permission_mode_of_the_session_starting_it() {
+fn a_run_starts_in_the_mode_it_is_given_not_the_callers() {
     use std::io::Write;
     let env = setup();
     let exe = Path::new(env!("CARGO_BIN_EXE_claude-proxy"));
@@ -863,44 +874,35 @@ fn a_run_inherits_the_permission_mode_of_the_session_starting_it() {
         )
         .unwrap();
     assert!(hook.wait().unwrap().success());
-
     let vars = [("CLAUDE_CODE_SESSION_ID", session)];
-    let id = stdout(&run_as(
-        &env,
-        exe,
-        &["run", "--account", "claude", "hi"],
-        &vars,
-    ));
-    cp(&env, &["wait", &id, "--timeout", "30"]);
-    let args = std::fs::read_to_string(&env.args_log).unwrap();
+    let last_args = |args: &[&str]| {
+        let id = stdout(&run_as(&env, exe, args, &vars));
+        cp(&env, &["wait", &id, "--timeout", "30"]);
+        let log = std::fs::read_to_string(&env.args_log).unwrap();
+        log.lines().last().unwrap().to_string()
+    };
+
+    let last = last_args(&["run", "--account", "claude", "hi"]);
     assert!(
-        args.lines()
-            .last()
-            .unwrap()
-            .ends_with("--permission-mode acceptEdits"),
-        "{args}"
+        last.ends_with("--permission-mode auto") && !last.contains("acceptEdits"),
+        "{last}"
     );
 
-    // An explicit mode wins.
-    let id = stdout(&run_as(
-        &env,
-        exe,
-        &[
-            "run",
-            "--account",
-            "claude",
-            "hi",
-            "--",
-            "--permission-mode",
-            "plan",
-        ],
-        &vars,
-    ));
-    cp(&env, &["wait", &id, "--timeout", "30"]);
-    let args = std::fs::read_to_string(&env.args_log).unwrap();
-    let last = args.lines().last().unwrap();
+    let last = last_args(&["run", "--account", "claude", "--mode", "plan", "hi"]);
+    assert!(last.ends_with("--permission-mode plan"), "{last}");
+
+    // A mode after `--` wins over --mode.
+    let last = last_args(&[
+        "run",
+        "--account",
+        "claude",
+        "hi",
+        "--",
+        "--permission-mode",
+        "manual",
+    ]);
     assert!(
-        last.ends_with("--permission-mode plan") && !last.contains("acceptEdits"),
+        last.ends_with("--permission-mode manual") && !last.contains("auto"),
         "{last}"
     );
 }
@@ -1239,15 +1241,6 @@ fn run_state_is_private_to_the_user() {
     for file in ["allowed", "mode"] {
         assert_mode(&run.join(file), 0o600);
     }
-
-    let session = "33333333-3333-4333-8444-555555555555";
-    hook(
-        &env,
-        "prompt",
-        &format!(r#"{{"session_id":"{session}","permission_mode":"default"}}"#),
-    );
-    assert_mode(&root.join("sessions"), 0o700);
-    assert_mode(&root.join("sessions").join(session), 0o600);
 }
 
 #[test]

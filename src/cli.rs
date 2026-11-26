@@ -116,6 +116,10 @@ enum Command {
         /// Run as one of your Claude agents (`~/.claude/agents`), e.g. a GSD one.
         #[arg(long)]
         agent: Option<String>,
+        /// Permission mode the run starts in. Not inherited from the calling session.
+        #[arg(long, value_name = "MODE", default_value = "auto",
+              value_parser = ["auto", "acceptEdits", "plan", "manual", "dontAsk", "bypassPermissions"])]
+        mode: String,
         /// Arguments for `claude`, after `--`.
         #[arg(last = true)]
         claude_args: Vec<String>,
@@ -198,6 +202,10 @@ enum Command {
     /// Let a waiting run use the tool it asked for.
     Allow {
         id: String,
+        /// Answer this pending ask (`key` in `status --json`) instead of the
+        /// oldest one; fails if it is no longer pending.
+        #[arg(long, value_name = "ASK")]
+        key: Option<String>,
         /// And stop asking for requests like this one: the exact command, the
         /// domain, or the tool (for edits: accept edits).
         #[arg(long)]
@@ -214,12 +222,20 @@ enum Command {
     /// Refuse what a waiting run asked for; it reads your reason and carries on.
     Deny {
         id: String,
+        /// Answer this pending ask (`key` in `status --json`) instead of the
+        /// oldest one; fails if it is no longer pending.
+        #[arg(long, value_name = "ASK")]
+        key: Option<String>,
         /// What to tell it instead.
         reason: Option<String>,
     },
     /// Answer a waiting run's question, one answer per question, in order.
     Answer {
         id: String,
+        /// Answer this pending ask (`key` in `status --json`) instead of the
+        /// oldest one; fails if it is no longer pending.
+        #[arg(long, value_name = "ASK")]
+        key: Option<String>,
         #[arg(required = true)]
         answers: Vec<String>,
     },
@@ -291,6 +307,7 @@ fn dispatch(command: Command) -> Result<i32, String> {
             fork_from,
             worktree,
             agent,
+            mode,
             claude_args,
         } => crate::agents::run(crate::agents::RunOpts {
             message,
@@ -302,6 +319,7 @@ fn dispatch(command: Command) -> Result<i32, String> {
             fork: fork_from.or(fork.then(String::new)),
             worktree,
             agent,
+            mode,
             claude_args,
         }),
         Command::Runs { json, all } => crate::agents::runs(json, all),
@@ -345,24 +363,29 @@ fn dispatch(command: Command) -> Result<i32, String> {
         Command::Wait { id, timeout } => crate::agents::wait(&id, timeout),
         Command::Allow {
             id,
+            key,
             always,
             rule,
             accept_edits,
         } => crate::agents::reply(
             &id,
+            key.as_deref(),
             Reply::Allow(Grant {
                 always,
                 rule,
                 accept_edits,
             }),
         ),
-        Command::Deny { id, reason } => crate::agents::reply(
+        Command::Deny { id, key, reason } => crate::agents::reply(
             &id,
+            key.as_deref(),
             Reply::Deny(reason.unwrap_or_else(|| {
                 "Declined. Carry on without it, or say what you need and why.".into()
             })),
         ),
-        Command::Answer { id, answers } => crate::agents::reply(&id, Reply::Answer(answers)),
+        Command::Answer { id, key, answers } => {
+            crate::agents::reply(&id, key.as_deref(), Reply::Answer(answers))
+        }
         Command::Attach { id } => crate::agents::attach(&id),
         Command::Events { ids, mine } => crate::agents::events(&ids, mine),
         Command::News { json, peek, ack } => crate::agents::news(json, peek, &ack),

@@ -158,11 +158,12 @@ claude-proxy allow <id> --rule "Bash(cargo test:*)" # and stop asking for anythi
 claude-proxy allow <id> --accept-edits              # and accept edits from now on (approving a plan)
 ```
 
-**Permissions:** a run inherits your session's permission mode, as a subagent
-would (`claude-proxy` says so when it does), so it only asks about what you
-would have been asked about. Pass `-- --permission-mode <mode>` or
-`--allowedTools "Bash(cargo test:*)"` to give it more or less; never
-`bypassPermissions` or `--dangerously-skip-permissions` unless the user asked.
+**Permissions:** pick the mode when you start the run: `--mode auto` (the
+default) lets the classifier approve routine work and asks about the rest,
+`acceptEdits`, `plan` or `manual` ask more. It is not inherited from your
+session. `--allowedTools "Bash(cargo test:*)"` after `--` widens it further;
+never `--mode bypassPermissions` or `--dangerously-skip-permissions` unless the
+user asked.
 
 ## Everything else you can do
 

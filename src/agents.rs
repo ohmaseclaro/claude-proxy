@@ -23,6 +23,7 @@ pub struct RunOpts {
     pub fork: Option<String>,
     pub worktree: bool,
     pub agent: Option<String>,
+    pub mode: String,
     pub claude_args: Vec<String>,
 }
 
@@ -61,9 +62,11 @@ pub fn run(opts: RunOpts) -> Result<i32, String> {
     if let Some(agent) = opts.agent {
         claude_args.extend(["--agent".to_string(), agent]);
     }
-    if let Some(mode) = inherited_mode(&claude_args) {
-        eprintln!("claude-proxy: inheriting your session's permission mode ({mode})");
-        claude_args.extend(["--permission-mode".to_string(), mode]);
+    let explicit = claude_args
+        .iter()
+        .any(|a| a.starts_with("--permission-mode") || a == "--dangerously-skip-permissions");
+    if !explicit {
+        claude_args.extend(["--permission-mode".to_string(), opts.mode]);
     }
     // Set by `runs::turn_command` inside a run.
     let parent = std::env::var("CLAUDE_PROXY_RUN")
@@ -106,21 +109,6 @@ pub fn run(opts: RunOpts) -> Result<i32, String> {
         return wait_and_print(&meta.id, None);
     }
     Ok(0)
-}
-
-/// The calling session's mode as the plugin's `prompt` hook recorded it: what a
-/// subagent would inherit.
-fn inherited_mode(claude_args: &[String]) -> Option<String> {
-    let explicit = claude_args
-        .iter()
-        .any(|a| a.starts_with("--permission-mode") || a == "--dangerously-skip-permissions");
-    if explicit {
-        return None;
-    }
-    std::env::var("CLAUDE_CODE_SESSION_ID")
-        .ok()
-        .and_then(|s| crate::hook::session_mode(&s))
-        .filter(|m| m != "default")
 }
 
 fn fork_source(id: String) -> Result<String, String> {
@@ -375,7 +363,7 @@ fn status_json(m: &Meta) -> serde_json::Value {
         "parent": m.parent,
         "session": m.session,
         "background": m.background,
-        "asks": asks::pending(&dir).iter().map(|a| json!({"tool": a.tool, "input": a.input})).collect::<Vec<_>>(),
+        "asks": asks::pending(&dir).iter().map(|a| json!({"key": a.key(), "tool": a.tool, "input": a.input})).collect::<Vec<_>>(),
         "session_id": m.session_id,
         "created_at": m.created_at,
         "updated_at": m.updated_at,
@@ -558,8 +546,8 @@ fn wait_and_print(id: &str, timeout: Option<Duration>) -> Result<i32, String> {
     }
 }
 
-pub fn reply(id: &str, reply: Reply) -> Result<i32, String> {
-    let (ask, granted) = asks::reply(id, reply)?;
+pub fn reply(id: &str, key: Option<&str>, reply: Reply) -> Result<i32, String> {
+    let (ask, granted) = asks::reply(id, key, reply)?;
     let what = if ask.is_question() {
         "question".to_string()
     } else {

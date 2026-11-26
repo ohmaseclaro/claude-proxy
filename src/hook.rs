@@ -45,7 +45,6 @@ pub fn run(event: &str) -> i32 {
     let speaks = policy_applies() && !mod_handles(&sessions, &v);
     match event {
         "prompt" => {
-            remember_mode(&v);
             if let (true, Some(session)) = (speaks, v["session_id"].as_str()) {
                 if let Some(news) = news_since_last_prompt(session) {
                     println!("{news}");
@@ -83,29 +82,6 @@ fn own_pick() -> bool {
     // Caller first: it costs no quota lookup, which the hook's 5 s timeout may not fit.
     crate::quota::caller().is_some()
         && crate::runs::first_account(&[]).is_ok_and(|first| crate::quota::is_callers(&first))
-}
-
-fn remember_mode(v: &Value) {
-    let (Some(session), Some(mode)) = (v["session_id"].as_str(), v["permission_mode"].as_str())
-    else {
-        return;
-    };
-    if crate::paths::valid_id(session) {
-        let dir = config_dir().join("sessions");
-        // ponytail: one small file per session, never pruned; prune by age if it ever matters.
-        let _ = crate::paths::private_dir(&dir)
-            .and_then(|()| crate::paths::write_atomic(&dir.join(session), mode.as_bytes(), 0o600));
-    }
-}
-
-pub fn session_mode(session: &str) -> Option<String> {
-    if !crate::paths::valid_id(session) {
-        return None;
-    }
-    fs::read_to_string(config_dir().join("sessions").join(session))
-        .ok()
-        .map(|m| m.trim().to_string())
-        .filter(|m| !m.is_empty())
 }
 
 fn label(m: &Meta) -> String {
