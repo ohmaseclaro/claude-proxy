@@ -208,6 +208,14 @@ test('remote_control false opts the run out of Remote Control', async ($, on) =>
   expect(w.argvs.find(a => a[1] === 'run')).toEqual(['claude-proxy', 'run', '-', '--json', '--name', 'quiet', '--no-remote-control'])
 })
 
+test('a run call with the wrong inputs is refused before it reaches claude-proxy', async ($, on) => {
+  const w = world(on)
+  await start($)
+  const ran = await $.tool.call({ tool: TOOL, tool_use_id: 'tu4', task_description: 'x', initial_prompt_from_file: 'y' } as never)
+  expect(String(ran.isError ? ran.text : ran.deny)).toContain('Give prompt and description')
+  expect(w.argvs.find(a => a[1] === 'run')).toBeUndefined()
+})
+
 const picked = (select: { props: Record<string, unknown> } | undefined) =>
   (select?.props.options as { label: string }[] | undefined)?.map(o => o.label)
 
