@@ -65,6 +65,16 @@ A Claude Code mod (function-hooks plugin, Claude Code 2.1.287+) that makes
   runs did meanwhile as a notice and in the status line, and your next message
   carries the details to Claude; it counts as told only once that message
   entered.
+- **An inbox per session.** Every 5 s the mod reads
+  `~/.config/claude-proxy/inbox/<session id>/` and submits each `<id>.md` there
+  (`<id>`: lowercase letters, digits and `-`, 40 at most) as a prompt of its own,
+  which runs once the session is idle. The text is framed as another agent's
+  request, not the user's, and told to stop for the user's review before
+  anything outward-facing or irreversible. Beside the message the mod writes
+  `<id>.delivered` (queued), `<id>.started` (its turn began) and `<id>.reply.md`
+  (that turn's final answer), so a sender needs nothing but files: write
+  `<id>.md` by rename, and withdraw it if no `.delivered` appears. A message is
+  submitted once; the mod deletes nothing.
 - **Agent calls redirected.** A `tool.call` hook on Agent (and Task) refuses
   the call and points to the tool, unless the description starts with
   `[direct]`, `CLAUDE_PROXY_POLICY=off`, or `CLAUDE_PROXY_RUN` is set.
