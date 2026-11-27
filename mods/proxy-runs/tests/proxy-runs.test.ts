@@ -642,7 +642,7 @@ test('a reopened session is shown what its runs did, and the next prompt brings 
     { ...RUN, id: 'def456', name: 'tidy', state: 'waiting', asks: [{ tool: 'Bash', input: { command: 'rm x' } }], mark: 'def456 waiting k1' },
   ]
   await start($)
-  for (let i = 0; i < 200 && !w.statuses.includes('2 runs finished while closed'); i++) await Promise.resolve()
+  for (let i = 0; i < 200 && !w.statuses.includes('2 runs finished while closed'); i++) await new Promise(r => setTimeout(r, 0))
   expect(w.statuses).toContain('2 runs finished while closed')
   expect(entered).toHaveLength(0)
   expect(w.argvs.some(a => a[2] === '--ack')).toBe(false)
