@@ -867,7 +867,8 @@ export const register: Register = on => {
 
   on('turn.start', async ($, e, next) => {
     const started = await next(e)
-    const ids = e.agentId === undefined ? [...e.text.matchAll(INBOX_MARK)].map(m => m[1] ?? '') : []
+    const isMain = (e as { agentId?: string }).agentId === undefined
+    const ids = isMain ? [...e.text.matchAll(INBOX_MARK)].map(m => m[1] ?? '') : []
     if (ids.length === 0 || (await $.env.get('CLAUDE_PROXY_RUN'))) return started
     const dir = await inboxDir($)
     inboxTurns.set(started.turnId, { dir, ids })
