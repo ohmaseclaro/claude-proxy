@@ -13,6 +13,13 @@ has its own version and first shipped in 0.8.0.
 
 ### Added
 
+- proxy-runs mod: an inbox per session. A file dropped in
+  `~/.config/claude-proxy/inbox/<session id>/<id>.md` enters that live session
+  as a prompt of the mod's own once it is idle, framed as another agent's
+  request with a hold before anything outward-facing. The mod writes
+  `<id>.delivered`, `<id>.started` and `<id>.reply.md` (the turn's answer) beside
+  it, so another agent on the machine can hand work to an open Desktop or
+  terminal session and read the answer back.
 - Runs open in Remote Control by default, so claude.ai/code and the Claude app
   list them, named `<name> · <id>` (or `claude-proxy <id>`), on the run's
   account. Each Claude process reattaches the same session, so the link stays
