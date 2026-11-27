@@ -79,15 +79,15 @@ type Input = {
 type Row = (t: RunTool, active: boolean) => Promise<RenderNode>
 
 function runArgv(input: Input): string[] {
-  const argv = ['run', '-', '--json', '--name', input.name ?? input.description]
+  const argv = ['run', '-', '--json', '--name', str(input.name) || input.description]
   if (input.subagent_type && !BUILT_IN_AGENTS.includes(input.subagent_type)) {
     argv.push('--agent', input.subagent_type)
   }
   if (input.isolation === 'worktree') argv.push('--worktree')
-  if (input.cwd) argv.push('--cwd', input.cwd)
+  if (str(input.cwd)) argv.push('--cwd', str(input.cwd))
   if (input.mode) argv.push('--mode', input.mode)
   if (input.remote_control === false) argv.push('--no-remote-control')
-  if (input.model) argv.push('--', '--model', input.model)
+  if (str(input.model)) argv.push('--', '--model', str(input.model))
   return argv
 }
 
@@ -122,7 +122,9 @@ async function cli(
   bin = BIN,
 ): Promise<ProcessRunResult | undefined> {
   try {
-    return await $.process.run([bin, ...argv], init)
+    const ran = await $.process.run([bin, ...argv], init)
+    await update($, problem, () => '')
+    return ran
   } catch (err) {
     await update($, problem, () => `cannot start ${BIN} from this session (${err}); showing what its files say`)
     return undefined
@@ -671,6 +673,9 @@ export const register: Register = on => {
 
   on('tool.call', { tool: TOOL }, async ($, e) => {
     const input = e as unknown as Input
+    if (!str(input.prompt).trim() || !str(input.description).trim()) {
+      return { deny: 'Give prompt and description, both non-empty strings (same inputs as the Agent tool).' }
+    }
     const ran = await cli($, runArgv(input), {
       stdin: input.prompt,
       env: { CLAUDE_CODE_SESSION_ID: await $.session.id() },

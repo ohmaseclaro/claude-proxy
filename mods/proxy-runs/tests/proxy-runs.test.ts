@@ -208,6 +208,14 @@ test('remote_control false opts the run out of Remote Control', async ($, on) =>
   expect(w.argvs.find(a => a[1] === 'run')).toEqual(['claude-proxy', 'run', '-', '--json', '--name', 'quiet', '--no-remote-control'])
 })
 
+test('a run call with the wrong inputs is refused before it reaches claude-proxy', async ($, on) => {
+  const w = world(on)
+  await start($)
+  const ran = await $.tool.call({ tool: TOOL, tool_use_id: 'tu4', task_description: 'x', initial_prompt_from_file: 'y' } as never)
+  expect(String(ran.isError ? ran.text : ran.deny)).toContain('Give prompt and description')
+  expect(w.argvs.find(a => a[1] === 'run')).toBeUndefined()
+})
+
 const picked = (select: { props: Record<string, unknown> } | undefined) =>
   (select?.props.options as { label: string }[] | undefined)?.map(o => o.label)
 
@@ -634,7 +642,7 @@ test('a reopened session is shown what its runs did, and the next prompt brings 
     { ...RUN, id: 'def456', name: 'tidy', state: 'waiting', asks: [{ tool: 'Bash', input: { command: 'rm x' } }], mark: 'def456 waiting k1' },
   ]
   await start($)
-  for (let i = 0; i < 200 && !w.statuses.includes('2 runs finished while closed'); i++) await Promise.resolve()
+  for (let i = 0; i < 5000 && !w.statuses.includes('2 runs finished while closed'); i++) await Promise.resolve()
   expect(w.statuses).toContain('2 runs finished while closed')
   expect(entered).toHaveLength(0)
   expect(w.argvs.some(a => a[2] === '--ack')).toBe(false)
