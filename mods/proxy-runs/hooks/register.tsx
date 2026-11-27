@@ -84,10 +84,10 @@ function runArgv(input: Input): string[] {
     argv.push('--agent', input.subagent_type)
   }
   if (input.isolation === 'worktree') argv.push('--worktree')
-  if (str(input.cwd)) argv.push('--cwd', input.cwd)
+  if (str(input.cwd)) argv.push('--cwd', str(input.cwd))
   if (input.mode) argv.push('--mode', input.mode)
   if (input.remote_control === false) argv.push('--no-remote-control')
-  if (str(input.model)) argv.push('--', '--model', input.model)
+  if (str(input.model)) argv.push('--', '--model', str(input.model))
   return argv
 }
 
